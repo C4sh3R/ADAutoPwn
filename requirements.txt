@@ -1,0 +1,15 @@
+# ADAutoPwn — Python dependencies
+# Recommended install: pipx (isolated). Pip fallback: pip3 install --user -r requirements.txt
+#
+# NOTE: ADAutoPwn is a Bash orchestrator. These are the Python-based tools it
+# drives. System packages (nmap, smbclient, smbmap, rpcclient, ldap-utils,
+# ntpdate, enum4linux-ng, john, hashcat, seclists) and kerbrute (Go binary in
+# /opt/kerbrute) are handled by install.sh, not by pip.
+
+netexec            # nxc — core SMB/LDAP/WinRM swiss-army knife
+impacket           # secretsdump, GetUserSPNs, GetNPUsers, getTGT, dacledit, etc.
+certipy-ad         # ADCS enumeration & ESC abuse
+bloodhound         # bloodhound-python ingestor
+bloodyAD           # fast LDAP privilege/ACL abuse
+ldapdomaindump     # offline LDAP dump (optional)
+msoffcrypto-tool   # decrypt password-protected Office docs found on shares

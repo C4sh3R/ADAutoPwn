@@ -1,0 +1,17 @@
+# Loot & engagement output — NEVER commit captured creds/hashes
+loot_*/
+*.ccache
+*.kirbi
+*.zip
+*_hashes.txt
+secretsdump.txt
+cracked_passwords.txt
+rollback.log
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
