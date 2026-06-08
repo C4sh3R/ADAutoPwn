@@ -30,6 +30,8 @@ offensive toolchain (`netexec`, `impacket`, `certipy`, `bloodyAD`, `kerbrute`,
 ![kerberos](https://img.shields.io/badge/auth-Kerberos--first-blueviolet?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-orange?style=flat-square)
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support%20the%20project-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/C4sh3R)
+
 </div>
 
 ---
@@ -249,6 +251,21 @@ legitimate testing. Stealth here means *being quiet* (`--stealth`, Kerberos,
 jitter), not *destroying evidence*.
 
 ---
+
+## ☕ Support the project
+
+ADAutoPwn is free and open-source, built and maintained on a lot of late nights
+(testing against real labs, adding attack techniques, fixing edge cases). If it
+saved you time on an engagement or helped you learn, consider buying me a coffee —
+it directly fuels the next feature. 🙏
+
+<div align="center">
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-c4sh3r-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/C4sh3R)
+
+**→ https://www.buymeacoffee.com/C4sh3R**
+
+</div>
 
 ## 🤝 Contributing
 

