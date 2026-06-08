@@ -269,8 +269,46 @@ it directly fuels the next feature. 🙏
 
 ## 🤝 Contributing
 
-Issues and PRs welcome — new abuse modules, parser hardening, and additional
-ESC/trust techniques especially.
+Contributions are very welcome — this is a community tool and the AD attack
+surface is huge. Whether you fix a parser edge-case or add a whole new technique,
+PRs and issues are appreciated.
+
+### How to contribute
+
+```bash
+# 1. Fork & clone
+git clone https://github.com/<you>/ADAutoPwn.git && cd ADAutoPwn
+# 2. Branch
+git checkout -b feature/my-technique
+# 3. Hack on adautopwn.sh — keep the house style:
+#    - one `phase_*` function per stage, wired into assess_current_credential()
+#    - gate techniques on the CAP_* capability flags
+#    - print findings with info/ok/warn/loot, save artifacts to $OUTDIR
+#    - anything that changes the target → rb_record for --cleanup
+#    - run `bash -n adautopwn.sh` (must stay clean) and test on a lab/HTB box
+# 4. PR with a short description + sample output
+```
+
+> Please test against a lab or a box you're allowed to use, and **never commit
+> loot/credentials** (the `.gitignore` already blocks the usual files).
+
+### 🌱 Good first issues
+
+- **Parser hardening** — make the bloodyAD / netexec output parsing more robust
+  across versions (the ACL and trust parsers are the juiciest targets).
+- **`add dcsync` abuse** — when a principal has `WriteDACL`/`GenericAll` on the
+  domain object, grant + use DCSync rights (`bloodyAD add dcsync`).
+- **ADCS ESC auto-exploit** — go beyond `certipy find`: auto-run `certipy req`
+  for ESC1/ESC4/ESC8 when a vulnerable template is found.
+- **Offline DPAPI** — decrypt masterkey + credential blobs looted from shares.
+- **More document types** — OneNote, `.kdb`, `.config` connection strings, etc.
+- **Output formats** — JSON/Markdown engagement report from the loot dir.
+- **WinRM post-ex** — pull `cmdkey /list`, scheduled tasks, saved creds when a
+  shell is available.
+- **Coercion-to-relay glue** — optional `--relay` that launches `ntlmrelayx`
+  + a coercion trigger end-to-end (opt-in).
+
+Pick one, open an issue to claim it, and go 🚀
 
 ## 📜 License
 
