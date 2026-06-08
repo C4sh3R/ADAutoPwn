@@ -854,8 +854,17 @@ phase_relay() {
         subsection "LDAP signing & channel binding (relay → LDAP: RBCD / shadow creds / ESC8)"
         run "$NXC ldap $DCT ${args[*]} -M ldap-checker"
         $NXC ldap "$DCT" "${args[@]}" -M ldap-checker 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/relay_ldap.txt"
-        grep -qiE 'not enforce|is not required|False|vulnerable' "$OUTDIR/relay_ldap.txt" 2>/dev/null \
-            && loot "★ LDAP signing/channel-binding not enforced → relay to LDAP available"
+        # Only read the LDAP-CHECKER verdict lines (avoid matching 'SMBv1:False' etc.)
+        local lc; lc=$(grep -i 'LDAP-CHE' "$OUTDIR/relay_ldap.txt")
+        if echo "$lc" | grep -qiE 'Connection fail|Name or service|Errno|timed out|error'; then
+            warn "ldap-checker could not run (Kerberos/DNS) → LDAP signing status UNKNOWN, verify manually"
+        elif echo "$lc" | grep -qiE 'not (enforced|required)'; then
+            loot "★ LDAP signing/channel-binding NOT enforced → relay to LDAP available (RBCD / shadow / ESC8)"
+        elif echo "$lc" | grep -qiE 'enforced|required'; then
+            info "LDAP signing / channel binding appears enforced — LDAP relay blocked"
+        else
+            info "LDAP signing status inconclusive — see relay_ldap.txt"
+        fi
     fi
 
     subsection "Coercion vectors (force the DC to authenticate to us)"
@@ -863,8 +872,10 @@ phase_relay() {
     $NXC smb "$DCT" "${args[@]}" -M coerce_plus 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/coerce.txt"
     grep -qiE 'VULNERABLE|is vuln|Success' "$OUTDIR/coerce.txt" 2>/dev/null \
         && loot "★ DC is coercible (PetitPotam/PrinterBug/DFSCoerce/MS-EVEN) → trigger auth for relay"
-    $NXC smb "$DCT" "${args[@]}" -M spooler 2>&1 | tee -a "$LOGFILE"
-    $NXC smb "$DCT" "${args[@]}" -M webdav  2>&1 | tee -a "$LOGFILE"
+    $NXC smb "$DCT" "${args[@]}" -M spooler 2>&1 | tee -a "$LOGFILE" | grep -qi 'enabled' \
+        && loot "★ Print Spooler enabled → PrinterBug (MS-RPRN) coercion available"
+    $NXC smb "$DCT" "${args[@]}" -M webdav  2>&1 | tee -a "$LOGFILE" | grep -qi 'running\|enabled' \
+        && loot "★ WebClient (WebDAV) running → HTTP coercion → relay to LDAP/ADCS"
 
     subsection "Relay playbook (run these yourself — needs your listeners)"
     echo -e "      ${C_GREY}# 1) Relay to LDAPS and escalate (RBCD/shadow-cred), or -t smb://<other-host>:${C_RESET}"
