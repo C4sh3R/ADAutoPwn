@@ -8,6 +8,9 @@ secretsdump.txt
 cracked_passwords.txt
 rollback.log
 
+# VPN / engagement configs — never commit
+*.ovpn
+
 # Editor / OS noise
 *.swp
 *~

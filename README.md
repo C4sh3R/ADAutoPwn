@@ -69,18 +69,25 @@ Every user, hash, ticket and finding is **printed live and saved to disk**.
 | **★ Share looting** | spider readable shares, download files, **crack** password-protected Office/zip/pdf/keepass, **decrypt & read** their contents, **harvest** passwords inside |
 | **★ Secrets** | **GPP cpassword**, **LAPS**, **gMSA**, **DPAPI** → auto-pivot on everything recovered |
 | **★ WinRM + privesc** | who can WinRM; `whoami /priv` + `/groups` → maps **SeImpersonate→Potato**, SeBackup/SeDebug/SeRestore, Backup Operators, DnsAdmins… |
-| **★ ACL analysis** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN** — reported, and **abused** with `--abuse`: add-to-group, password reset, **WriteSPN→Kerberoast**, **Shadow Credentials** (recover NT hash), **RBCD** (impersonate Administrator) |
+| **★ ACL analysis** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN** — reported, and **abused** with `--abuse`: add-to-group, password reset, **WriteSPN→Kerberoast**, **Shadow Credentials** (recover NT hash), **RBCD** (impersonate Administrator), and **WriteDACL on the domain → self-grant DCSync** |
 | **★ Relay & coercion** | SMB/LDAP signing checks, `coerce_plus` (PetitPotam/PrinterBug/DFSCoerce), spooler, WebDAV → **relay playbook** with your IP |
 | **★ Trusts** | domain & **cross-forest** trusts, foreign security principals, cross-forest Kerberoast |
 | **6 · Kerberoast** | `GetUserSPNs` for SPN accounts (incl. cross-forest) |
-| **7 · ADCS** | `certipy` scan for **ESC1…ESC16** vulnerable templates |
-| **8 · BloodHound** | full `All` collection → importable `.zip` |
+| **7 · ADCS** | `certipy` scan for **ESC1…ESC16**, and with `--abuse` **auto-exploit ESC1** (request a cert as Administrator → recover its hash/TGT → pivot) |
+| **8 · BloodHound** | full `All` collection → importable `.zip` **+ a self-contained interactive `graph.html`** (offline, with built-in Linux/Windows abuse commands per edge) |
 | **9 · DCSync** | `secretsdump -just-dc` when privileges allow → **entire domain's NTLM hashes** |
 | **★ NTDS offline** | if `NTDS.dit` + `SYSTEM` are looted from shares → `secretsdump -ntds LOCAL` |
+| **★ Report** | a consolidated, human-readable **`report.md`** + tidy loot dir (`enum/` · `secrets/` · `raw/`) |
 | **∞ · Pivot + spray** | every recovered identity/secret re-enters the engine; recovered passwords are **sprayed** across all users to find more |
 
 Plus:
 
+- 🕸️ **Interactive attack graph** — a single self-contained `graph.html` (no server,
+  no internet, no BloodHound install). It opens focused on the **attack paths to
+  Domain Admins / DC** from what you own, and click any node to get the exact
+  **Linux *and* Windows abuse commands** for each ACL edge (GenericAll, WriteDacl,
+  Shadow Credentials, RBCD, DCSync…). Auto-opens after a run; search/expand the rest.
+  Use it standalone on **any** BloodHound zip: `adautopwn --graph data.zip`.
 - 🔐 **Kerberos-first** by default — works even when NTLM is disabled, and is quieter. `--ntlm` to force NTLM.
 - 🧠 **Domain-focused wordlist** auto-generated from the target (`Season+Year`, `Name+123!`, …) and tried **first** for offline cracking; optional capped online spray with `--spray`.
 - ♻️ **Self-feed / resume** — got creds or users by hand? Pass them with `--creds-file` / `--users-file` (or reuse the same `-o` loot dir) and the engine continues from there.
@@ -158,6 +165,9 @@ adautopwn -t <DC_IP> [-d <domain>] [-u <user>] [-p <pass> | -H <nt_hash>] [optio
 | `--stealth` | OPSEC mode: skip noisy techniques + jitter |
 | `--ntlm` | Force NTLM (default is Kerberos-first) |
 | `--no-bh` | Skip BloodHound collection |
+| `--no-open` | Don't auto-open `graph.html` in a browser |
+| `--graph <zip>` | **Standalone**: render a BloodHound zip → `graph.html` and open it (no scan) |
+| `--owned <file>` | Mark these principals (one per line) as compromised in the graph |
 | `-y, --yes` | Assume yes — fully unattended |
 | `--no-color` | Disable colors |
 | `-h, --help` | Help |
@@ -186,6 +196,10 @@ adautopwn -t 10.10.10.10 -d corp.local -u jdoe -p 'P@ssw0rd' --stealth
 
 # Clean up after yourself
 adautopwn -t 10.10.10.10 --cleanup -o loot_corp.local_20260607_2210
+
+# Just visualize an existing BloodHound zip — no scan, no creds
+adautopwn --graph ~/Downloads/20260608_bloodhound.zip
+adautopwn --graph data.zip --owned owned_users.txt   # flag what you already control
 ```
 
 ### Self-feed / resume
@@ -206,33 +220,29 @@ adautopwn -t 10.10.10.10 -d corp.local -u jdoe -p 'P@ss' --users-file users.txt
 
 ## 📂 Loot layout
 
-Everything is printed live **and** written to a timestamped loot directory:
+Everything is printed live **and** written to a timestamped loot directory.
+At the end the dir is **tidied**: trophies + resume-critical files stay on top,
+everything else is grouped into subfolders and empty files are pruned.
 
 ```
 loot_<domain>_<date>/
+├── report.md                  # ⭐ consolidated, human-readable engagement report
+├── graph.html                 # ⭐ interactive offline attack graph (auto-opens)
 ├── adautopwn.log              # full plain-text transcript
-├── nmap_dc.txt                # port scan
 ├── users_all.txt              # consolidated, de-duplicated user list
-├── users_variants*.txt        # generated + validated username variants
-├── domain_wordlist.txt        # target-specific password candidates
+├── found_passwords.txt        # every recovered password (sprayed + resumed)
+├── credential_map.txt         # what we recovered & where it came from
 ├── asrep_hashes.txt           # AS-REP roast (hashcat -m 18200)
 ├── kerberoast_hashes.txt      # Kerberoast (hashcat -m 13100)
-├── kerberoast_xforest_*.txt   # cross-forest roast
-├── secretsdump.txt / ntds_local.txt  # DCSync / offline NTDS dump
-├── gpp.txt / laps.txt / gmsa.txt / dpapi.txt   # recovered secrets
-├── shares/                    # files looted from readable shares
-├── decrypted_*  content_*.txt # decrypted documents + harvested text
-├── cracked_files.txt          # cracked document passwords
-├── found_passwords.txt        # every recovered password (sprayed + resumed)
-├── whoami_priv_<user>.txt     # token privileges & dangerous rights
-├── winrm_users.txt            # who can WinRM
-├── acl_writable_<user>.txt    # exploitable ACLs per identity
-├── relay_ldap.txt / coerce.txt # relay & coercion findings
-├── trusts.txt                 # domain/forest trusts
-├── certipy_find.txt           # ADCS findings
+├── secretsdump.txt            # DCSync dump
 ├── cracked_passwords.txt      # cracked hashes → plaintext
-├── bloodhound/*.zip           # BloodHound data
-└── rollback.log               # undo actions for --cleanup
+├── *.ccache                   # reusable Kerberos tickets
+├── rollback.log               # undo actions for --cleanup
+├── enum/                      # users/groups, password policy, nmap, domain wordlist
+├── secrets/                   # LAPS · gMSA · GPP · DPAPI · ACL dumps · trusts · ADCS · coercion
+├── shares/                    # files looted from readable shares
+├── bloodhound/*.zip           # BloodHound collection
+└── raw/                       # misc intermediates (cracked docs, file hashes…)
 ```
 
 ---
@@ -296,13 +306,11 @@ git checkout -b feature/my-technique
 
 - **Parser hardening** — make the bloodyAD / netexec output parsing more robust
   across versions (the ACL and trust parsers are the juiciest targets).
-- **`add dcsync` abuse** — when a principal has `WriteDACL`/`GenericAll` on the
-  domain object, grant + use DCSync rights (`bloodyAD add dcsync`).
-- **ADCS ESC auto-exploit** — go beyond `certipy find`: auto-run `certipy req`
-  for ESC1/ESC4/ESC8 when a vulnerable template is found.
+- **More ADCS ESCs** — extend the auto-exploit beyond ESC1 (ESC4/ESC8/ESC9…).
 - **Offline DPAPI** — decrypt masterkey + credential blobs looted from shares.
 - **More document types** — OneNote, `.kdb`, `.config` connection strings, etc.
-- **Output formats** — JSON/Markdown engagement report from the loot dir.
+- **Graph edges** — add `AdminTo`/`CanRDP`/session-based lateral edges and
+  more abuse recipes to the graph's built-in command library.
 - **WinRM post-ex** — pull `cmdkey /list`, scheduled tasks, saved creds when a
   shell is available.
 - **Coercion-to-relay glue** — optional `--relay` that launches `ntlmrelayx`
