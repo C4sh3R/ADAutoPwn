@@ -28,7 +28,7 @@ offensive toolchain (`netexec`, `impacket`, `certipy`, `bloodyAD`, `kerbrute`,
 ![bash](https://img.shields.io/badge/bash-5%2B-1f425f?style=flat-square&logo=gnubash&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Kali%20%7C%20Parrot-2ea44f?style=flat-square&logo=linux&logoColor=white)
 ![kerberos](https://img.shields.io/badge/auth-Kerberos--first-blueviolet?style=flat-square)
-![license](https://img.shields.io/badge/license-MIT-orange?style=flat-square)
+![license](https://img.shields.io/badge/license-PolyForm%20Noncommercial-orange?style=flat-square)
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support%20the%20project-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/C4sh3R)
 
@@ -320,8 +320,12 @@ Pick one, open an issue to claim it, and go 🚀
 
 ## 📜 License
 
-MIT — see [`LICENSE`](LICENSE). Provided for **authorized security testing and
-education only**. The author assumes no liability for misuse.
+**PolyForm Noncommercial 1.0.0** — see [`LICENSE`](LICENSE). Free to use, modify
+and share for **noncommercial** purposes (research, education, personal use,
+nonprofits). **Commercial use, selling or reselling is not permitted** — all
+commercial rights are reserved by the author (**c4sh3r**); contact for a
+commercial license. Provided for **authorized security testing only**; the
+author assumes no liability for misuse.
 
 <div align="center">
 <sub>Made with ☕ and too many <code>impacket</code> flags by <b>c4sh3r</b></sub>
