@@ -264,7 +264,7 @@ jitter), not *destroying evidence*.
 
 ## ☕ Support the project
 
-ADAutoPwn is free and open-source, built and maintained on a lot of late nights
+ADAutoPwn is free and source-available (noncommercial), built and maintained on a lot of late nights
 (testing against real labs, adding attack techniques, fixing edge cases). If it
 saved you time on an engagement or helped you learn, consider buying me a coffee —
 it directly fuels the next feature. 🙏
