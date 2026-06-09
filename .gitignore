@@ -1,15 +1,5 @@
-# Loot & engagement output — NEVER commit captured creds/hashes
+# Engagement output — the tool writes everything into a timestamped loot dir
 loot_*/
-*.ccache
-*.kirbi
-*.zip
-*_hashes.txt
-secretsdump.txt
-cracked_passwords.txt
-rollback.log
-
-# VPN / engagement configs — never commit
-*.ovpn
 
 # Editor / OS noise
 *.swp
