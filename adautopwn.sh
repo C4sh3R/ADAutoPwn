@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.18.1"
+readonly VERSION="1.18.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -3690,18 +3690,30 @@ _adautograph_launch() {   # _adautograph_launch <zip> [logdir]
     # 2) import the given BloodHound zip via /api/import ----------------------------
     if [[ -n "$zip" && -f "$zip" ]]; then
         subsection "Importing BloodHound data → ADAutoGraph"
-        run "curl -F zip=@$(basename "$zip") -F name=${DOMAIN:-domain} $url/api/import"
+        # Pre-mark the principals we already compromised as 'owned' on the web, just
+        # like graph.html did via OWNED_FILE. Source (first match wins): --owned file,
+        # else this run's valid_creds_map.txt / owned_principals.txt. First column =
+        # principal name; the server matches by sAMAccountName/label/SID.
+        local of="" owned=""
+        if   [[ -n "$OWNED_FILE" && -f "$OWNED_FILE" ]]; then of="$OWNED_FILE"
+        elif [[ -f "$OUTDIR/valid_creds_map.txt" ]];      then of="$OUTDIR/valid_creds_map.txt"
+        elif [[ -f "$OUTDIR/owned_principals.txt" ]];     then of="$OUTDIR/owned_principals.txt"
+        fi
+        [[ -n "$of" ]] && owned=$(awk 'NF{print $1}' "$of" | sort -u | paste -sd, -)
+        [[ -n "$owned" ]] && info "Marking owned on the graph: ${owned//,/, }"
+        run "curl -F zip=@$(basename "$zip") -F name=${DOMAIN:-domain} -F owned=… $url/api/import"
         local resp
         if have curl; then
-            resp=$(curl -fsS -m 120 -F "zip=@${zip}" -F "name=${DOMAIN:-domain}" "$url/api/import" 2>&1)
+            resp=$(curl -fsS -m 120 -F "zip=@${zip}" -F "name=${DOMAIN:-domain}" -F "owned=${owned}" "$url/api/import" 2>&1)
         else
-            resp=$(python3 - "$zip" "${DOMAIN:-domain}" "$url/api/import" <<'PY' 2>&1
+            resp=$(python3 - "$zip" "${DOMAIN:-domain}" "$url/api/import" "$owned" <<'PY' 2>&1
 import sys,uuid,urllib.request
 zp,name,url=sys.argv[1],sys.argv[2],sys.argv[3]
+owned=sys.argv[4] if len(sys.argv)>4 else ""
 b=uuid.uuid4().hex
 def part(n,v): return ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'%(b,n,v)).encode()
 with open(zp,'rb') as f: data=f.read()
-body=part('name',name)
+body=part('name',name)+part('owned',owned)
 body+=('--%s\r\nContent-Disposition: form-data; name="zip"; filename="bh.zip"\r\nContent-Type: application/zip\r\n\r\n'%b).encode()+data+b'\r\n'
 body+=('--%s--\r\n'%b).encode()
 req=urllib.request.Request(url,data=body,headers={'Content-Type':'multipart/form-data; boundary=%s'%b})
@@ -3710,7 +3722,7 @@ PY
 )
         fi
         [[ -n "$LOGFILE" ]] && echo "$resp" >>"$LOGFILE"
-        if grep -q '"ok"' <<<"$resp"; then ok "Imported '${DOMAIN:-domain}' into ADAutoGraph"
+        if grep -q '"ok"' <<<"$resp"; then ok "Imported '${DOMAIN:-domain}' into ADAutoGraph (owned pre-marked)"
         else warn "Import didn't confirm — response: $resp"; fi
     else
         info "No BloodHound zip to import (open the web and drag a zip in, or run the BloodHound phase)"
