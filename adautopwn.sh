@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.17.1"
+readonly VERSION="1.17.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -450,22 +450,24 @@ phase_hosts_time() {
     if [[ "$SUDO_OK" == "1" && -n "$DOMAIN" ]]; then
         subsection "Updating /etc/hosts"
         local entry="$DC_IP $DC_FQDN $DOMAIN $DC_HOST"
-        if [[ -n "$DC_FQDN" ]] && getent hosts "$DC_FQDN" 2>/dev/null | grep -q "^$DC_IP[[:space:]]"; then
-            ok "$DC_FQDN already resolves to $DC_IP (nothing to do)"
-        else
-            # Drop any stale line for this IP, then add a fresh, correct one.
-            # NB: we use `bash -c "… >> file"` (not a piped `tee`) because _sudo
-            # feeds the sudo password on stdin, which would clobber a pipe.
-            _sudo sed -i "\#^${DC_IP}[[:space:]]#d" /etc/hosts 2>/dev/null
-            if _sudo bash -c "printf '%s\n' '$entry' >> /etc/hosts"; then
-                ok "Appended to /etc/hosts: ${C_BOLD}$entry${C_RESET}"
-                rb_record "Added /etc/hosts entry for $DOMAIN ($DC_IP)" \
-                          "sudo sed -i '\\#^${DC_IP}[[:space:]]#d' /etc/hosts"
-                getent hosts "$DC_FQDN" >/dev/null 2>&1 && ok "$DC_FQDN now resolves" \
-                    || warn "$DC_FQDN still not resolving (check /etc/hosts manually)"
+        local fq_re="${DC_FQDN//./\\.}" dom_re="${DOMAIN//./\\.}"
+        # Always purge EVERY stale line referencing this FQDN/domain (any IP) AND
+        # this IP — otherwise a leftover line from a previous box revert resolves
+        # first and the whole chain hits a dead host. We rewrite, never append.
+        # NB: we use `bash -c "… >> file"` (not a piped `tee`) because _sudo feeds
+        # the sudo password on stdin, which would clobber a pipe.
+        _sudo sed -i -E "/(^|[[:space:]])(${fq_re}|${dom_re})([[:space:]]|\$)/d; /^${DC_IP}[[:space:]]/d" /etc/hosts 2>/dev/null
+        if _sudo bash -c "printf '%s\n' '$entry' >> /etc/hosts"; then
+            ok "Set /etc/hosts (stale entries purged): ${C_BOLD}$entry${C_RESET}"
+            rb_record "Set /etc/hosts entry for $DOMAIN ($DC_IP)" \
+                      "sudo sed -i -E '/(^|[[:space:]])${fq_re}([[:space:]]|\$)/d' /etc/hosts"
+            if getent hosts "$DC_FQDN" 2>/dev/null | grep -q "^${DC_IP}[[:space:]]"; then
+                ok "$DC_FQDN → $DC_IP ✓"
             else
-                err "Failed to write /etc/hosts"
+                warn "$DC_FQDN still not resolving to $DC_IP (check /etc/hosts manually)"
             fi
+        else
+            err "Failed to write /etc/hosts"
         fi
     else
         warn "No sudo or no domain: skipping /etc/hosts (add manually: $DC_IP $DC_FQDN $DOMAIN)"
