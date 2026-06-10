@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.18.2"
+readonly VERSION="1.18.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -3637,10 +3637,11 @@ phase_bloodhound_graph() {
     GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-$DC_IP}" GDCIP="${DC_IP:-${DC_FQDN}}" render_graph_py
     if [[ -s "$html" ]]; then
         loot "Interactive attack graph → graph.html (offline, portable — drop it in the report)"
-        # Don't pop two browser tabs: if the ADAutoGraph web UI is going to launch
-        # (richer, interactive), keep graph.html as the offline artifact and let the
-        # web be what opens. Only auto-open graph.html when the web won't run.
-        if [[ "$WEB_UI" == "1" && -n "$(_adautograph_dir)" ]]; then
+        # Don't pop two browser tabs. If you asked for the web (--web) OR the
+        # ADAutoGraph web UI is going to launch anyway, keep graph.html as the
+        # offline artifact and let the web be what opens. Only auto-open graph.html
+        # when the web won't run.
+        if [[ "$WEB_FORCE" == "1" || ( "$WEB_UI" == "1" && -n "$(_adautograph_dir)" ) ]]; then
             info "ADAutoGraph web UI will open instead — graph.html kept as an offline/report artifact"
         else
             open_in_browser "$html"
