@@ -87,6 +87,18 @@ elif command -v git >/dev/null; then
 else
     wrn "git missing — install ADAutoGraph manually: git clone https://github.com/C4sh3R/ADAutoGraph"
 fi
+# Put `adautograph` on PATH (server.py resolves its own dir, so a symlink is fine).
+if [[ -f "$AG_DIR/server.py" ]]; then
+    chmod +x "$AG_DIR/server.py" 2>/dev/null
+    if [[ -w /usr/local/bin ]] || [[ -n "$SUDO" ]]; then
+        $SUDO ln -sf "$AG_DIR/server.py" /usr/local/bin/adautograph 2>/dev/null \
+            && ok "Symlinked → run the web UI anywhere as: adautograph" \
+            || wrn "Could not symlink adautograph into /usr/local/bin"
+    else
+        mkdir -p "$HOME/.local/bin" && ln -sf "$AG_DIR/server.py" "$HOME/.local/bin/adautograph" \
+            && ok "Symlinked → adautograph (~/.local/bin)"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Make the framework executable + optional PATH symlink

@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.18.0"
+readonly VERSION="1.18.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -149,6 +149,7 @@ GRAPH_ZIP=""        # --graph: render a BloodHound zip to graph.html and exit
 OWNED_FILE=""       # --owned: file of compromised principals to flag in the graph
 NO_OPEN=0           # 1 = never auto-open the graph in a browser
 WEB_UI=1            # 1 = auto-launch the ADAutoGraph web UI + import BH data (if installed)
+WEB_FORCE=0         # --web/--adautograph: in --graph mode, open ADAutoGraph instead of graph.html
 ADAUTOGRAPH_HOST="${ADAUTOGRAPH_HOST:-127.0.0.1}"
 ADAUTOGRAPH_PORT="${ADAUTOGRAPH_PORT:-8765}"
 ADAUTOGRAPH_DIR="${ADAUTOGRAPH_DIR:-}"   # override; else found beside this script
@@ -3635,8 +3636,15 @@ phase_bloodhound_graph() {
     BH_ZIP="$zip" BH_HTML="$html" OWNED_FILE="$OUTDIR/valid_creds_map.txt" \
     GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-$DC_IP}" GDCIP="${DC_IP:-${DC_FQDN}}" render_graph_py
     if [[ -s "$html" ]]; then
-        loot "Interactive attack graph → graph.html (open in a browser — offline)"
-        open_in_browser "$html"
+        loot "Interactive attack graph → graph.html (offline, portable — drop it in the report)"
+        # Don't pop two browser tabs: if the ADAutoGraph web UI is going to launch
+        # (richer, interactive), keep graph.html as the offline artifact and let the
+        # web be what opens. Only auto-open graph.html when the web won't run.
+        if [[ "$WEB_UI" == "1" && -n "$(_adautograph_dir)" ]]; then
+            info "ADAutoGraph web UI will open instead — graph.html kept as an offline/report artifact"
+        else
+            open_in_browser "$html"
+        fi
     else
         warn "Could not generate graph.html"
     fi
@@ -3657,11 +3665,13 @@ _adautograph_dir() {
 _adautograph_up() {   # server already listening?
     have curl && curl -fsS -m 3 "http://${ADAUTOGRAPH_HOST}:${ADAUTOGRAPH_PORT}/api/domains" >/dev/null 2>&1
 }
-phase_adautograph_web() {
-    [[ "$WEB_UI" != "1" || "$STEALTH" == "1" ]] && return
+# Start ADAutoGraph (if down), import a specific BloodHound zip, open the browser.
+# Reused by the full run and by `--graph <zip> --web`. Returns 1 if not installed.
+_adautograph_launch() {   # _adautograph_launch <zip> [logdir]
+    local zip="$1" logdir="${2:-${OUTDIR:-/tmp}}"
     local dir; dir=$(_adautograph_dir)
-    [[ -z "$dir" ]] && return            # not installed → silent skip
-    have python3 || return
+    [[ -z "$dir" ]] && { warn "ADAutoGraph not found — install it: git clone https://github.com/C4sh3R/ADAutoGraph (or set ADAUTOGRAPH_DIR)"; return 1; }
+    have python3 || { warn "python3 unavailable → cannot launch ADAutoGraph"; return 1; }
     section "ADAUTOGRAPH · LOCAL BLOODHOUND-STYLE WEB UI"
     local url="http://${ADAUTOGRAPH_HOST}:${ADAUTOGRAPH_PORT}"
 
@@ -3671,14 +3681,13 @@ phase_adautograph_web() {
     else
         subsection "Starting ADAutoGraph ($dir)"
         ( cd "$dir" && nohup python3 server.py --host "$ADAUTOGRAPH_HOST" --port "$ADAUTOGRAPH_PORT" \
-            >"$OUTDIR/adautograph_server.log" 2>&1 & )
+            >"$logdir/adautograph_server.log" 2>&1 & )
         local i; for i in $(seq 1 20); do _adautograph_up && break; sleep 0.5; done
         if _adautograph_up; then ok "ADAutoGraph up → $url"
-        else warn "ADAutoGraph didn't come up (see adautograph_server.log)"; return; fi
+        else warn "ADAutoGraph didn't come up (see adautograph_server.log)"; return 1; fi
     fi
 
-    # 2) import the freshest BloodHound zip via /api/import -------------------------
-    local zip; zip=$(_bh_latest_zip)
+    # 2) import the given BloodHound zip via /api/import ----------------------------
     if [[ -n "$zip" && -f "$zip" ]]; then
         subsection "Importing BloodHound data → ADAutoGraph"
         run "curl -F zip=@$(basename "$zip") -F name=${DOMAIN:-domain} $url/api/import"
@@ -3700,16 +3709,22 @@ print(urllib.request.urlopen(req,timeout=120).read().decode())
 PY
 )
         fi
-        echo "$resp" >>"$LOGFILE"
+        [[ -n "$LOGFILE" ]] && echo "$resp" >>"$LOGFILE"
         if grep -q '"ok"' <<<"$resp"; then ok "Imported '${DOMAIN:-domain}' into ADAutoGraph"
         else warn "Import didn't confirm — response: $resp"; fi
     else
-        info "No BloodHound zip to import yet (run the BloodHound phase first)"
+        info "No BloodHound zip to import (open the web and drag a zip in, or run the BloodHound phase)"
     fi
 
     # 3) open the browser on the web UI --------------------------------------------
     open_in_browser "$url"
     loot "ADAutoGraph web UI → ${C_BOLD}$url${C_RESET}"
+}
+
+phase_adautograph_web() {
+    [[ "$WEB_UI" != "1" || "$STEALTH" == "1" ]] && return
+    [[ -z "$(_adautograph_dir)" ]] && return    # not installed → silent skip in a normal run
+    _adautograph_launch "$(_bh_latest_zip)" "$OUTDIR"
 }
 
 # Standalone: turn a BloodHound zip straight into the interactive graph and open
@@ -3726,11 +3741,15 @@ graph_only_mode() {
     info "Source zip: ${C_BOLD}$zip${C_RESET}"
     BH_ZIP="$zip" BH_HTML="$html" OWNED_FILE="${OWNED_FILE:-}" \
     GDOMAIN="${DOMAIN:-domain.local}" GDC="${DC_FQDN:-${DC_IP:-domain.local}}" GDCIP="${DC_IP:-${DC_FQDN}}" render_graph_py | sed 's/^/  /'
-    if [[ -s "$html" ]]; then
-        loot "Interactive attack graph → ${C_BOLD}$html${C_RESET}"
-        open_in_browser "$html"
+    if [[ ! -s "$html" ]]; then die "Could not generate the graph from $zip"; fi
+    loot "Interactive attack graph → ${C_BOLD}$html${C_RESET}"
+    # --web / --adautograph: import this zip into the ADAutoGraph web UI and open
+    # that instead of the offline graph.html. Default standalone behaviour is the
+    # self-contained graph.html (no server needed).
+    if [[ "$WEB_FORCE" == "1" ]]; then
+        OUTDIR="$outdir" _adautograph_launch "$zip" "$outdir" || open_in_browser "$html"
     else
-        die "Could not generate the graph from $zip"
+        open_in_browser "$html"
     fi
 }
 
@@ -4102,6 +4121,7 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_GREEN}--ntlm${C_RESET}         Force NTLM auth ${C_DIM}(default is Kerberos-first)${C_RESET}
   ${C_GREEN}--no-bh${C_RESET}        Skip BloodHound collection
   ${C_GREEN}--no-open${C_RESET}      Don't auto-open graph.html / the web UI in a browser
+  ${C_GREEN}--web${C_RESET}, ${C_GREEN}--adautograph${C_RESET}   Open results in the ADAutoGraph web UI (also forces it in ${C_BOLD}--graph${C_RESET} mode)
   ${C_GREEN}--no-web${C_RESET}       Don't auto-launch the ADAutoGraph web UI + import BloodHound data
   ${C_GREEN}--web-port${C_RESET} <n> Port for the ADAutoGraph web UI (default 8765)
   ${C_GREEN}-y, --yes${C_RESET}      Assume "yes" to all prompts — fully unattended run
@@ -4112,7 +4132,8 @@ ${C_CYAN}${C_BOLD}STANDALONE GRAPH${C_RESET} ${C_DIM}(no scan — just visualize
   ${C_GREEN}--graph${C_RESET} <zip>   Render any BloodHound .zip into the interactive ${C_BOLD}graph.html${C_RESET}
                 and open it. Domain auto-detected from the data
   ${C_GREEN}--owned${C_RESET} <file>  Mark these principals (one per line) as compromised in the graph
-  ${C_DIM}e.g.  $0 --graph ~/Downloads/bloodhound.zip${C_RESET}
+  ${C_DIM}add ${C_GREEN}--web${C_DIM} to import the zip into the ADAutoGraph web UI instead of graph.html${C_RESET}
+  ${C_DIM}e.g.  $0 --graph ~/Downloads/bloodhound.zip [--web]${C_RESET}
 
 ${C_CYAN}${C_BOLD}WHAT IT DOES${C_RESET} ${C_DIM}(phases run automatically, gated by what your access unlocks)${C_RESET}
   ${C_PURPLE}0${C_RESET}  Discovery      nmap of AD ports, SMB fingerprint → hostname/domain/FQDN
@@ -4196,6 +4217,7 @@ parse_args() {
             --owned) OWNED_FILE="$2"; shift 2;;
             --no-open) NO_OPEN=1; shift;;
             --no-web) WEB_UI=0; shift;;
+            --web|--adautograph) WEB_UI=1; WEB_FORCE=1; shift;;
             --web-port) ADAUTOGRAPH_PORT="$2"; shift 2;;
             --stealth) STEALTH=1; shift;;
             --ntlm) KERBEROS=0; shift;;
