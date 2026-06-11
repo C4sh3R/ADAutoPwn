@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.32.0"
+readonly VERSION="1.32.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -326,9 +326,14 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
     fi
     local user_key="${u,,}" key; key="$(cred_key "$u" "$p" "$h")"
     # Record the attack-chain edge (the identity we're acting as --via--> this one)
-    # the FIRST time we learn of it — even if already seen/queued — so the final
-    # "attack chain" is complete. A self-reference (root / self-reset) is skipped.
-    if [[ -z "${CHAIN_VIA[$user_key]:-}" && -n "${USER,,}" && "${USER,,}" != "$user_key" ]]; then
+    # the FIRST time we learn of it. CRITICAL: never assign a parent to an identity
+    # that is ALREADY compromised/assessed (in OWNED_GROUPS) — otherwise, when a
+    # later node re-harvests an earlier root (e.g. msa_health$ re-reading svc_recovery
+    # from the shares), the root gets a false parent and the chain becomes a CYCLE
+    # (svc_recovery⇄msa_health$), rendered as two duplicate trees. A root keeps no
+    # parent; a genuinely new lead (not yet owned) gets its true discoverer.
+    if [[ -z "${CHAIN_VIA[$user_key]:-}" && -z "${OWNED_GROUPS[$user_key]:-}" \
+          && -n "${USER,,}" && "${USER,,}" != "$user_key" ]]; then
         CHAIN_FROM["$user_key"]="${USER,,}"; CHAIN_VIA["$user_key"]="$via"
     fi
     [[ -n "${SEEN_CREDS[$key]:-}" || -n "${SEEN_CREDS[${user_key}|*|*]:-}" ]] && return
