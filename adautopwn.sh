@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.43.0"
+readonly VERSION="1.43.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -5933,10 +5933,13 @@ final_summary() {
             detail "  ${C_BOLD}${C_RED}» DOMAIN NTLM DUMP${C_RESET} ${C_DIM}($(grep -cE ':::' "$dd") accounts — Pass-the-Hash ready)${C_RESET}"
             # high-value first (Administrator, krbtgt), then the rest
             while IFS= read -r line; do
-                local u nt lc; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4); lc="${u,,}"
+                local u nt lc ud; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4); lc="${u,,}"
+                # detail() runs echo -e, which eats backslash escapes (sendai.vl\Elliot
+                # → \E = ESC → "sendai.vlliot"). Double the backslashes for display.
+                ud="${u//\\/\\\\}"
                 case "$lc" in
-                    *administrator|*krbtgt|*'$') detail "      ${C_RED}${C_BOLD}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_RED}${nt}${C_RESET}" ;;
-                    *) detail "      ${C_CYAN}${u}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${nt}${C_RESET}" ;;
+                    *administrator|*krbtgt|*'$') detail "      ${C_RED}${C_BOLD}${ud}${C_RESET} ${C_DIM}:${C_RESET} ${C_RED}${nt}${C_RESET}" ;;
+                    *) detail "      ${C_CYAN}${ud}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${nt}${C_RESET}" ;;
                 esac
             done < <(grep -E ':::' "$dd" | grep -iE '(administrator|krbtgt):' ; grep -E ':::' "$dd" | grep -ivE '(administrator|krbtgt):')
             local ah; ah=$(grep -iE '^[^:]*administrator:' "$dd" | head -1 | cut -d: -f4)
