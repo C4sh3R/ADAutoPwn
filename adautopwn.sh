@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.2"
+readonly VERSION="1.35.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1687,8 +1687,11 @@ phase_adcs() {
         # structured dump for analysis (best-effort)
         "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy_$(_safe_name "$USER")" >/dev/null 2>&1
         _abuse_adcs "$cout" && ADCS_PWNED=1
-    else
-        info "Nothing flagged by -vulnerable — mapping the FULL template surface (ESS / EKU / who can enroll)…"
+    elif [[ "$DEEP_CVE" == "1" ]]; then
+        # OPT-IN only (--deep-cve): the full review runs a SECOND certipy enumeration
+        # (slow — CA config via RRP), so it's off by default. It maps every enrollable
+        # ESS/abusable template incl. ones restricted to another group (pivot target).
+        info "Nothing flagged by -vulnerable — mapping the FULL template surface (--deep-cve)…"
         subsection "Template review — ESS/abusable templates (★=you can enroll · ⚑=need another group)"
         local full; full=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" -stdout 2>&1)
         echo "$full" >"$OUTDIR/certipy_templates_$(_safe_name "$USER").txt"
@@ -1705,6 +1708,8 @@ phase_adcs() {
         elif grep -q '⚑' <<<"$rev"; then
             loot "⚑ ESS template(s) exist but need a group you don't hold yet → pivot to that group, then enroll (note ServerAuth+ESS → WSUS HTTPS-spoof chain)"
         fi
+    else
+        info "No templates ${USER} can abuse (certipy -vulnerable clean; run with --deep-cve for a full enrollable-template review)"
     fi
     # ESC15/EKUwu is the blind spot: certipy -vulnerable frequently does NOT flag it
     # even on a default v1 template (WebServer/SubCA) that ANY enrolment-capable user
