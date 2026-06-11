@@ -10,3 +10,6 @@
 [submodule "external/krbrelayx"]
 	path = external/krbrelayx
 	url = https://github.com/dirkjanm/krbrelayx
+[submodule "external/sccmhunter"]
+	path = external/sccmhunter
+	url = https://github.com/garrettfoster13/sccmhunter

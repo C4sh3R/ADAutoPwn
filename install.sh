@@ -93,11 +93,14 @@ clone_helper noPac          https://github.com/Ridter/noPac
 clone_helper CVE-2020-1472  https://github.com/dirkjanm/CVE-2020-1472
 clone_helper CVE-2021-1675  https://github.com/cube0x0/CVE-2021-1675
 clone_helper krbrelayx      https://github.com/dirkjanm/krbrelayx
-if [[ -f "$EXT_DIR/noPac/requirements.txt" ]]; then
-    pip3 install --user -r "$EXT_DIR/noPac/requirements.txt" >/dev/null 2>&1 || \
-        pip3 install --break-system-packages -r "$EXT_DIR/noPac/requirements.txt" >/dev/null 2>&1 || \
-        wrn "Could not install noPac Python requirements (it may still work with system impacket)"
-fi
+clone_helper sccmhunter     https://github.com/garrettfoster13/sccmhunter
+for _req in noPac sccmhunter; do
+    if [[ -f "$EXT_DIR/$_req/requirements.txt" ]]; then
+        pip3 install --user -r "$EXT_DIR/$_req/requirements.txt" >/dev/null 2>&1 || \
+            pip3 install --break-system-packages -r "$EXT_DIR/$_req/requirements.txt" >/dev/null 2>&1 || \
+            wrn "Could not install $_req Python requirements (it may still work with system impacket)"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 6. ADAutoGraph — local BloodHound-style web UI (separate repo, pure stdlib)
