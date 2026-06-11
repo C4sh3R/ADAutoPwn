@@ -62,14 +62,14 @@ Every user, hash, ticket and finding is **printed live and saved to disk**.
 | **0 · Discovery** | `nmap` of key AD ports → **capability matrix** (Kerberos/SMB/LDAP/RPC/WinRM). Domain/FQDN via SMB **or LDAP rootDSE + LDAPS cert** (works on Kerberos-only DCs) |
 | **1 · Host & Time** | Auto-append to `/etc/hosts` (idempotent) + clock sync with the DC (Kerberos prerequisite) |
 | **2 · Unauth enum** | null/guest sessions, anonymous shares, RID brute, `rpcclient`, LDAP anon bind, `enum4linux-ng`, `kerbrute` userenum |
-| **3 · AS-REP Roast** | `GetNPUsers` — **dynamic**: authenticated LDAP sweep, discovered-user list, or capped seed |
+| **3 · AS-REP + Timeroast** | `GetNPUsers` + MS-SNTP Timeroast — captured hashes are cracked and fed back into the pivot queue |
 | **4 · Validate + TGT** | **TGT-first** (`getTGT -dc-ip`, DNS-independent) → proves creds, cached & reused everywhere via `-k --use-kcache` |
 | **5 · Auth enum** | users, groups, password policy, descriptions, shares, MachineAccountQuota (LDAP, or `rpcclient` fallback when LDAP is closed) |
 | **★ Username variants** | `ryan.naylor` → `rnaylor`, `r.naylor`, `naylor`… validated with `kerbrute` (no lockout) |
 | **★ Share looting** | spider readable shares, download files, **crack** password-protected Office/zip/pdf/keepass, **decrypt & read** their contents, **harvest** passwords inside |
-| **★ Secrets** | **GPP cpassword**, **LAPS**, **gMSA**, **DPAPI** → auto-pivot on everything recovered |
+| **★ Secrets** | Passwords in descriptions/files, **GPP**, **LAPS**, **gMSA/dMSA**, **DPAPI**, pre-created computer passwords → auto-pivot on everything recovered |
 | **★ WinRM + privesc** | who can WinRM; `whoami /priv` + `/groups` → maps **SeImpersonate→Potato**, SeBackup/SeDebug/SeRestore, Backup Operators, DnsAdmins… |
-| **★ ACL analysis** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN** — reported, and **abused** with `--abuse`: add-to-group, password reset, **WriteSPN→Kerberoast**, **Shadow Credentials** (recover NT hash), **RBCD** (impersonate Administrator), and **WriteDACL on the domain → self-grant DCSync** |
+| **★ ACL/delegation abuse** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN**, constrained delegation — with `--abuse` it performs the chain: group add/reset, **WriteSPN→Kerberoast**, **Shadow Credentials**, **RBCD**, S4U-to-Administrator, and **DCSync** |
 | **★ Relay & coercion** | SMB/LDAP signing checks, `coerce_plus` (PetitPotam/PrinterBug/DFSCoerce), spooler, WebDAV → **relay playbook** with your IP |
 | **★ Trusts** | domain & **cross-forest** trusts, foreign security principals, cross-forest Kerberoast |
 | **6 · Kerberoast** | `GetUserSPNs` for SPN accounts (incl. cross-forest) |
@@ -161,6 +161,7 @@ adautopwn -t <DC_IP> [-d <domain>] [-u <user>] [-p <pass> | -H <nt_hash>] [optio
 | `--no-crack` | Disable hash cracking (**cracking is ON by default**) |
 | `--spray` | Also spray the domain-focused wordlist **online** ⚠️ *account-lockout risk* |
 | `--abuse` | Actively exploit ACLs (group adds, password resets, WriteSPN roast) — tracked for rollback |
+| `--auto-pwn` | Convenience alias for `--abuse --spray -y`; `--abuse` remains the main exploitation switch |
 | `--cleanup` | Revert every tracked change and exit |
 | `--stealth` | OPSEC mode: skip noisy techniques + jitter |
 | `--ntlm` | Force NTLM (default is Kerberos-first) |

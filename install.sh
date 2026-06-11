@@ -72,7 +72,34 @@ if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyo
 fi
 
 # ---------------------------------------------------------------------------
-# 5. ADAutoGraph — local BloodHound-style web UI (separate repo, pure stdlib)
+# 5. Optional exploit helpers used by --abuse when a safe automation path exists
+# ---------------------------------------------------------------------------
+EXT_DIR="$(realpath "$(dirname "$0")/external" 2>/dev/null || echo "$(dirname "$0")/external")"
+mkdir -p "$EXT_DIR"
+clone_helper() {  # clone_helper <name> <url>
+    local name="$1" url="$2" dst="$EXT_DIR/$name"
+    if [[ -d "$dst/.git" || -f "$dst/noPac.py" || -f "$dst/cve-2020-1472-exploit.py" || -f "$dst/CVE-2021-1675.py" ]]; then
+        ok "$name helper already present → $dst"
+    elif command -v git >/dev/null; then
+        inf "Cloning optional helper $name → $dst"
+        git clone --depth 1 "$url" "$dst" >/dev/null 2>&1 \
+            && ok "$name helper installed" \
+            || wrn "$name clone failed — $url"
+    else
+        wrn "git missing — cannot clone optional helper $name"
+    fi
+}
+clone_helper noPac          https://github.com/Ridter/noPac
+clone_helper CVE-2020-1472  https://github.com/dirkjanm/CVE-2020-1472
+clone_helper CVE-2021-1675  https://github.com/cube0x0/CVE-2021-1675
+if [[ -f "$EXT_DIR/noPac/requirements.txt" ]]; then
+    pip3 install --user -r "$EXT_DIR/noPac/requirements.txt" >/dev/null 2>&1 || \
+        pip3 install --break-system-packages -r "$EXT_DIR/noPac/requirements.txt" >/dev/null 2>&1 || \
+        wrn "Could not install noPac Python requirements (it may still work with system impacket)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. ADAutoGraph — local BloodHound-style web UI (separate repo, pure stdlib)
 #    Cloned beside this repo so ADAutoPwn auto-detects and launches it at the end
 #    of a run (web UI on http://127.0.0.1:8765, BloodHound data imported for you).
 # ---------------------------------------------------------------------------
@@ -101,7 +128,7 @@ if [[ -f "$AG_DIR/server.py" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Make the framework executable + optional PATH symlink
+# 7. Make the framework executable + optional PATH symlink
 # ---------------------------------------------------------------------------
 chmod +x "$(dirname "$0")/adautopwn.sh"
 ok "adautopwn.sh is executable"

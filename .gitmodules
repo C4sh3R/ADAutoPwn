@@ -1,0 +1,9 @@
+[submodule "external/noPac"]
+	path = external/noPac
+	url = https://github.com/Ridter/noPac
+[submodule "external/CVE-2020-1472"]
+	path = external/CVE-2020-1472
+	url = https://github.com/dirkjanm/CVE-2020-1472
+[submodule "external/CVE-2021-1675"]
+	path = external/CVE-2021-1675
+	url = https://github.com/cube0x0/CVE-2021-1675
