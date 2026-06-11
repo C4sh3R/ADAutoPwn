@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.0"
+readonly VERSION="1.35.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -78,20 +78,25 @@ subsection() {
 
 hr() { echo -e "${C_GREY}    ----------------------------------------------------------------${C_RESET}"; }
 
+# Clean left-bar panel. A right border is intentionally avoided: values carry ANSI
+# colour codes (zero visible width) and vary in length, so a right edge can never
+# line up — the old boxed table looked broken. A single accent bar + a consistent
+# label column reads cleanly and never misaligns. Labels share ONE width across
+# ui_kv/ui_metric so both sections line up in a single value column.
 ui_kv() {
     local k="$1" v="$2"
-    detail "    ${C_GREY}│${C_RESET} ${C_BOLD}$(printf '%-16s' "$k")${C_RESET} ${C_GREY}│${C_RESET} $v"
+    detail "    ${C_GREY}┃${C_RESET}  ${C_BOLD}$(printf '%-17s' "$k")${C_RESET}  $v"
 }
 
 ui_metric() {
     local k="$1" v="$2" hint="${3:-}"
-    [[ -n "$hint" ]] && hint=" ${C_DIM}${hint}${C_RESET}"
-    detail "    ${C_GREY}│${C_RESET} ${C_CYAN}$(printf '%-22s' "$k")${C_RESET} ${C_GREY}│${C_RESET} ${C_BOLD}${v}${C_RESET}${hint}"
+    [[ -n "$hint" ]] && hint="   ${C_DIM}${hint}${C_RESET}"
+    detail "    ${C_GREY}┃${C_RESET}  ${C_CYAN}$(printf '%-17s' "$k")${C_RESET}  ${C_BOLD}${v}${C_RESET}${hint}"
 }
 
-ui_panel_top()    { detail "    ${C_GREY}┌────────────────────────┬──────────────────────────────────────────────┐${C_RESET}"; }
-ui_panel_mid()    { detail "    ${C_GREY}├────────────────────────┼──────────────────────────────────────────────┤${C_RESET}"; }
-ui_panel_bottom() { detail "    ${C_GREY}└────────────────────────┴──────────────────────────────────────────────┘${C_RESET}"; }
+ui_panel_top()    { detail "    ${C_GREY}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"; }
+ui_panel_mid()    { detail "    ${C_GREY}┠─────────────────────────────────────────────────────${C_RESET}"; }
+ui_panel_bottom() { detail "    ${C_GREY}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"; }
 
 banner() {
     # Modern gradient palette (true-color). Falls back to empty strings w/ --no-color.
@@ -5448,7 +5453,8 @@ final_summary() {
     ui_kv "Auth mode" "$([[ $KERBEROS == 1 ]] && echo Kerberos || echo NTLM)"
     ui_kv "Authenticated" "$auth_state"
     ui_kv "Result" "$admin_state"
-    ui_kv "Loot dir" "$OUTDIR"
+    ui_kv "Compromised" "${C_GREEN}${#OWNED_GROUPS[@]}${C_RESET} principal(s)${C_DIM}$( [[ ${#OWNED_ADMIN[@]} -gt 0 ]] && echo ", ${#OWNED_ADMIN[@]} admin" )${C_RESET}"
+    ui_kv "Loot dir" "${C_DIM}…/${C_RESET}$(basename "$OUTDIR")"
     ui_panel_mid
     ui_metric "Users enumerated" "$users_n"
     ui_metric "AS-REP hashes" "$asrep_n" "hashcat -m 18200"
@@ -5456,6 +5462,7 @@ final_summary() {
     ui_metric "Kerberoast hashes" "$kerb_n" "hashcat -m 13100"
     ui_metric "NTLM hashes" "$ntlm_n" "DCSync / offline NTDS"
     ui_metric "Cracked passwords" "$cracked_n"
+    ui_metric "NT hashes (PtH)" "$(_cnt_lines "$OUTDIR/recovered_hashes.txt")" "shadow creds / dumps · hashcat -m 1000"
     ui_metric "ADCS" "$adcs_state"
     ui_panel_bottom
 
