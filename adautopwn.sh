@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.37.2"
+readonly VERSION="1.37.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -945,10 +945,7 @@ _change_expired_password() {
     [[ -z "$PASS" && -n "$HASH" ]] && return 1
     local tool; tool=$(command -v changepasswd.py || command -v impacket-changepasswd) || return 1
     local newpw="$PIVOT_PW" host="${DC_FQDN:-$DC_IP}"
-    local _oldshow="${PASS:-<empty>}"
-    warn "Account '${USER}' must change its password at next logon (old password: ${_oldshow})."
-    warn "  → Setting a NEW password automatically so we can log in as '${USER}': ${C_BOLD}${newpw}${C_RESET}"
-    warn "  (this is why you saw a 'Password:' prompt before — it's no longer needed; the change is automatic now)"
+    info "Must-change for '${USER}' (old: ${PASS:-<empty>}) → setting new password automatically: ${C_BOLD}${newpw}${C_RESET}"
     # The transport that works depends on the DC: kpasswd (Kerberos), rpc-samr
     # (SMB), or ldap. Force-pinning one (we used to pin kpasswd) fails on DCs where
     # that channel is closed — try them in order and stop at the first success.
