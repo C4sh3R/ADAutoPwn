@@ -92,6 +92,7 @@ clone_helper() {  # clone_helper <name> <url>
 clone_helper noPac          https://github.com/Ridter/noPac
 clone_helper CVE-2020-1472  https://github.com/dirkjanm/CVE-2020-1472
 clone_helper CVE-2021-1675  https://github.com/cube0x0/CVE-2021-1675
+clone_helper krbrelayx      https://github.com/dirkjanm/krbrelayx
 if [[ -f "$EXT_DIR/noPac/requirements.txt" ]]; then
     pip3 install --user -r "$EXT_DIR/noPac/requirements.txt" >/dev/null 2>&1 || \
         pip3 install --break-system-packages -r "$EXT_DIR/noPac/requirements.txt" >/dev/null 2>&1 || \
