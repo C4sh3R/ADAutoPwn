@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.35.4"
+readonly VERSION="1.35.5"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -41,7 +41,7 @@ fi
 
 G_INFO="${C_BLUE}${C_BOLD}[*]${C_RESET}"
 G_OK="${C_GREEN}${C_BOLD}[+]${C_RESET}"
-G_WARN="${C_YELLOW}${C_BOLD}[!]${C_RESET}"
+G_WARN="${C_ORANGE}${C_BOLD}[!]${C_RESET}"
 G_ERR="${C_RED}${C_BOLD}[-]${C_RESET}"
 G_RUN="${C_PURPLE}${C_BOLD}[>]${C_RESET}"
 G_LOOT="${C_MAGENTA}${C_BOLD}[\$]${C_RESET}"
@@ -55,10 +55,12 @@ _log()   { [[ -n "$LOGFILE" ]] && printf '%s\n' "$(echo -e "$1" | _strip)" >>"$L
 
 info()  { echo -e "$G_INFO $1";  _log "[*] $1"; }
 ok()    { echo -e "$G_OK ${C_GREEN}$1${C_RESET}"; _log "[+] $1"; }
-warn()  { echo -e "$G_WARN ${C_YELLOW}$1${C_RESET}"; _log "[!] $1"; }
-err()   { echo -e "$G_ERR ${C_RED}$1${C_RESET}"; _log "[-] $1"; }
+warn()  { echo -e "$G_WARN ${C_ORANGE}$1${C_RESET}"; _log "[!] $1"; }
+err()   { echo -e "$G_ERR ${C_RED}${C_BOLD}$1${C_RESET}"; _log "[-] $1"; }
 run()   { echo -e "$G_RUN ${C_DIM}$1${C_RESET}"; _log "[>] $1"; }
-loot()  { echo -e "$G_LOOT ${C_MAGENTA}${C_BOLD}$1${C_RESET}"; _log "[\$] $1"; }
+# Wins (lines carrying ★) render GREEN so a successful action pops; plain loot
+# (recovered secrets) stays magenta-treasure. Quick good=green / bad=red language.
+loot()  { local _c="${C_MAGENTA}"; [[ "$1" == *★* ]] && _c="${C_GREEN}"; echo -e "$G_LOOT ${_c}${C_BOLD}$1${C_RESET}"; _log "[\$] $1"; }
 qst()   { echo -ne "$G_QST ${C_CYAN}$1${C_RESET}"; }
 detail(){ echo -e "$1"; _log "$(echo -e "$1" | _strip)"; }   # print to screen AND log (used by the final harvest dump)
 
