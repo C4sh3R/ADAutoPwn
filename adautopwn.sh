@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.37.1"
+readonly VERSION="1.37.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -952,10 +952,22 @@ _change_expired_password() {
     # The transport that works depends on the DC: kpasswd (Kerberos), rpc-samr
     # (SMB), or ldap. Force-pinning one (we used to pin kpasswd) fails on DCs where
     # that channel is closed — try them in order and stop at the first success.
-    local proto out ok=0
-    for proto in kpasswd rpc-samr ldap smb-samr; do
+    # changepasswd reads the CURRENT password via getpass, which reads from /dev/tty
+    # when one exists — IGNORING a redirected stdin — so it drops to an interactive
+    # "Current password:" prompt. Two things make it non-interactive:
+    #   * run under `setsid` → new session, NO controlling tty → getpass can't open
+    #     /dev/tty and falls back to stdin;
+    #   * feed the old password on stdin via a here-string (empty = the real blank old
+    #     password of a must-change account).
+    # Protocol order matters: for a MUST-CHANGE account the SMB session itself returns
+    # STATUS_PASSWORD_MUST_CHANGE, so rpc-samr/smb-samr can't even bind ("wrong
+    # credentials"). kpasswd (the Kerberos change-password service) accepts the expired
+    # password and is the one that works here — tried first.
+    local proto out ok=0 runner=()
+    command -v setsid >/dev/null 2>&1 && runner=(setsid)
+    for proto in kpasswd ldap rpc-samr smb-samr; do
         run "$tool $DOMAIN/$USER:***@$host -newpass *** -p $proto -dc-ip $DC_IP"
-        out=$("$tool" "$DOMAIN/$USER:$PASS@$host" -newpass "$newpw" -p "$proto" -dc-ip "$DC_IP" 2>&1)
+        out=$("${runner[@]}" "$tool" "$DOMAIN/$USER:$PASS@$host" -newpass "$newpw" -p "$proto" -dc-ip "$DC_IP" 2>&1 <<<"$PASS")
         printf '%s\n' "$out" >>"$LOGFILE"
         if grep -qiE 'changed successfully|password was changed|success' <<<"$out"; then ok=1; break; fi
         grep -qiE 'unrecognized arguments|invalid choice' <<<"$out" && continue   # this impacket build lacks -p <proto>
