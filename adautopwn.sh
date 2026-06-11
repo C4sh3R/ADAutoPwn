@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.28.0"
+readonly VERSION="1.28.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -620,6 +620,13 @@ phase_hosts_time() {
 #  PHASE 2 — UNAUTHENTICATED ENUMERATION  (null / guest / anonymous)
 # ===========================================================================
 phase_unauth() {
+    # If the operator already supplied credentials, null/guest/anonymous enumeration
+    # is redundant — authenticated SMB/LDAP enum covers all of it (and better). Skip
+    # the whole unauth phase so we don't waste time / make noise re-deriving it.
+    if [[ -n "$USER" && ( -n "$PASS" || -n "$HASH" ) ]]; then
+        info "Credentials supplied → skipping unauthenticated null/guest/anonymous enum (redundant)"
+        return
+    fi
     section "PHASE 2 · UNAUTHENTICATED ENUMERATION (null / guest / anonymous)"
 
     subsection "SMB: null session & guest"
