@@ -4211,7 +4211,7 @@ harvest_secrets() {
 
     # (0) USER↔PASS PAIRS — capture the *associated account*, not just the loose
     # password. Logs/configs/connection-strings almost always leak both together
-    # (e.g. `BindUser: "LOGGING\svc_recovery", BindPass: "Em3rg3ncyPa$$2025"`);
+    # (e.g. `BindUser: "CORP\svc_account", BindPass: "S3cr3tP@ss"`);
     # pairing them lets us validate a REAL credential (queue_cred → tested as that
     # user) instead of blind-spraying the password across every account. Broad
     # label set + connstring / URL / CLI forms so we recognise the common shapes:
@@ -4378,7 +4378,7 @@ phase_share_loot() {
     # IMPORTANT: feed harvest_secrets via process substitution, NOT a pipe. A pipe
     # runs the RIGHT side in a SUBSHELL, so the queue_cred/add_secret it performs
     # mutate a throwaway CRED_QUEUE/FOUND_SECRETS and are lost on subshell exit —
-    # that's exactly why a harvested credential (e.g. svc_recovery from a log)
+    # that's exactly why a harvested credential (e.g. a service account from a log)
     # printed "queued" yet was never assessed/pivoted. `< <(...)` keeps
     # harvest_secrets in THIS shell so the in-memory queue actually grows.
     harvest_secrets "shares" < <(find "$dl" -type f -size -200k \
