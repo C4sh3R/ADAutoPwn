@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.45.0"
+readonly VERSION="1.45.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2725,6 +2725,7 @@ $me=[Security.Principal.WindowsIdentity]::GetCurrent(); $sids=@($me.User.Value)+
 function _cw($p){ if(-not $p){return ""}; $f=$p.Trim([char]34); $tg=@(); if($f){$tg+=$f}; $pd=Split-Path $f -Parent; if($pd){$tg+=$pd}; $o=@(); foreach($t in $tg){ if($t -and (Test-Path $t)){ try{ $a=(Get-Acl $t).Access|?{ $_.AccessControlType -eq "Allow" -and ($_.FileSystemRights -match "Write|Modify|FullControl|CreateFiles|AppendData|WriteData") -and ($sids -contains (try{$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value}catch{$_.IdentityReference.Value})) }; if($a){$o+=$t} }catch{} } }; return (($o|Select-Object -Unique) -join "; ") };
 function _paths($s){ $r=@(); if($s){ foreach($m in [regex]::Matches($s,"[A-Za-z]:\\[^ "+[char]34+[char]39+";|]+\.(exe|dll|ps1|bat|cmd|vbs)")){ $r+=$m.Value } }; return $r };
 Get-ScheduledTask | ?{ $_.TaskPath -notmatch "\\Microsoft\\" -and $_.Principal.UserId } | %{ $n=$_.TaskName; $u=$_.Principal.UserId; foreach($ac in $_.Actions){ $c=@(); if($ac.Execute){$c+=$ac.Execute}; $c+=_paths($ac.Arguments); foreach($x in ($c|Select-Object -Unique)){ $w=_cw $x; if($w){ "TASK [{0}] runas={1} exec={2}  WRITABLE: {3}" -f $n,$u,$x,$w } } } };
+$svc=New-Object -ComObject Schedule.Service; $svc.Connect(); function _tk($fl){ try{ foreach($t in $fl.GetTasks(1)){ try{ $u=$t.Definition.Principal.UserId; foreach($a in $t.Definition.Actions){ if($a.Path){ $c=@($a.Path)+(_paths $a.Arguments); foreach($x in ($c|Select-Object -Unique)){ $w=_cw $x; if($w){ "TASK [{0}] runas={1} exec={2}  WRITABLE: {3}" -f $t.Name,$u,$x,$w } } } } }catch{} } }catch{}; try{ foreach($sf in $fl.GetFolders(0)){ _tk $sf } }catch{} }; _tk $svc.GetFolder("\");
 Get-CimInstance Win32_Service | ?{ $_.PathName -and $_.PathName -notmatch "system32" } | %{ $b=$_.PathName; if($b -match ([char]34+"([^"+[char]34+"]+)")){$b=$Matches[1]}elseif($b -match "^(\S+)"){$b=$Matches[1]}; $w=_cw $b; if($w){ "SVC [{0}] runas={1} bin={2}  WRITABLE: {3}" -f $_.Name,$_.StartName,$b,$w } };'
     # Pull the real result lines wherever they land — `-o` ignores any evil-winrm prompt
     # prefix, and `[^{]` after the bracket skips the echoed `"TASK [{0}]…"` format string.
