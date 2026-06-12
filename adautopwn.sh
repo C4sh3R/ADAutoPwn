@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.44.1"
+readonly VERSION="1.45.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -5710,9 +5710,10 @@ phase_bloodhound_graph() {
         # when the web won't run.
         if [[ "$WEB_FORCE" == "1" || ( "$WEB_UI" == "1" && -n "$(_adautograph_dir)" ) ]]; then
             info "ADAutoGraph web UI will open instead — graph.html kept as an offline/report artifact"
-        else
-            open_in_browser "$html"
+        elif [[ "$WEB_UI" == "1" ]]; then
+            open_in_browser "$html"     # web wanted but ADAutoGraph absent → pop the offline graph
         fi
+        # else: --no-web → open nothing; graph.html stays as an offline artifact only.
     else
         warn "Could not generate graph.html"
     fi
@@ -5910,7 +5911,7 @@ gen_report() {
         echo
         echo "## Attack graph"
         echo
-        echo "Open [\`graph.html\`](graph.html) in a browser — interactive, offline, highlights paths to Domain Admins/DC."
+        echo "Imported into the ADAutoGraph web UI (run with \`--web\`, or re-import the BloodHound zip)."
         echo
 
         if [[ -s "$o/valid_creds_map.txt" ]]; then
@@ -6140,24 +6141,22 @@ final_summary() {
         echo
     fi
 
-    # Build the human report + interactive graph, THEN tidy the loot dir
-    # (gen_report/graph read files while they're still at the root).
+    # Build the human report, THEN tidy the loot dir (gen_report reads files while
+    # they're still at the root). The interactive graph lives in the ADAutoGraph web UI
+    # now — the standalone graph.html is gone (use --web / the web UI for the graph).
     gen_report
-    phase_bloodhound_graph
     phase_adautograph_web
     finalize_loot
 
     echo
-    local report_state graph_state web_state
+    local report_state web_state
     report_state=$([[ -s "$OUTDIR/report.md" ]] && echo "${C_GREEN}ready${C_RESET}" || echo "${C_YELLOW}missing${C_RESET}")
-    graph_state=$([[ -s "$OUTDIR/graph.html" ]] && echo "${C_GREEN}ready${C_RESET}" || echo "${C_YELLOW}not generated${C_RESET}")
     web_state=$([[ "$WEB_UI" == "1" ]] && echo "http://${ADAUTOGRAPH_HOST}:${ADAUTOGRAPH_PORT}" || echo "${C_DIM}disabled${C_RESET}")
 
     detail "${C_GREY}    ╔══════════════════════════════════════════════════════════════════╗${C_RESET}"
     detail "${C_GREY}    ║${C_RESET} ${C_BOLD}${C_GREEN}ADAutoPwn complete${C_RESET} ${C_DIM}v${VERSION}${C_RESET}                                      ${C_GREY}║${C_RESET}"
     detail "${C_GREY}    ╠══════════════════════════════════════════════════════════════════╣${C_RESET}"
     detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Report${C_RESET}      ${report_state}  ${C_DIM}$OUTDIR/report.md${C_RESET}"
-    detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Graph${C_RESET}       ${graph_state}  ${C_DIM}$OUTDIR/graph.html${C_RESET}"
     detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Web UI${C_RESET}      ${web_state}"
     detail "    ${C_GREY}║${C_RESET} ${C_CYAN}Log${C_RESET}         ${C_DIM}$LOGFILE${C_RESET}"
     detail "${C_GREY}    ╠══════════════════════════════════════════════════════════════════╣${C_RESET}"
@@ -6360,7 +6359,6 @@ ${C_CYAN}${C_BOLD}EXAMPLES${C_RESET}
 ${C_CYAN}${C_BOLD}LOOT LAYOUT${C_RESET} ${C_DIM}(tidied at the end — trophies on top, the rest grouped)${C_RESET}
   loot_<dom>_<date>/
    ├─ ${C_BOLD}report.md${C_RESET}        consolidated, human-readable engagement report
-   ├─ ${C_BOLD}graph.html${C_RESET}       interactive offline attack graph (auto-opens)
    ├─ users_all.txt · found_passwords.txt · credential_map.txt · *.ccache
    ├─ asrep_hashes.txt · kerberoast_hashes.txt · secretsdump.txt · rollback.log
    ├─ timeroast_hashes.txt
