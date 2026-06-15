@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.3"
+readonly VERSION="1.49.4"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -229,7 +229,12 @@ die() { err "$1"; exit 1; }
 script_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd; }
 external_tool() { local p; p="$(script_dir)/external/$1"; [[ -e "$p" ]] && printf '%s\n' "$p"; }
 nxc_has_module() {  # nxc_has_module <proto> <module>
-    local proto="$1" mod="$2" cache="${OUTDIR:-/tmp}/.nxc_${proto}_modules.txt"
+    local proto="$1" mod="$2"
+    # cache MUST be its OWN statement: in a single `local a=$1 cache=..${proto}..` bash
+    # expands ${proto} with the OLD/empty value before assigning, so the cache was always
+    # ".nxc__modules.txt" — SHARED across protocols. The first probe (smb) cached SMB
+    # modules, then `ldap pre2k` grepped that SMB list → false → pre2k path never fired.
+    local cache="${OUTDIR:-/tmp}/.nxc_${proto}_modules.txt"
     if [[ ! -s "$cache" ]]; then
         # nxc prints the module list to stdout AND/OR stderr depending on version/tty,
         # so capture BOTH; only persist a NON-empty result so a transient failure
