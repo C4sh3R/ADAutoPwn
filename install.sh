@@ -20,7 +20,8 @@ inf "ADAutoPwn installer — this will install the required toolchain"
 # ---------------------------------------------------------------------------
 APT_PKGS=(nmap smbclient smbmap rpcclient ldap-utils ntpdate enum4linux-ng \
           john hashcat python3 python3-pip pipx git golang-go seclists wordlists \
-          openssl unzip p7zip-full libreoffice-calc)
+          openssl unzip p7zip-full libreoffice-calc libguestfs-tools)
+# libguestfs-tools → guestmount, to mount *.vhd(x)/*.vmdk disk images looted from shares
 # john ships the *2john helpers (office2john, zip2john, keepass2john, ssh2john, …)
 inf "Installing APT packages: ${APT_PKGS[*]}"
 $SUDO apt-get update -qq || wrn "apt update failed (continuing)"
@@ -47,6 +48,7 @@ pyinstall bloodhound-python bloodhound
 pyinstall bloodyAD         bloodyAD
 pyinstall ldapdomaindump   ldapdomaindump
 pyinstall msoffcrypto-tool msoffcrypto-tool
+pyinstall vol              volatility3
 
 # ---------------------------------------------------------------------------
 # 3. kerbrute (Go binary) → /opt/kerbrute

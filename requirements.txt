@@ -19,3 +19,4 @@ bloodhound         # bloodhound-python ingestor
 bloodyAD           # fast LDAP privilege/ACL abuse
 ldapdomaindump     # offline LDAP dump (optional)
 msoffcrypto-tool   # decrypt password-protected Office docs found on shares
+volatility3        # hashdump/lsadump/cachedump of *.vmem/*.dmp memory images looted from shares
