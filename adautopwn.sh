@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.4"
+readonly VERSION="1.48.5"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -4740,7 +4740,12 @@ harvest_secrets() {
         # case-INSENSITIVELY (${s,,}) so .LOG1/.DAT/.EXE are caught too, and accept an
         # optional trailing .LOGn / .dat after the real ext (ntuser.dat.LOG1).
         local _sl="${s,,}"
-        [[ "$_sl" =~ \.(xml|bin|rels|png|jpg|jpeg|gif|bmp|svg|csv|ini|inf|pol|log|log1|log2|htb|local|exe|dll|sys|msi|msu|bat|cmd|ps1|psm1|vbs|com|cat|mui|tmp|dat|db|bak|lnk|url|cfg|config|conf|manifest|regtrans|regtrans-ms|blf|etl|evtx|node|json|txt|md|library-ms|mapimail|desklink|zfsendtotarget)(\.log[12]?|\.dat)?$ ]] && continue
+        [[ "$_sl" =~ \.(xml|bin|rels|png|jpg|jpeg|gif|bmp|svg|csv|ini|inf|pol|log|log1|log2|htb|local|exe|dll|sys|msi|msu|bat|cmd|ps1|psm1|vbs|com|cat|mui|tmp|dat|db|bak|lnk|url|cfg|config|conf|manifest|regtrans|regtrans-ms|blf|etl|evtx|node|json|txt|md|library-ms|mapimail|desklink|zfsendtotarget|vmem|vmsn|vmss|vmdk|vmx|vmxf|vmsd|nvram|scoreboard|iso|ova|ovf|vhd|vhdx|qcow2|img)(\.log[12]?|\.dat)?$ ]] && continue
+        # Backup / snapshot artifact NAMES leak out of VMware .vmx/.vmsd descriptors
+        # and look like strong tokens but are NOT passwords, e.g.
+        # "Windows Server 2019-Snapshot1", "NightlyBackup_2024-11-01". Drop a trailing
+        # snapshot index or an embedded YYYY-MM-DD datestamp.
+        [[ "$_sl" =~ -snapshot[0-9]* || "$_sl" =~ [-_][0-9]{4}-[0-9]{2}-[0-9]{2} ]] && continue
         # NTFS / journal artifacts: TMContainer0000000000000000001, $-prefixed, long zero runs
         [[ "$s" =~ ^[$] || "$s" =~ [Cc]ontainer[0-9]{6,} || "$s" =~ 0{8,} ]] && continue
         _plausible_secret "$s" || continue          # drop GUIDs, hex, blobs, fragments
