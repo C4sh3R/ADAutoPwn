@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.6"
+readonly VERSION="1.49.7"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -5406,6 +5406,15 @@ phase_dpapi_offline() {
 VARIANTS_DONE=0
 phase_user_variants() {
     [[ "$VARIANTS_DONE" == "1" || -z "$DOMAIN" || "$CAP_KERBEROS" != "1" ]] && return
+    # Variants are a username-DISCOVERY trick for when the real account format is
+    # unknown. Once we've authenticated and pulled the domain's actual sAMAccountNames
+    # (users_enum.txt from --users), guessing formats is pure noise (and would bloat the
+    # spray) → skip entirely. Only run variants in the no-real-list (unauth) case.
+    if [[ -s "$OUTDIR/users_enum.txt" ]]; then
+        VARIANTS_DONE=1
+        info "Username variants skipped — already have the domain's real accounts ($(grep -c . "$OUTDIR/users_enum.txt") from --users enum)"
+        return
+    fi
     { ! _kerbrute_ok || [[ ! -s "$OUTDIR/users_all.txt" ]]; } && return
     VARIANTS_DONE=1
     section "USERNAME VARIANTS · derive & validate alternate account formats"
