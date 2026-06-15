@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.1"
+readonly VERSION="1.48.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -284,10 +284,13 @@ nxc_cred_args() {
             a+=(-u '' -p '')        # truly anonymous (no user at all)
         fi
         [[ -n "$DOMAIN" ]] && a+=(-d "$DOMAIN")
-        # Only force Kerberos (-k) when we actually have something Kerberos can use
-        # (a non-empty password or a hash). `-k` with a blank password and no ticket
-        # breaks ("invalid principal syntax"); NTLM SMB handles `-p ''` cleanly.
-        [[ "$KERBEROS" == "1" && -n "$DC_FQDN" && ( -n "$PASS" || -n "$HASH" ) ]] && a+=(-k)
+        # Force Kerberos (-k) only for a PASSWORD with no ticket (it derives AES keys).
+        # NEVER for a bare NT HASH here: an NT hash is RC4, and if getTGT already failed
+        # to mint a ticket with it (no KERB_TICKET), repeating the same RC4 AS-REQ via
+        # `-k -H` just re-hits KDC_ERR_ETYPE_NOSUPP on RC4-disabled DCs (Server 2025).
+        # The hash is still valid over NTLM, so fall back to plain PtH (`-H`, no -k).
+        # `-k` with a blank password and no ticket also breaks; NTLM handles `-p ''`.
+        [[ "$KERBEROS" == "1" && -n "$DC_FQDN" && -n "$PASS" && -z "$HASH" ]] && a+=(-k)
     fi
     printf '%s\n' "${a[@]}"
 }
@@ -1148,7 +1151,13 @@ phase_validate_creds() {
             # Classify WHY: expired password (recoverable!), disabled/locked,
             # nonexistent (deleted?), clock skew, or simply wrong password.
             _classify_auth_error "$tgtout" && return
-            warn "Could not obtain TGT (bad creds, clock skew, or wrong domain)"
+            if [[ -n "$HASH" ]] && grep -qi 'ETYPE_NOSUPP' <<<"$tgtout"; then
+                # RC4 disabled for Kerberos (Server 2025 default). The NT hash is still
+                # valid over NTLM → not a bad credential; the SMB step below uses PtH.
+                info "RC4 (NT hash) rejected for Kerberos on this DC → falling back to NTLM pass-the-hash"
+            else
+                warn "Could not obtain TGT (bad creds, clock skew, or wrong domain)"
+            fi
         fi
     fi
 
