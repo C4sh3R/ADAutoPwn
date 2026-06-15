@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.51.2"
+readonly VERSION="1.51.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -204,6 +204,7 @@ declare -A TRIED_HASHES=()        # per-account (krb) or per-hash (ntlm) → alr
 declare -A OWNED_GROUPS=()        # compromised user (lowercased) → group memberships
 declare -A OWNED_ADMIN=()         # compromised user (lowercased) → 1 if privileged/admin
 declare -A REQUEUED_SELF=()       # "user|group" (lc) re-assessed after a self-group-add → fresh PAC per hop, no loops
+declare -A ASSESS_N=()            # identity (lc) → times assessed; hard loop cap
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
@@ -3837,7 +3838,11 @@ _abuse_group() {
         # group B → join B → re-assess again. Keying per-user would cap it at one hop
         # and stall exactly the precomputer→group→GenericWrite→AddSelf→privesc chain.
         # The same group can't re-trigger (its key is set) → no infinite loop.
-        local _rqk="${USER,,}|${grp,,}"
+        # Canonicalize the group name (strip CN=/DN, trailing $, lowercase) so the dedup
+        # key is stable whether the caller passed a sAMAccountName, a CN or a full DN —
+        # otherwise the same group in two forms re-queues forever.
+        local _g="${grp,,}"; _g="${_g##*cn=}"; _g="${_g%%,*}"; _g="${_g%\$}"
+        local _rqk="${USER,,}|${_g}"
         if [[ -z "${REQUEUED_SELF[$_rqk]:-}" ]]; then
             REQUEUED_SELF["$_rqk"]=1
             unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
@@ -7297,6 +7302,16 @@ trap _on_sigint INT
 BH_DONE=0
 
 assess_current_credential() {
+    # Hard loop-breaker: an identity may legitimately be re-assessed a few times (each
+    # group-join re-tickets it for a fresh PAC), but never dozens. Cap total assessments
+    # per identity so a mis-deduped re-queue (e.g. a group name varying by case/DN) can't
+    # spin FS01$/FS02$ 50× — kills any cycle regardless of its source.
+    local _ak="${USER,,}"
+    ASSESS_N["$_ak"]=$(( ${ASSESS_N[$_ak]:-0} + 1 ))
+    if [[ "${ASSESS_N[$_ak]}" -gt 6 ]]; then
+        warn "Skipping ${USER} — already assessed ${ASSESS_N[$_ak]}× (loop guard)"
+        return
+    fi
     SEEN_CREDS["$(cred_key "$USER" "$PASS" "$HASH")"]=1
     HAVE_AUTH=0; IS_DC_ADMIN=0; KERB_TICKET=""; unset KRB5CCNAME
 
