@@ -62,18 +62,19 @@ Every user, hash, ticket and finding is **printed live and saved to disk**.
 | **0 · Discovery** | `nmap` of key AD ports → **capability matrix** (Kerberos/SMB/LDAP/RPC/WinRM). Domain/FQDN via SMB **or LDAP rootDSE + LDAPS cert** (works on Kerberos-only DCs) |
 | **1 · Host & Time** | Auto-append to `/etc/hosts` (idempotent) + clock sync with the DC (Kerberos prerequisite) |
 | **2 · Unauth enum** | null/guest sessions, anonymous shares, RID brute, `rpcclient`, LDAP anon bind, `enum4linux-ng`, `kerbrute` userenum |
-| **3 · AS-REP + Timeroast** | `GetNPUsers` + MS-SNTP Timeroast — captured hashes are cracked and fed back into the pivot queue |
+| **3 · AS-REP + Timeroast** | `GetNPUsers` + MS-SNTP Timeroast — hashes captured in hashcat-ready form (`-m 31300 --username`), each RID resolved to its **machine account** (RID→`DC01$` map), cracked, and any recovered computer password fed back for **RBCD/Silver** |
 | **4 · Validate + TGT** | **TGT-first** (`getTGT -dc-ip`, DNS-independent) → proves creds, cached & reused everywhere via `-k --use-kcache` |
 | **5 · Auth enum** | users, groups, password policy, descriptions, shares, MachineAccountQuota (LDAP, or `rpcclient` fallback when LDAP is closed) |
 | **★ Username variants** | `ryan.naylor` → `rnaylor`, `r.naylor`, `naylor`… validated with `kerbrute` (no lockout) |
 | **★ Share looting** | spider readable shares, download files, **crack** password-protected Office/zip/pdf/keepass, **decrypt & read** their contents, **harvest** passwords inside |
 | **★ Secrets** | Passwords in descriptions/files, **GPP**, **LAPS**, **gMSA/dMSA**, **DPAPI**, pre-created computer passwords → auto-pivot on everything recovered |
+| **★ Attribute creds** | LDAP sweep of `description` / `info` / `comment` / `userPassword` / `unixUserPassword` (base64-decoded) — each value tried against its **own owner** (lockout-safe) and password-shaped tokens mined out of prose and added to the spray pool |
 | **★ WinRM + privesc** | who can WinRM; `whoami /priv` + `/groups` → maps **SeImpersonate→Potato**, SeBackup/SeDebug/SeRestore, Backup Operators, DnsAdmins… |
-| **★ ACL/delegation abuse** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN**, constrained delegation — with `--abuse` it performs the chain: group add/reset, **WriteSPN→Kerberoast**, **Shadow Credentials**, **RBCD**, S4U-to-Administrator, and **DCSync** |
-| **★ Relay & coercion** | SMB/LDAP signing checks, `coerce_plus` (PetitPotam/PrinterBug/DFSCoerce), spooler, WebDAV → **relay playbook** with your IP |
+| **★ ACL/delegation abuse** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN**, constrained delegation — with `--abuse` it performs the chain: group add/reset, **WriteSPN→Kerberoast**, **Shadow Credentials**, **RBCD**, S4U-to-Administrator (with a **Bronze Bit** `-force-forwardable` fallback for Protected-Users / not-delegatable targets, CVE-2020-17049), and **DCSync** |
+| **★ Relay & coercion** | SMB/LDAP signing checks, `coerce_plus` (PetitPotam/PrinterBug/DFSCoerce), spooler, WebDAV → **relay playbook** with your IP; with `AUTO_RELAY=1` also **ADIDNS WPAD injection** (`wpad`→your IP, any authenticated user, auto-rollback) |
 | **★ Trusts** | domain & **cross-forest** trusts, foreign security principals, cross-forest Kerberoast |
 | **6 · Kerberoast** | `GetUserSPNs` for SPN accounts (incl. cross-forest) |
-| **7 · ADCS** | `certipy` scan for **ESC1…ESC16**, and with `--abuse` **auto-exploit ESC1** (request a cert as Administrator → recover its hash/TGT → pivot) |
+| **7 · ADCS** | `certipy` scan for **ESC1…ESC16** + **Certifried (CVE-2022-26923)**, and with `--abuse` **auto-exploit** them (request a cert as Administrator → recover its hash/TGT → pivot). Templates are chosen **by property, never by name**. **ESC3** is fully chained: enrol the enrollment-agent cert, and when Administrator has no email for the target template (the `CERTSRV_E_SUBJECT_EMAIL_REQUIRED` / `ASN1_EOD` wall) it **harvests on-behalf-of certs for every email-bearing user**, ranked by group interest, and pivots on each |
 | **8 · BloodHound** | full `All` collection → importable `.zip` **+ a self-contained interactive `graph.html`** (offline, with built-in Linux/Windows abuse commands per edge) |
 | **9 · DCSync** | `secretsdump -just-dc` when privileges allow → **entire domain's NTLM hashes** |
 | **★ NTDS offline** | if `NTDS.dit` + `SYSTEM` are looted from shares → `secretsdump -ntds LOCAL` |
