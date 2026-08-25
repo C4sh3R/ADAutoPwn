@@ -1,0 +1,4 @@
+dn: CN=Pre-Windows 2000 Compatible Access,CN=Builtin,DC=vintage,DC=htb
+distinguishedName: CN=Pre-Windows 2000 Compatible Access,CN=Builtin,DC=vintage,DC=htb
+member: CN=FS01,CN=Computers,DC=vintage,DC=htb
+member: CN=S-1-5-11,CN=ForeignSecurityPrincipals,DC=vintage,DC=htb

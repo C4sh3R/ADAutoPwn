@@ -1,0 +1,31 @@
+dn: CN=FS01,CN=Computers,DC=vintage,DC=htb
+distinguishedName: CN=FS01,CN=Computers,DC=vintage,DC=htb
+sAMAccountName: FS01$
+pwdLastSet: 133620093500000000
+lastLogonTimestamp: 133620093500000000
+logonCount: 7
+userAccountControl: 4096
+
+dn: CN=WSNEW,CN=Computers,DC=vintage,DC=htb
+distinguishedName: CN=WSNEW,CN=Computers,DC=vintage,DC=htb
+sAMAccountName: WSNEW$
+pwdLastSet: 0
+lastLogonTimestamp: 0
+logonCount: 0
+userAccountControl: 4128
+
+dn: CN=NORMAL,CN=Computers,DC=vintage,DC=htb
+distinguishedName: CN=NORMAL,CN=Computers,DC=vintage,DC=htb
+sAMAccountName: NORMAL$
+pwdLastSet: 133620093500000000
+lastLogonTimestamp: 133620093500000000
+logonCount: 42
+userAccountControl: 4096
+
+dn: CN=DC01,OU=Domain Controllers,DC=vintage,DC=htb
+distinguishedName: CN=DC01,OU=Domain Controllers,DC=vintage,DC=htb
+sAMAccountName: DC01$
+pwdLastSet: 0
+lastLogonTimestamp: 0
+logonCount: 0
+userAccountControl: 8192

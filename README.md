@@ -67,7 +67,7 @@ Every user, hash, ticket and finding is **printed live and saved to disk**.
 | **5 · Auth enum** | users, groups, password policy, descriptions, shares, MachineAccountQuota (LDAP, or `rpcclient` fallback when LDAP is closed) |
 | **★ Username variants** | `ryan.naylor` → `rnaylor`, `r.naylor`, `naylor`… validated with `kerbrute` (no lockout) |
 | **★ Share looting** | spider readable shares, download files, **crack** password-protected Office/zip/pdf/keepass, **decrypt & read** their contents, **harvest** passwords inside |
-| **★ Secrets** | Passwords in descriptions/files, **GPP**, **LAPS**, **gMSA/dMSA**, **DPAPI**, pre-created computer passwords → auto-pivot on everything recovered |
+| **★ Secrets** | Passwords in descriptions/files, **GPP**, **LAPS**, **gMSA/dMSA**, **DPAPI**, pre-created computer passwords (**NetExec + SID/group-aware LDAP fallback**) → auto-pivot on everything recovered |
 | **★ Attribute creds** | LDAP sweep of `description` / `info` / `comment` / `userPassword` / `unixUserPassword` (base64-decoded) — each value tried against its **own owner** (lockout-safe) and password-shaped tokens mined out of prose and added to the spray pool |
 | **★ WinRM + privesc** | who can WinRM; `whoami /priv` + `/groups` → maps **SeImpersonate→Potato**, SeBackup/SeDebug/SeRestore, Backup Operators, DnsAdmins… |
 | **★ ACL/delegation abuse** | `GenericAll`, `WriteDACL`, `ForceChangePassword`, `AddSelf`, `WriteOwner`, **WriteSPN**, constrained delegation — with `--abuse` it performs the chain: group add/reset, **WriteSPN→Kerberoast**, **Shadow Credentials**, **RBCD**, S4U-to-Administrator (with a **Bronze Bit** `-force-forwardable` fallback for Protected-Users / not-delegatable targets, CVE-2020-17049), and **DCSync** |
