@@ -1,19 +1,28 @@
 <div align="center">
 
-```
+<pre align="center">
  █████╗ ██████╗      █████╗ ██╗   ██╗████████╗ ██████╗
 ██╔══██╗██╔══██╗    ██╔══██╗██║   ██║╚══██╔══╝██╔═══██╗
 ███████║██║  ██║    ███████║██║   ██║   ██║   ██║   ██║
 ██╔══██║██║  ██║    ██╔══██║██║   ██║   ██║   ██║   ██║
 ██║  ██║██████╔╝    ██║  ██║╚██████╔╝   ██║   ╚██████╔╝
 ╚═╝  ╚═╝╚═════╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝
-        ██████╗ ██╗    ██╗███╗   ██╗
-        ██╔══██╗██║    ██║████╗  ██║   Active Directory
-        ██████╔╝██║ █╗ ██║██╔██╗ ██║   Automated Pwnage
-        ██╔═══╝ ██║███╗██║██║╚██╗██║   Framework
-        ██║     ╚███╔███╔╝██║ ╚████║
-        ╚═╝      ╚══╝╚══╝ ╚═╝  ╚═══╝
-```
+██████╗ ██╗    ██╗███╗   ██╗
+██╔══██╗██║    ██║████╗  ██║
+██████╔╝██║ █╗ ██║██╔██╗ ██║
+██╔═══╝ ██║███╗██║██║╚██╗██║
+██║     ╚███╔███╔╝██║ ╚████║
+╚═╝      ╚══╝╚══╝ ╚═╝  ╚═══╝
+Active Directory · Automated Pwnage · Framework
+</pre>
+
+&ensp;[<kbd> <br> Why ADAutoPwn? <br> </kbd>](#-why-adautopwn)&ensp;
+&ensp;[<kbd> <br> Features <br> </kbd>](#-features)&ensp;
+&ensp;[<kbd> <br> Install <br> </kbd>](#-installation)&ensp;
+&ensp;[<kbd> <br> Usage <br> </kbd>](#-usage)&ensp;
+&ensp;[<kbd> <br> Loot layout <br> </kbd>](#-loot-layout)&ensp;
+&ensp;[<kbd> <br> Contributing <br> </kbd>](#-contributing)&ensp;
+<br>
 
 # ⚡ ADAutoPwn
 
@@ -23,10 +32,10 @@ A single-command Active Directory assessment engine that chains the best of the
 offensive toolchain (`netexec`, `impacket`, `certipy`, `bloodyAD`, `kerbrute`,
 `bloodhound-python`…) into one coherent, recursive, colorful workflow.
 
-<sub>Crafted & weaponized by **c4sh3r** · authorized engagements only</sub>
+<sub>Crafted & weaponized by **C4sh$R** · authorized engagements only</sub>
 
 ![bash](https://img.shields.io/badge/bash-5%2B-1f425f?style=flat-square&logo=gnubash&logoColor=white)
-![platform](https://img.shields.io/badge/platform-Kali%20%7C%20Parrot-2ea44f?style=flat-square&logo=linux&logoColor=white)
+![platform](https://img.shields.io/badge/platform-Kali%20%7C%20Parrot%20%7C%20Arch-2ea44f?style=flat-square&logo=linux&logoColor=white)
 ![kerberos](https://img.shields.io/badge/auth-Kerberos--first-blueviolet?style=flat-square)
 ![license](https://img.shields.io/badge/license-PolyForm%20Noncommercial-orange?style=flat-square)
 
@@ -49,9 +58,11 @@ exploitation chain runs again as that user — until nothing new appears.
 
 Every user, hash, ticket and finding is **printed live and saved to disk**.
 
-> ⚠️ **Legal:** Use only against systems you are explicitly authorized to test —
-> a signed engagement, your own lab, or a CTF you're entitled to play. You are
-> responsible for your actions.
+> [!CAUTION]
+> **Legal use only.** Use ADAutoPwn strictly against systems you are explicitly
+> authorized to test - a signed engagement, your own lab, or a CTF you're
+> entitled to play. Unauthorized use against systems you don't own or lack
+> written permission for is illegal. **You are solely responsible for your actions.**
 
 ---
 
@@ -99,6 +110,13 @@ Plus:
   with `--cleanup`. *No event-log wiping / anti-forensics — by design.*
 - 🎨 Modern, colorful, real-time output (every user, hash and step printed live). Plain-text log saved alongside.
 
+> [!WARNING]
+> `--abuse` and `--spray` are **loud, active, and potentially destructive**.
+> `--abuse` performs live changes on the target (group membership, password
+> resets, owner/SPN edits, certificate requests) and `--spray` risks **account
+> lockouts**. Both are opt-in for a reason — make sure they're in scope before
+> using them on a real engagement.
+
 ---
 
 ## 📦 Installation
@@ -110,8 +128,9 @@ chmod +x install.sh adautopwn.sh
 ./install.sh          # installs the whole toolchain (apt + pipx + kerbrute + rockyou)
 ```
 
-On **Kali/Parrot** most dependencies are already present; `install.sh` fills the gaps.
+On **Kali/Parrot/Arch** most dependencies are already present; `install.sh` fills the gaps.
 
+> [!NOTE]
 > Python tools are listed in [`requirements.txt`](requirements.txt) and installed
 > in isolation via `pipx` (with a `pip --user` fallback). `kerbrute` is fetched as
 > a Go binary into `/opt/kerbrute`.
@@ -125,19 +144,28 @@ ln -sf "$PWD/adautopwn.sh" ~/.local/bin/adautopwn   # ~/.local/bin is on PATH
 
 (`install.sh` also creates a `/usr/local/bin/adautopwn` symlink when it can.)
 
----
+### 🧰 Requirements
 
-## 🧰 Requirements
+**System (apt — Debian/Ubuntu/Kali/Parrot):** `nmap` · `smbclient` · `smbmap` ·
+`ldap-utils` · `ntpsec-ntpdate` · `enum4linux-ng` · `john` · `hashcat` ·
+`seclists` · `wordlists` · `netexec`
 
-**System (apt):** `nmap` · `smbclient` · `smbmap` · `rpcclient` · `ldap-utils` ·
-`ntpdate` · `enum4linux-ng` · `john` · `hashcat` · `seclists`
+**System (pacman — Arch/Manjaro):** `nmap` · `smbclient` · `samba` (provides
+`rpcclient`) · `openldap` · `ntp` · `john` · `hashcat`. The following are
+pulled from the **AUR** via `yay`/`paru`: `smbmap` · `enum4linux-ng` ·
+`seclists` · `wordlists` · `netexec`
 
-**Python (pipx/pip):** `netexec` · `impacket` · `certipy-ad` · `bloodhound` ·
-`bloodyAD` · `ldapdomaindump`
+**Python (pipx/pip):** `impacket` · `certipy-ad` · `bloodhound` · `bloodyAD` ·
+`ldapdomaindump` · `msoffcrypto-tool` · `volatility3`
 
-**Standalone:** `kerbrute` → `/opt/kerbrute` *(override with `KERBRUTE_BIN=...`)*
+**Standalone:** `kerbrute` → `/opt/kerbrute` *(override with `KERBRUTE_BIN=...`)*,
+`evil-winrm` *(installed via gem)*
 
-`sudo` is requested once, for clock sync and the `/etc/hosts` entry.
+> [!IMPORTANT]
+> On Arch, an AUR helper (`yay` or `paru`) must already be installed — `install.sh`
+> does not install one for you. Also, `sudo` is requested **once** during install,
+> for clock sync and the `/etc/hosts` entry - both are hard prerequisites for
+> Kerberos authentication to work correctly.
 
 ---
 
@@ -174,6 +202,7 @@ adautopwn -t <DC_IP> [-d <domain>] [-u <user>] [-p <pass> | -H <nt_hash>] [optio
 | `--no-color` | Disable colors |
 | `-h, --help` | Help |
 
+> [!TIP]
 > **Only `-t` is required.** With no credentials it runs every unauthenticated phase;
 > add `-u/-p` (or `-H`) and it unlocks the rest and pivots recursively. The only
 > opt-in (loud/destructive) extras are `--abuse` and `--spray`.
@@ -257,10 +286,11 @@ ADAutoPwn is built for **professional engagements**, so it cleans up after *itse
   `/etc/hosts` entry) is recorded as an **undo command** in `rollback.log`.
 - `--cleanup` reads that file and reverts the environment.
 
-What it deliberately **does not** do: clear Windows event logs or perform
-anti-forensics. That breaks the client's evidence chain and is out of scope for
-legitimate testing. Stealth here means *being quiet* (`--stealth`, Kerberos,
-jitter), not *destroying evidence*.
+> [!IMPORTANT]
+> What it deliberately **does not** do: clear Windows event logs or perform
+> anti-forensics. That breaks the client's evidence chain and is out of scope
+> for legitimate testing. Stealth here means *being quiet* (`--stealth`,
+> Kerberos, jitter), **not** *destroying evidence*.
 
 ---
 
@@ -285,6 +315,12 @@ Contributions are very welcome — this is a community tool and the AD attack
 surface is huge. Whether you fix a parser edge-case or add a whole new technique,
 PRs and issues are appreciated.
 
+<div align="center">
+
+![Typing SVG](https://readme-typing-svg.demolab.com?font=JetBrains+Mono&size=18&pause=1000&color=00FFB3&center=true&vCenter=true&width=500&lines=All+contributions+are+welcome!;Fork+it.+Hack+it.+PR+it.;Knowledge+shared+is+knowledge+multiplied.)
+
+</div>
+
 ### How to contribute
 
 ```bash
@@ -301,6 +337,7 @@ git checkout -b feature/my-technique
 # 4. PR with a short description + sample output
 ```
 
+> [!WARNING]
 > Please test against a lab or a box you're allowed to use, and **never commit
 > loot/credentials** (the `.gitignore` already blocks the usual files).
 
@@ -330,5 +367,5 @@ commercial license. Provided for **authorized security testing only**; the
 author assumes no liability for misuse.
 
 <div align="center">
-<sub>Made with ☕ and too many <code>impacket</code> flags by <b>c4sh3r</b></sub>
+<sub>Made with ☕ and too many <code>impacket</code> flags by <a href="https://andrei.quest/">C4sh$R</a> · ADautopwn © 2026</sub>
 </div>
